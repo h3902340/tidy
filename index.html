@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tidy — Teddy Sketch to 3D</title>
+  </head>
+  <body>
+    <div id="app">
+      <header class="header">
+        <h1>Tidy</h1>
+        <p class="subtitle">
+          Draw a closed silhouette — flat 3D polygon via constrained Delaunay triangulation
+          <span class="paper-ref">(Igarashi et al., SIGGRAPH 1999)</span>
+        </p>
+      </header>
+      <main class="workspace">
+        <section class="panel draw-panel">
+          <div class="panel-head">
+            <h2>Sketch</h2>
+            <span class="hint">Release near start to auto-close (40px tolerance)</span>
+          </div>
+          <div class="canvas-wrap">
+            <canvas id="draw-canvas"></canvas>
+          </div>
+          <div class="actions">
+            <button id="btn-generate" type="button">Generate 3D</button>
+            <button id="btn-square" type="button" class="secondary">Create square</button>
+            <button id="btn-clear" type="button" class="secondary">Clear</button>
+          </div>
+          <p id="status" class="status" role="status"></p>
+        </section>
+        <section class="panel view-panel">
+          <div class="panel-head">
+            <h2>3D Preview</h2>
+            <div class="view-controls">
+              <label class="display-mode-label" for="display-mode">Display</label>
+              <select id="display-mode" aria-label="Mesh display mode">
+                <option value="solid">Solid</option>
+                <option value="wireframe" selected>Wireframe</option>
+                <option value="both">Both</option>
+              </select>
+              <label class="paint-toggle">
+                <input type="checkbox" id="paint-mode" />
+                Paint on surface
+              </label>
+              <label class="paint-toggle">
+                <input type="checkbox" id="cut-mode" />
+                Cut mode
+              </label>
+            </div>
+            <span class="hint">Cut: stroke must cross the boundary twice · keeps the larger piece</span>
+          </div>
+          <div id="view3d" class="view3d-wrap"></div>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
