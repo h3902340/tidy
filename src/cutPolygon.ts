@@ -11,48 +11,53 @@ interface BoundaryHit {
   polyT: number;
 }
 
-export function cutPolygon(
-  polygon: Vec2[],
+export type CutBoundaryHit = BoundaryHit;
+
+/** Validate that a stroke crosses a closed boundary exactly twice (screen silhouette). */
+export function validateCutCrossesBoundary(
+  boundary: Vec2[],
   cut: Vec2[]
-): { kept: Vec2[]; discarded: Vec2[] } | { error: string } {
-  if (polygon.length < 3) return { error: 'Invalid polygon.' };
+):
+  | { ok: true; hits: [CutBoundaryHit, CutBoundaryHit]; silhouette: Vec2[] }
+  | { error: string } {
+  if (boundary.length < 3) return { error: 'Invalid silhouette.' };
   if (cut.length < 2) return { error: 'Cut stroke is too short.' };
 
-  const start = cut[0];
-  const end = cut[cut.length - 1];
-
-  if (windingNumber(start, polygon)) {
-    return { error: 'Cut must start outside the polygon.' };
-  }
-  if (windingNumber(end, polygon)) {
-    return { error: 'Cut must end outside the polygon.' };
-  }
-
-  const hits = findBoundaryHits(polygon, cut);
+  const hits = findBoundaryHits(boundary, cut);
   const unique = dedupeHits(hits);
 
   if (unique.length < 2) {
     return {
       error:
-        'Cut does not cross the polygon boundary twice. Draw across the shape from outside to outside.',
+        'Cut does not cross the object silhouette twice. Draw across the shape in the current view.',
     };
   }
 
   if (unique.length > 2) {
     return {
       error:
-        'Cut crosses the boundary more than twice. Use a single straight stroke across the shape.',
+        'Cut crosses the silhouette more than twice. Use one stroke across the shape.',
     };
   }
 
-  const hasInteriorPoint = cut.some((p) => windingNumber(p, polygon));
+  const hasInteriorPoint = cut.some((p) => windingNumber(p, boundary));
   if (!hasInteriorPoint) {
     return {
-      error: 'Cut must pass through the interior of the polygon, not only near it from outside.',
+      error: 'Cut must pass through the interior of the object in this view.',
     };
   }
 
-  const [h0, h1] = unique;
+  return { ok: true, hits: [unique[0], unique[1]], silhouette: boundary };
+}
+
+export function cutPolygon(
+  polygon: Vec2[],
+  cut: Vec2[]
+): { kept: Vec2[]; discarded: Vec2[] } | { error: string } {
+  const validated = validateCutCrossesBoundary(polygon, cut);
+  if ('error' in validated) return validated;
+
+  const [h0, h1] = validated.hits;
   const parts = splitAtHits(polygon, cut, h0, h1);
   if (!parts) return { error: 'Could not split polygon along cut.' };
 
@@ -200,7 +205,7 @@ function walkBoundary(vertices: Vec2[], from: number, to: number): Vec2[] {
   return path;
 }
 
-function extractCutPath(cut: Vec2[], param0: number, param1: number): Vec2[] {
+export function extractCutPath(cut: Vec2[], param0: number, param1: number): Vec2[] {
   const [start, end] = param0 < param1 ? [param0, param1] : [param1, param0];
   const path: Vec2[] = [];
   let acc = 0;

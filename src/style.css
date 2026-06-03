@@ -90,6 +90,14 @@ body {
   font-weight: 600;
 }
 
+.inflation-step {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #2d5a8e;
+  width: 100%;
+  flex-basis: 100%;
+}
+
 .hint {
   font-size: 0.78rem;
   color: #8a857c;
@@ -106,12 +114,16 @@ body {
   inset: 0;
   width: 100%;
   height: 100%;
+  overflow: hidden;
 }
 
-.scene-view canvas {
+.scene-view .webgl-layer {
+  position: absolute;
+  inset: 0;
   display: block;
   width: 100% !important;
   height: 100% !important;
+  z-index: 1;
 }
 
 .scene-view .paint-overlay {
@@ -120,7 +132,12 @@ body {
   width: 100%;
   height: 100%;
   pointer-events: none;
-  z-index: 2;
+  z-index: 10;
+}
+
+.scene-view .paint-overlay.overlay-interactive {
+  pointer-events: auto;
+  cursor: crosshair;
 }
 
 .paint-toggle {
@@ -166,6 +183,15 @@ button.secondary {
 
 button.secondary:hover {
   background: #f0eeea;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+button:disabled:hover {
+  background: #2d5a8e;
 }
 
 .status {

@@ -11,7 +11,7 @@
       <header class="header">
         <h1>Tidy</h1>
         <p class="subtitle">
-          Draw a closed silhouette once on the 3D plane — then rotate, zoom, and pan
+          Draw a closed loop, then step through T/S/J → fans → spine → elevation → inflation
           <span class="paper-ref">(Igarashi et al., SIGGRAPH 1999)</span>
         </p>
       </header>
@@ -23,8 +23,8 @@
               <label class="display-mode-label" for="display-mode">Display</label>
               <select id="display-mode" aria-label="Mesh display mode" disabled>
                 <option value="solid">Solid</option>
-                <option value="wireframe" selected>Wireframe</option>
-                <option value="both">Both</option>
+                <option value="wireframe">Wireframe</option>
+                <option value="both" selected>Both</option>
               </select>
               <label class="paint-toggle">
                 <input type="checkbox" id="paint-mode" disabled />
@@ -35,12 +35,19 @@
                 Cut mode
               </label>
             </div>
+            <span class="inflation-step" id="inflation-step" aria-live="polite"></span>
             <span class="hint" id="canvas-hint">Draw one closed loop on the 3D plane</span>
           </div>
           <div class="canvas-wrap">
             <div id="scene-view" class="scene-view"></div>
           </div>
           <div class="actions">
+            <button id="btn-next-step" type="button" disabled>Next step</button>
+            <button id="btn-apply-cut" type="button" disabled>Remove triangles</button>
+            <button id="btn-fill-cut" type="button" disabled>Fill hole</button>
+            <button id="btn-discard-cut" type="button" class="secondary" disabled>
+              Discard cut
+            </button>
             <button id="btn-square" type="button" class="secondary">Create square</button>
             <button id="btn-clear" type="button" class="secondary">Clear</button>
           </div>

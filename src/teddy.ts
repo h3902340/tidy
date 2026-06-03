@@ -1,23 +1,25 @@
-import { constrainedDelaunay, type Triangle2D } from './cdt';
-import { dist, type Vec2, type Vec3, vec3 } from './math';
-import { isSelfIntersecting, normalizePolygon } from './stroke';
+import { dist, type Vec2 } from './math';
+import { isSelfIntersecting } from './stroke';
+import {
+  buildInflatedMesh,
+  buildTeddyPipelineFromStroke,
+} from './teddyPipeline';
+import type { Mesh3D } from './teddyPipeline';
 
-export interface Mesh3D {
-  vertices: Vec3[];
-  faces: [number, number, number][];
-}
-
-/** Planar CDT mesh: boundary vertices at z = 0, interior filled with Delaunay triangles. */
-function buildFlatCdtMesh(polygon: Vec2[], triangles: Triangle2D[]): Mesh3D {
-  const vertices: Vec3[] = polygon.map((p) => vec3(p.x, p.y, 0));
-  const faces: [number, number, number][] = triangles.map((t) => [
-    t.indices[0],
-    t.indices[1],
-    t.indices[2],
-  ]);
-
-  return { vertices, faces };
-}
+export type {
+  Mesh3D,
+  TeddyPipelineMeshes,
+  TeddyPipelineResult,
+  TriangleType,
+} from './teddyPipeline';
+export { FAN_TERMINAL_COLOR } from './teddyPipeline';
+export {
+  buildFlatCdtMesh,
+  buildInflatedMesh,
+  buildSpineMesh,
+  buildTeddyPipeline,
+  buildTeddyPipelineFromStroke,
+} from './teddyPipeline';
 
 export function buildMeshFromPolygon(ring: Vec2[]): {
   mesh: Mesh3D | null;
@@ -42,8 +44,7 @@ export function buildMeshFromPolygon(ring: Vec2[]): {
     };
   }
 
-  const { triangles } = constrainedDelaunay(polygon);
-  const mesh = buildFlatCdtMesh(polygon, triangles);
+  const mesh = buildInflatedMesh(polygon);
   return { mesh, error: null, polygon: closed };
 }
 
@@ -52,9 +53,6 @@ export function buildTeddyMesh(rawStroke: Vec2[]): {
   error: string | null;
   polygon: Vec2[];
 } {
-  const polygon = normalizePolygon(rawStroke);
-  if (polygon.length < 3) {
-    return { mesh: null, error: 'Draw a longer closed shape.', polygon };
-  }
-  return buildMeshFromPolygon(polygon);
+  const { meshes, error, polygon } = buildTeddyPipelineFromStroke(rawStroke);
+  return { mesh: meshes?.inflated ?? null, error, polygon };
 }

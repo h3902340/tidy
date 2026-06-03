@@ -1,9 +1,16 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type { Mesh3D } from './teddy';
-import { projectScreenStroke, projectScreenStrokeToPlane } from './surfaceProjection';
+import { validateCutCrossesBoundary, type CutBoundaryHit } from './cutPolygon';
+import { computeScreenSilhouetteFromRender } from './renderSilhouette';
+import {
+  projectScreenStroke,
+  projectScreenStrokeFrontBack,
+  projectScreenStrokeToPlane,
+  worldHitToMeshVertex,
+} from './surfaceProjection';
 import { CLOSE_TOLERANCE, closeStroke } from './stroke';
-import type { Vec2 } from './math';
+import type { Vec2, Vec3 } from './math';
 
 export type DisplayMode = 'solid' | 'wireframe' | 'both';
 export type InteractionMode = 'silhouette' | 'orbit' | 'paint' | 'cut';
@@ -12,8 +19,51 @@ export type SilhouetteCompleteHandler = (closed: Vec2[]) => void;
 
 const PAINT_LINE_COLOR = 0xc0392b;
 const CUT_LINE_COLOR = 0xd35400;
+/** Preview: front surface (Teddy §5.4) along view rays. */
+const CUT_PREVIEW_FRONT_COLOR = 0x1abc9c;
+/** Preview: back surface along view rays. */
+const CUT_PREVIEW_BACK_COLOR = 0x9b59b6;
 
-export type CutCompleteHandler = (cutPolyline: Vec2[]) => boolean;
+export type CutValidated = {
+  silhouette: Vec2[];
+  hits: [CutBoundaryHit, CutBoundaryHit];
+};
+
+export type CutPreviewPayload = {
+  screenStroke: Vec2[];
+  validated: CutValidated;
+  frontPath: Vec3[];
+  backPath: Vec3[];
+  /** Camera state captured when the stroke was drawn, so a later orbit doesn't change the cut. */
+  camera: THREE.Camera;
+};
+
+/** Called after stroke validates and surface projection is shown for review. */
+export type CutPreviewHandler = (payload: CutPreviewPayload) => void;
+
+export type CutRejectedHandler = (message: string) => void;
+
+export interface MeshDisplayOptions {
+  color?: number;
+  wireColor?: number;
+  /** One hex color per face (enables flat per-triangle shading). */
+  faceColors?: number[];
+  opacity?: number;
+  /** Per-triangle normals (avoids bad vertex averaging on inflated meshes). */
+  flatShading?: boolean;
+}
+
+const DEFAULT_MESH_COLOR = 0x6b9bd1;
+const DEFAULT_WIRE_COLOR = 0x2d4a63;
+/** Render both sides so occasional inverted inflation triangles stay visible. */
+const MESH_MATERIAL_SIDE = THREE.DoubleSide;
+const SPINE_LINE_COLOR = 0x000000;
+/** World-space radius for spine tube meshes (visible on ~100px-scale shapes). */
+const SPINE_TUBE_RADIUS = 1.1;
+/** Recompute cut silhouette only after the camera has been idle this long (ms). */
+const SILHOUETTE_IDLE_MS = 3000;
+const DEFAULT_CAMERA_POSITION = new THREE.Vector3(0, -180, 220);
+const DEFAULT_ORBIT_TARGET = new THREE.Vector3(0, 0, 0);
 
 export class SceneView {
   private container: HTMLElement;
@@ -23,14 +73,25 @@ export class SceneView {
   private controls: OrbitControls;
   private meshObject: THREE.Mesh | null = null;
   private wireframe: THREE.LineSegments | null = null;
-  private displayMode: DisplayMode = 'wireframe';
+  private secondaryMeshObject: THREE.Mesh | null = null;
+  private secondaryWireframe: THREE.LineSegments | null = null;
+  private displayMode: DisplayMode = 'both';
   private interactionMode: InteractionMode = 'silhouette';
   private surfaceLinesGroup: THREE.Group;
+  private cutPreviewGroup: THREE.Group;
+  private spineLinesGroup: THREE.Group;
+  private spineTubeMaterial: THREE.MeshBasicMaterial | null = null;
   private overlayCanvas: HTMLCanvasElement;
   private overlayCtx: CanvasRenderingContext2D;
   private painting = false;
   private paintStroke: Vec2[] = [];
-  private onCutComplete: CutCompleteHandler | null = null;
+  private onCutPreview: CutPreviewHandler | null = null;
+  private onCutRejected: CutRejectedHandler | null = null;
+  private onCutPendingChange: (() => void) | null = null;
+  private pendingCut: CutPreviewPayload | null = null;
+  private currentMeshData: Mesh3D | null = null;
+  private cutSilhouette: Vec2[] = [];
+  private silhouetteIdleTimer: ReturnType<typeof setTimeout> | null = null;
   private onSilhouetteComplete: SilhouetteCompleteHandler | null = null;
 
   constructor(container: HTMLElement) {
@@ -41,14 +102,20 @@ export class SceneView {
     this.scene.background = new THREE.Color(0xf0eeea);
     this.surfaceLinesGroup = new THREE.Group();
     this.scene.add(this.surfaceLinesGroup);
+    this.cutPreviewGroup = new THREE.Group();
+    this.scene.add(this.cutPreviewGroup);
+    this.spineLinesGroup = new THREE.Group();
+    this.spineLinesGroup.scale.set(1, -1, 1);
+    this.scene.add(this.spineLinesGroup);
 
     const aspect = container.clientWidth / Math.max(container.clientHeight, 1);
     this.camera = new THREE.PerspectiveCamera(45, aspect, 0.1, 2000);
-    this.camera.position.set(0, -180, 220);
+    this.camera.position.copy(DEFAULT_CAMERA_POSITION);
 
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
     this.renderer.setPixelRatio(window.devicePixelRatio);
     this.renderer.setSize(container.clientWidth, container.clientHeight);
+    this.renderer.domElement.classList.add('webgl-layer');
     container.appendChild(this.renderer.domElement);
 
     this.overlayCanvas = document.createElement('canvas');
@@ -65,7 +132,12 @@ export class SceneView {
     this.controls.screenSpacePanning = true;
     this.controls.minDistance = 50;
     this.controls.maxDistance = 800;
-    this.controls.target.set(0, 0, 0);
+    this.controls.target.copy(DEFAULT_ORBIT_TARGET);
+    this.controls.addEventListener('change', () => {
+      if (this.interactionMode === 'cut') {
+        this.scheduleCutSilhouetteRefreshOnCameraIdle();
+      }
+    });
 
     const ambient = new THREE.AmbientLight(0xffffff, 0.55);
     const dir = new THREE.DirectionalLight(0xffffff, 0.85);
@@ -88,8 +160,32 @@ export class SceneView {
     if (visible) this.onResize();
   }
 
-  setOnCutComplete(handler: CutCompleteHandler | null): void {
-    this.onCutComplete = handler;
+  setOnCutPreview(handler: CutPreviewHandler | null): void {
+    this.onCutPreview = handler;
+  }
+
+  setOnCutPendingChange(handler: (() => void) | null): void {
+    this.onCutPendingChange = handler;
+  }
+
+  hasPendingCut(): boolean {
+    return this.pendingCut !== null;
+  }
+
+  getPendingCut(): CutPreviewPayload | null {
+    return this.pendingCut;
+  }
+
+  clearPendingCut(): void {
+    this.discardPendingCut();
+  }
+
+  setOnCutRejected(handler: CutRejectedHandler | null): void {
+    this.onCutRejected = handler;
+  }
+
+  getCutSilhouette(): Vec2[] {
+    return this.cutSilhouette;
   }
 
   setOnSilhouetteComplete(handler: SilhouetteCompleteHandler | null): void {
@@ -108,15 +204,70 @@ export class SceneView {
 
   setInteractionMode(mode: InteractionMode): void {
     this.interactionMode = mode;
-    const overlayActive = mode === 'silhouette' || mode === 'paint' || mode === 'cut';
-    this.overlayCanvas.style.pointerEvents = overlayActive ? 'auto' : 'none';
-    this.overlayCanvas.style.cursor = overlayActive ? 'crosshair' : 'default';
-    this.controls.enabled = mode === 'orbit';
+    const overlayActive =
+      mode === 'silhouette' || mode === 'paint' || mode === 'cut';
     if (!overlayActive) {
       this.painting = false;
       this.paintStroke = [];
+      this.cutSilhouette = [];
+      this.cancelSilhouetteIdleRefresh();
+      this.discardPendingCut();
       this.clearOverlay();
+    } else if (mode === 'cut') {
+      this.paintStroke = [];
+      this.discardPendingCut();
+      this.scheduleCutSilhouetteRefreshImmediate();
     }
+    this.syncPointerAndOrbitState();
+  }
+
+  /** Overlay captures strokes; orbit uses the canvas when reviewing a cut preview. */
+  private syncPointerAndOrbitState(): void {
+    const overlayActive =
+      this.interactionMode === 'silhouette' ||
+      this.interactionMode === 'paint' ||
+      this.interactionMode === 'cut';
+    const cutReviewing =
+      this.interactionMode === 'cut' && this.pendingCut !== null;
+
+    this.overlayCanvas.classList.toggle(
+      'overlay-interactive',
+      overlayActive && !cutReviewing
+    );
+    this.controls.enabled =
+      this.interactionMode === 'orbit' || cutReviewing;
+  }
+
+  private cancelSilhouetteIdleRefresh(): void {
+    if (this.silhouetteIdleTimer !== null) {
+      clearTimeout(this.silhouetteIdleTimer);
+      this.silhouetteIdleTimer = null;
+    }
+  }
+
+  /** Hide stale silhouette while the camera moves; recompute after idle. */
+  private clearCutSilhouetteOverlay(): void {
+    if (this.cutSilhouette.length === 0) return;
+    this.cutSilhouette = [];
+    this.drawCutOverlay();
+  }
+
+  /** Debounced: used while orbiting in cut mode (render pass is expensive). */
+  private scheduleCutSilhouetteRefreshOnCameraIdle(): void {
+    this.clearCutSilhouetteOverlay();
+    this.cancelSilhouetteIdleRefresh();
+    this.silhouetteIdleTimer = setTimeout(() => {
+      this.silhouetteIdleTimer = null;
+      this.scheduleCutSilhouetteRefreshImmediate();
+    }, SILHOUETTE_IDLE_MS);
+  }
+
+  /** Immediate: entering cut mode, resize, mesh update, stroke validation. */
+  private scheduleCutSilhouetteRefreshImmediate(): void {
+    requestAnimationFrame(() => {
+      this.refreshCutSilhouette();
+      requestAnimationFrame(() => this.refreshCutSilhouette());
+    });
   }
 
   getMeshPolygon(): Vec2[] {
@@ -124,9 +275,42 @@ export class SceneView {
     const pos = this.meshObject.geometry.getAttribute('position');
     const out: Vec2[] = [];
     for (let i = 0; i < pos.count; i++) {
-      out.push({ x: pos.getX(i), y: -pos.getY(i) });
+      out.push({ x: pos.getX(i), y: pos.getY(i) });
     }
     return out;
+  }
+
+  getCurrentMesh(): Mesh3D | null {
+    return this.currentMeshData;
+  }
+
+  /** Rendered mesh (world transform includes y-flip). */
+  getMeshObject(): THREE.Mesh | null {
+    return this.meshObject;
+  }
+
+  getCamera(): THREE.Camera {
+    return this.camera;
+  }
+
+  /** Frozen copy of the live camera so a cut uses the view from when its stroke was drawn. */
+  private snapshotCamera(): THREE.Camera {
+    const snapshot = this.camera.clone() as THREE.Camera;
+    snapshot.position.copy(this.camera.position);
+    snapshot.quaternion.copy(this.camera.quaternion);
+    snapshot.scale.copy(this.camera.scale);
+    snapshot.updateMatrixWorld(true);
+    if (
+      snapshot instanceof THREE.PerspectiveCamera ||
+      snapshot instanceof THREE.OrthographicCamera
+    ) {
+      snapshot.updateProjectionMatrix();
+    }
+    return snapshot;
+  }
+
+  getOverlayElement(): HTMLElement {
+    return this.overlayCanvas;
   }
 
   clearSurfaceLines(): void {
@@ -149,6 +333,9 @@ export class SceneView {
     this.overlayCanvas.addEventListener('pointerdown', (e) => {
       if (this.interactionMode === 'orbit') return;
       if (this.interactionMode !== 'silhouette' && !this.meshObject) return;
+      if (this.interactionMode === 'cut') {
+        this.discardPendingCut();
+      }
       e.preventDefault();
       this.overlayCanvas.setPointerCapture(e.pointerId);
       this.painting = true;
@@ -181,10 +368,6 @@ export class SceneView {
 
     this.overlayCanvas.addEventListener('pointerup', finish);
     this.overlayCanvas.addEventListener('pointercancel', finish);
-  }
-
-  private threeToMesh(p: THREE.Vector3): Vec2 {
-    return { x: p.x, y: -p.y };
   }
 
   private finishSilhouetteStroke(): void {
@@ -223,26 +406,192 @@ export class SceneView {
   }
 
   private finishCutStroke(): void {
-    this.clearOverlay();
-    if (!this.meshObject || this.paintStroke.length < 2) {
-      this.paintStroke = [];
+    const stroke = [...this.paintStroke];
+    this.paintStroke = [];
+
+    if (!this.meshObject || !this.currentMeshData) {
+      this.drawCutOverlay();
       return;
     }
 
-    const projected = projectScreenStrokeToPlane(
-      this.paintStroke,
+    if (stroke.length < 2) {
+      this.onCutRejected?.('Cut stroke is too short.');
+      this.drawCutOverlay();
+      return;
+    }
+
+    this.refreshCutSilhouette();
+    if (this.cutSilhouette.length < 3) {
+      this.onCutRejected?.('Could not compute object silhouette from the current view.');
+      this.drawCutOverlay();
+      return;
+    }
+
+    const validated = validateCutCrossesBoundary(this.cutSilhouette, stroke);
+    if ('error' in validated) {
+      this.onCutRejected?.(validated.error);
+      this.drawCutOverlay(stroke);
+      return;
+    }
+
+    const { front, back } = projectScreenStrokeFrontBack(
+      stroke,
       this.camera,
+      this.meshObject,
       this.overlayCanvas
     );
-    this.paintStroke = [];
 
-    if (projected.length < 2) return;
-
-    const cutMesh = projected.map((p) => this.threeToMesh(p));
-    const applied = this.onCutComplete?.(cutMesh) ?? false;
-    if (applied) {
-      this.addSurfaceLine(projected, CUT_LINE_COLOR);
+    if (front.length < 2 || back.length < 2) {
+      this.onCutRejected?.(
+        'Could not project cut onto the surface. Adjust the view or redraw the stroke.'
+      );
+      this.drawCutOverlay(stroke);
+      return;
     }
+
+    const frontPath = front.map(worldHitToMeshVertex);
+    const backPath = back.map(worldHitToMeshVertex);
+
+    this.pendingCut = {
+      screenStroke: stroke,
+      validated: {
+        silhouette: validated.silhouette,
+        hits: validated.hits,
+      },
+      frontPath,
+      backPath,
+      camera: this.snapshotCamera(),
+    };
+
+    this.showCutProjectionPreview(front, back);
+    this.syncPointerAndOrbitState();
+    this.onCutPreview?.(this.pendingCut);
+    this.drawCutOverlay();
+  }
+
+  /** Recompute screen silhouette for cut mode (call after camera / mesh changes). */
+  refreshCutSilhouette(): void {
+    if (this.interactionMode !== 'cut' || !this.currentMeshData) {
+      this.cutSilhouette = [];
+      if (this.interactionMode === 'cut') this.drawCutOverlay();
+      return;
+    }
+
+    const rect = this.overlayCanvas.getBoundingClientRect();
+    if (rect.width < 2 || rect.height < 2) {
+      this.scheduleCutSilhouetteRefreshImmediate();
+      return;
+    }
+
+    this.controls.update();
+    this.camera.updateMatrixWorld(true);
+    this.camera.updateProjectionMatrix();
+
+    if (!this.meshObject) {
+      this.cutSilhouette = [];
+    } else {
+      this.cutSilhouette = computeScreenSilhouetteFromRender(
+        this.renderer,
+        this.meshObject,
+        this.camera,
+        rect.width,
+        rect.height
+      );
+    }
+
+    if (this.cutSilhouette.length < 3) {
+      this.onCutRejected?.(
+        'Could not compute projected silhouette — try rotating the view slightly.'
+      );
+    }
+    this.drawCutOverlay();
+  }
+
+  private clearOverlayBuffer(): void {
+    this.overlayCtx.save();
+    this.overlayCtx.setTransform(1, 0, 0, 1, 0, 0);
+    this.overlayCtx.clearRect(0, 0, this.overlayCanvas.width, this.overlayCanvas.height);
+    this.overlayCtx.restore();
+  }
+
+  private drawCutOverlay(stroke: Vec2[] = this.paintStroke): void {
+    if (this.overlayCanvas.clientWidth < 2) return;
+
+    this.clearOverlayBuffer();
+
+    if (this.cutSilhouette.length >= 3) {
+      this.overlayCtx.save();
+      this.overlayCtx.fillStyle = 'rgba(45, 90, 142, 0.12)';
+      this.overlayCtx.strokeStyle = '#1a4d8c';
+      this.overlayCtx.lineWidth = 3;
+      this.overlayCtx.setLineDash([10, 6]);
+      this.overlayCtx.lineJoin = 'round';
+      this.overlayCtx.lineCap = 'round';
+      this.overlayCtx.beginPath();
+      this.overlayCtx.moveTo(this.cutSilhouette[0].x, this.cutSilhouette[0].y);
+      for (let i = 1; i < this.cutSilhouette.length; i++) {
+        this.overlayCtx.lineTo(this.cutSilhouette[i].x, this.cutSilhouette[i].y);
+      }
+      this.overlayCtx.closePath();
+      this.overlayCtx.fill();
+      this.overlayCtx.stroke();
+      this.overlayCtx.setLineDash([]);
+      this.overlayCtx.restore();
+    }
+
+    if (stroke.length >= 2) {
+      this.overlayCtx.lineCap = 'round';
+      this.overlayCtx.lineJoin = 'round';
+      this.overlayCtx.setLineDash([]);
+      this.overlayCtx.strokeStyle = 'rgba(211, 84, 0, 0.75)';
+      this.overlayCtx.lineWidth = 2.5;
+      this.overlayCtx.beginPath();
+      this.overlayCtx.moveTo(stroke[0].x, stroke[0].y);
+      for (let i = 1; i < stroke.length; i++) {
+        this.overlayCtx.lineTo(stroke[i].x, stroke[i].y);
+      }
+      this.overlayCtx.stroke();
+    }
+  }
+
+  private discardPendingCut(): void {
+    const hadPending = this.pendingCut !== null;
+    this.pendingCut = null;
+    this.clearCutProjectionPreview();
+    this.syncPointerAndOrbitState();
+    if (hadPending) this.onCutPendingChange?.();
+  }
+
+  clearCutProjectionPreview(): void {
+    while (this.cutPreviewGroup.children.length > 0) {
+      const child = this.cutPreviewGroup.children[0];
+      this.cutPreviewGroup.remove(child);
+      if (child instanceof THREE.Line) {
+        child.geometry.dispose();
+        (child.material as THREE.Material).dispose();
+      }
+    }
+  }
+
+  private showCutProjectionPreview(front: THREE.Vector3[], back: THREE.Vector3[]): void {
+    this.clearCutProjectionPreview();
+    this.addCutPreviewLine(front, CUT_PREVIEW_FRONT_COLOR);
+    this.addCutPreviewLine(back, CUT_PREVIEW_BACK_COLOR);
+  }
+
+  private addCutPreviewLine(points: THREE.Vector3[], color: number): void {
+    if (points.length < 2) return;
+    const geometry = new THREE.BufferGeometry().setFromPoints(points);
+    const line = new THREE.Line(
+      geometry,
+      new THREE.LineBasicMaterial({
+        color,
+        depthTest: true,
+        depthWrite: true,
+      })
+    );
+    line.renderOrder = 11;
+    this.cutPreviewGroup.add(line);
   }
 
   private addSurfaceLine(points: THREE.Vector3[], color: number): void {
@@ -256,20 +605,22 @@ export class SceneView {
   }
 
   private drawOverlayPreview(): void {
+    if (this.interactionMode === 'cut') {
+      this.drawCutOverlay();
+      return;
+    }
+
     const w = this.overlayCanvas.clientWidth;
     const h = this.overlayCanvas.clientHeight;
     this.overlayCtx.clearRect(0, 0, w, h);
     if (this.paintStroke.length < 2) return;
 
-    const isCut = this.interactionMode === 'cut';
     const isSilhouette = this.interactionMode === 'silhouette';
     this.overlayCtx.lineCap = 'round';
     this.overlayCtx.lineJoin = 'round';
     this.overlayCtx.strokeStyle = isSilhouette
       ? 'rgba(45, 90, 142, 0.75)'
-      : isCut
-        ? 'rgba(211, 84, 0, 0.6)'
-        : 'rgba(192, 57, 43, 0.55)';
+      : 'rgba(192, 57, 43, 0.55)';
     this.overlayCtx.lineWidth = 2.5;
     this.overlayCtx.beginPath();
     this.overlayCtx.moveTo(this.paintStroke[0].x, this.paintStroke[0].y);
@@ -280,9 +631,7 @@ export class SceneView {
   }
 
   private clearOverlay(): void {
-    const w = this.overlayCanvas.clientWidth;
-    const h = this.overlayCanvas.clientHeight;
-    this.overlayCtx.clearRect(0, 0, w, h);
+    this.clearOverlayBuffer();
   }
 
   private resizeOverlay(): void {
@@ -306,6 +655,8 @@ export class SceneView {
     const showWire = this.displayMode === 'wireframe' || this.displayMode === 'both';
     if (this.meshObject) this.meshObject.visible = showSolid;
     if (this.wireframe) this.wireframe.visible = showWire;
+    if (this.secondaryMeshObject) this.secondaryMeshObject.visible = showSolid;
+    if (this.secondaryWireframe) this.secondaryWireframe.visible = showWire;
   }
 
   private onResize(): void {
@@ -316,6 +667,9 @@ export class SceneView {
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
     this.resizeOverlay();
+    if (this.interactionMode === 'cut') {
+      this.scheduleCutSilhouetteRefreshImmediate();
+    }
   }
 
   private animate = (): void => {
@@ -323,10 +677,176 @@ export class SceneView {
     if (!this.container.classList.contains('hidden')) {
       this.controls.update();
       this.renderer.render(this.scene, this.camera);
+      if (this.interactionMode === 'cut' && this.currentMeshData) {
+        this.drawCutOverlay();
+      }
     }
   };
 
-  setMesh(mesh: Mesh3D | null): void {
+  clearSpineOverlay(): void {
+    while (this.spineLinesGroup.children.length > 0) {
+      const child = this.spineLinesGroup.children[0];
+      this.spineLinesGroup.remove(child);
+      if (child instanceof THREE.Mesh) {
+        child.geometry.dispose();
+      }
+    }
+    this.spineTubeMaterial?.dispose();
+    this.spineTubeMaterial = null;
+  }
+
+  /** Draw chordal-axis trunk as thick black tubes (step 2). */
+  setSpineOverlay(
+    vertices: { x: number; y: number; z: number }[],
+    segments: [number, number][]
+  ): void {
+    this.clearSpineOverlay();
+    const up = new THREE.Vector3(0, 1, 0);
+    const dir = new THREE.Vector3();
+    this.spineTubeMaterial?.dispose();
+    this.spineTubeMaterial = new THREE.MeshBasicMaterial({
+      color: SPINE_LINE_COLOR,
+      depthTest: false,
+      depthWrite: false,
+    });
+    const material = this.spineTubeMaterial;
+
+    for (const [a, b] of segments) {
+      const va = vertices[a];
+      const vb = vertices[b];
+      const dx = vb.x - va.x;
+      const dy = vb.y - va.y;
+      const dz = vb.z - va.z;
+      const len = Math.hypot(dx, dy, dz);
+      if (len < 1e-6) continue;
+
+      const geometry = new THREE.CylinderGeometry(
+        SPINE_TUBE_RADIUS,
+        SPINE_TUBE_RADIUS,
+        len,
+        8,
+        1,
+        false
+      );
+      const tube = new THREE.Mesh(geometry, material);
+      tube.position.set(
+        (va.x + vb.x) / 2,
+        (va.y + vb.y) / 2,
+        (va.z + vb.z) / 2
+      );
+      dir.set(dx / len, dy / len, dz / len);
+      tube.quaternion.setFromUnitVectors(up, dir);
+      tube.renderOrder = 1000;
+      this.spineLinesGroup.add(tube);
+    }
+  }
+
+  clearSecondaryMesh(): void {
+    if (this.secondaryMeshObject) {
+      this.scene.remove(this.secondaryMeshObject);
+      this.secondaryMeshObject.geometry.dispose();
+      (this.secondaryMeshObject.material as THREE.Material).dispose();
+      this.secondaryMeshObject = null;
+    }
+    if (this.secondaryWireframe) {
+      this.scene.remove(this.secondaryWireframe);
+      this.secondaryWireframe.geometry.dispose();
+      (this.secondaryWireframe.material as THREE.Material).dispose();
+      this.secondaryWireframe = null;
+    }
+  }
+
+  /** Overlay mesh (e.g. green terminal fans on top of classified CDT). */
+  setSecondaryMesh(mesh: Mesh3D | null, options: MeshDisplayOptions = {}): void {
+    this.clearSecondaryMesh();
+    if (!mesh || mesh.vertices.length === 0) return;
+
+    const built = this.buildMeshGeometry(mesh, options);
+    const opacity = options.opacity ?? 1;
+
+    const material = new THREE.MeshPhongMaterial({
+      color: built.useFaceColors ? 0xffffff : (options.color ?? DEFAULT_MESH_COLOR),
+      vertexColors: built.useFaceColors,
+      side: MESH_MATERIAL_SIDE,
+      flatShading: built.useFaceColors,
+      transparent: opacity < 1,
+      opacity,
+      depthWrite: opacity >= 1,
+      shininess: 30,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1,
+    });
+
+    this.secondaryMeshObject = new THREE.Mesh(built.geometry, material);
+    this.secondaryMeshObject.scale.set(1, -1, 1);
+    this.secondaryMeshObject.renderOrder = 1;
+    this.scene.add(this.secondaryMeshObject);
+
+    const wireGeom = new THREE.WireframeGeometry(built.geometry);
+    this.secondaryWireframe = new THREE.LineSegments(
+      wireGeom,
+      new THREE.LineBasicMaterial({
+        color: options.wireColor ?? DEFAULT_WIRE_COLOR,
+        transparent: opacity < 1,
+        opacity: Math.min(1, opacity + 0.25),
+      })
+    );
+    this.secondaryWireframe.scale.set(1, -1, 1);
+    this.secondaryWireframe.renderOrder = 2;
+    this.scene.add(this.secondaryWireframe);
+
+    this.applyDisplayMode();
+  }
+
+  private buildMeshGeometry(
+    mesh: Mesh3D,
+    options: MeshDisplayOptions
+  ): { geometry: THREE.BufferGeometry; useFaceColors: boolean } {
+    const useFaceColors =
+      options.faceColors !== undefined &&
+      options.faceColors.length === mesh.faces.length;
+
+    const geometry = new THREE.BufferGeometry();
+
+    if (useFaceColors) {
+      const positions: number[] = [];
+      const colors: number[] = [];
+      const color = new THREE.Color();
+
+      for (let fi = 0; fi < mesh.faces.length; fi++) {
+        color.setHex(options.faceColors![fi]);
+        const [a, b, c] = mesh.faces[fi];
+        for (const idx of [a, b, c]) {
+          const v = mesh.vertices[idx];
+          positions.push(v.x, v.y, v.z);
+          colors.push(color.r, color.g, color.b);
+        }
+      }
+
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+      geometry.computeVertexNormals();
+    } else {
+      const positions: number[] = [];
+      for (const v of mesh.vertices) {
+        positions.push(v.x, v.y, v.z);
+      }
+
+      const indices: number[] = [];
+      for (const [a, b, c] of mesh.faces) {
+        indices.push(a, b, c);
+      }
+
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      geometry.setIndex(indices);
+      geometry.computeVertexNormals();
+    }
+
+    return { geometry, useFaceColors };
+  }
+
+  setMesh(mesh: Mesh3D | null, options: MeshDisplayOptions = {}): void {
     this.clearSurfaceLines();
 
     if (this.meshObject) {
@@ -343,28 +863,21 @@ export class SceneView {
     }
 
     if (!mesh || mesh.vertices.length === 0) {
+      this.currentMeshData = null;
       return;
     }
 
-    const positions: number[] = [];
-    for (const v of mesh.vertices) {
-      positions.push(v.x, -v.y, v.z);
+    this.currentMeshData = mesh;
+    if (this.interactionMode === 'cut') {
+      this.scheduleCutSilhouetteRefreshImmediate();
     }
-
-    const indices: number[] = [];
-    for (const [a, b, c] of mesh.faces) {
-      indices.push(a, c, b);
-    }
-
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-    geometry.setIndex(indices);
-    geometry.computeVertexNormals();
+    const { geometry, useFaceColors } = this.buildMeshGeometry(mesh, options);
 
     const material = new THREE.MeshPhongMaterial({
-      color: 0x6b9bd1,
-      side: THREE.FrontSide,
-      flatShading: false,
+      color: useFaceColors ? 0xffffff : (options.color ?? DEFAULT_MESH_COLOR),
+      vertexColors: useFaceColors,
+      side: MESH_MATERIAL_SIDE,
+      flatShading: useFaceColors || options.flatShading === true,
       shininess: 30,
       polygonOffset: true,
       polygonOffsetFactor: 1,
@@ -372,22 +885,42 @@ export class SceneView {
     });
 
     this.meshObject = new THREE.Mesh(geometry, material);
+    this.meshObject.scale.set(1, -1, 1);
     this.scene.add(this.meshObject);
 
     const wireGeom = new THREE.WireframeGeometry(geometry);
     this.wireframe = new THREE.LineSegments(
       wireGeom,
-      new THREE.LineBasicMaterial({ color: 0x2d4a63 })
+      new THREE.LineBasicMaterial({ color: options.wireColor ?? DEFAULT_WIRE_COLOR })
     );
+    this.wireframe.scale.set(1, -1, 1);
     this.scene.add(this.wireframe);
 
     this.applyDisplayMode();
   }
 
+  addCutSurfaceLines(front: Vec3[], back: Vec3[]): void {
+    const toWorld = (v: Vec3) => new THREE.Vector3(v.x, -v.y, v.z);
+    this.addSurfaceLine(front.map(toWorld), CUT_LINE_COLOR);
+    this.addSurfaceLine(back.map(toWorld), CUT_LINE_COLOR);
+  }
+
+  /** Restore default orbit distance/angle so a previous zoom-in does not block the next object. */
+  resetOrbitCamera(): void {
+    this.camera.position.copy(DEFAULT_CAMERA_POSITION);
+    this.controls.target.copy(DEFAULT_ORBIT_TARGET);
+    this.controls.update();
+  }
+
   clear(): void {
+    this.cancelSilhouetteIdleRefresh();
     this.setMesh(null);
+    this.clearSecondaryMesh();
+    this.clearSpineOverlay();
     this.clearSurfaceLines();
+    this.discardPendingCut();
     this.clearOverlay();
+    this.resetOrbitCamera();
     this.setInteractionMode('silhouette');
   }
 }

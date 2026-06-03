@@ -8,8 +8,8 @@ Web app that turns a hand-drawn 2D silhouette into an inflated 3D polygonal mesh
 - **Auto-close tolerance** — if start and end are within 40px, the stroke snaps closed; otherwise a closing segment is added
 - **Uniform resampling** — stroke is resampled to even edge length before meshing
 - **Constrained Delaunay triangulation (CDT)** — `cdt2d` on the polygon boundary
-- **Flat 3D polygon** — CDT fills the interior; all vertices lie in the sketch plane (z = 0)
-- **Single panel** — draw the silhouette once on 2D canvas; mesh appears in the same area with **rotate** (drag) and **zoom** (scroll)
+- **Teddy inflation** — inflation pipeline ported from [zeyap/teddy](https://github.com/zeyap/teddy): terminal pruning, spine growth, quarter-oval elevation (SIGGRAPH ’99 §5.1), mirrored back face, and rim stitching
+- **Single 3D panel** — draw the silhouette on the view plane; mesh appears where you drew with **rotate**, **zoom**, and **pan**
 - **Paint & cut** — projected onto the 3D mesh after the silhouette is locked
 
 ## Live demo (GitHub Pages)
@@ -34,12 +34,15 @@ Open the URL shown in the terminal (typically `http://localhost:5173`).
 ```bash
 npm run build
 npm run preview
+npm test
 ```
+
+`npm test` checks mesh winding: interior faces point outward from the solid, and **silhouette-adjacent** faces point up on the top cap (the usual hole source).
 
 ## Usage
 
 1. Draw a simple closed shape on the canvas (blob, star, animal silhouette) — **only once** per session until **Clear**.
-2. Release the pointer — the loop auto-closes and the triangulated polygon appears (drag to rotate, scroll to zoom).
+2. Release the pointer — the loop auto-closes and an inflated 3D shape appears (drag to rotate, scroll to zoom, right-drag to pan).
 3. Use **Paint** or **Cut** modes for further edits.
 
 Avoid self-intersecting outlines; the paper’s algorithm assumes a simple closed polygon.
@@ -48,3 +51,4 @@ Avoid self-intersecting outlines; the paper’s algorithm assumes a simple close
 
 - Paper: [siggraph99.pdf](https://www-ui.is.s.u-tokyo.ac.jp/~takeo/papers/siggraph99.pdf)
 - Original Teddy: http://www-ui.is.s.u-tokyo.ac.jp/~takeo/teddy/teddy.htm
+- Inflation port reference: [zeyap/teddy](https://github.com/zeyap/teddy)
