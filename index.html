@@ -34,6 +34,14 @@
                 <input type="checkbox" id="cut-mode" disabled />
                 Cut mode
               </label>
+              <label class="paint-toggle">
+                <input type="checkbox" id="loopcut-mode" disabled />
+                Loop cut
+              </label>
+              <label class="paint-toggle">
+                <input type="checkbox" id="extrude-mode" disabled />
+                Extrude
+              </label>
             </div>
             <span class="inflation-step" id="inflation-step" aria-live="polite"></span>
             <span class="hint" id="canvas-hint">Draw one closed loop on the 3D plane</span>
@@ -47,6 +55,9 @@
             <button id="btn-fill-cut" type="button" disabled>Fill hole</button>
             <button id="btn-discard-cut" type="button" class="secondary" disabled>
               Discard cut
+            </button>
+            <button id="btn-confirm-extrude" type="button" disabled>
+              Confirm orientation
             </button>
             <button id="btn-square" type="button" class="secondary">Create square</button>
             <button id="btn-clear" type="button" class="secondary">Clear</button>

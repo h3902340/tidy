@@ -4,21 +4,57 @@ import type { Mesh3D } from './teddy';
 import { validateCutCrossesBoundary, type CutBoundaryHit } from './cutPolygon';
 import { computeScreenSilhouetteFromRender } from './renderSilhouette';
 import {
+  projectClosedLoopToFrontSurface,
   projectScreenStroke,
   projectScreenStrokeFrontBack,
   projectScreenStrokeToPlane,
   worldHitToMeshVertex,
 } from './surfaceProjection';
+import {
+  computeExtrusion,
+  fillLoopHole,
+  imprintLoop,
+  type ExtrusionBase,
+} from './extrude';
 import { CLOSE_TOLERANCE, closeStroke } from './stroke';
 import type { Vec2, Vec3 } from './math';
 
 export type DisplayMode = 'solid' | 'wireframe' | 'both';
-export type InteractionMode = 'silhouette' | 'orbit' | 'paint' | 'cut';
+export type InteractionMode =
+  | 'silhouette'
+  | 'orbit'
+  | 'paint'
+  | 'cut'
+  | 'extrude'
+  | 'loopcut';
+
+/** Sub-phases of the two-stroke extrusion gesture (Teddy §4.4 / §5.3). */
+export type ExtrudePhase = 'idle' | 'loop' | 'orient' | 'curve';
+
+/**
+ * Loop cut runs in three inspectable stages so each can be verified independently:
+ *   1. `idle`      — draw the loop; it is projected onto the front surface and shown as a ring.
+ *   2. `projected` — loop ring is on the surface; press "Remove triangles" to imprint + cut.
+ *   3. `cut`       — enclosed surface removed (open hole shown); press "Fill hole" to close it.
+ */
+export type LoopCutPhase = 'idle' | 'projected' | 'cut';
 
 export type SilhouetteCompleteHandler = (closed: Vec2[]) => void;
+export type ExtrudeStatusHandler = (message: string, type: 'ok' | 'error') => void;
+export type ExtrudeMeshHandler = (mesh: Mesh3D) => void;
+export type SurfaceEditStatusHandler = (message: string, type: 'ok' | 'error') => void;
+export type SurfaceEditMeshHandler = (mesh: Mesh3D) => void;
 
 const PAINT_LINE_COLOR = 0xc0392b;
 const CUT_LINE_COLOR = 0xd35400;
+/** Base ring highlight while in extrusion mode (paper turns the surface line red). */
+const EXTRUDE_RING_COLOR = 0xe03030;
+/** Loop-cut projected loop + opening boundary highlight (green, distinct from extrude red). */
+const LOOPCUT_RING_COLOR = 0x27c93f;
+/** Mesh tint while the loop-cut hole is open (before filling). */
+const LOOPCUT_OPEN_COLOR = 0x8fa8c4;
+const EXTRUDE_LOOP_PREVIEW = 'rgba(224, 48, 48, 0.8)';
+const EXTRUDE_CURVE_PREVIEW = 'rgba(211, 84, 0, 0.85)';
 /** Preview: front surface (Teddy §5.4) along view rays. */
 const CUT_PREVIEW_FRONT_COLOR = 0x1abc9c;
 /** Preview: back surface along view rays. */
@@ -93,6 +129,18 @@ export class SceneView {
   private cutSilhouette: Vec2[] = [];
   private silhouetteIdleTimer: ReturnType<typeof setTimeout> | null = null;
   private onSilhouetteComplete: SilhouetteCompleteHandler | null = null;
+  private extrudePhase: ExtrudePhase = 'idle';
+  private extrudeBase: ExtrusionBase | null = null;
+  private extrudeRingGroup: THREE.Group;
+  private onExtrudeStatus: ExtrudeStatusHandler | null = null;
+  private onExtrudeLoopReady: (() => void) | null = null;
+  private onExtrudeComplete: ExtrudeMeshHandler | null = null;
+  private onLoopCutStatus: SurfaceEditStatusHandler | null = null;
+  private onLoopCutComplete: SurfaceEditMeshHandler | null = null;
+  private onLoopCutPhaseChange: (() => void) | null = null;
+  private loopCutPhase: LoopCutPhase = 'idle';
+  private loopCutBase: ExtrusionBase | null = null;
+  private loopCutMeshBeforeCut: Mesh3D | null = null;
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -107,6 +155,9 @@ export class SceneView {
     this.spineLinesGroup = new THREE.Group();
     this.spineLinesGroup.scale.set(1, -1, 1);
     this.scene.add(this.spineLinesGroup);
+    // Base ring lives in world space so it stays put while the camera orbits around it.
+    this.extrudeRingGroup = new THREE.Group();
+    this.scene.add(this.extrudeRingGroup);
 
     const aspect = container.clientWidth / Math.max(container.clientHeight, 1);
     this.camera = new THREE.PerspectiveCamera(45, aspect, 0.1, 2000);
@@ -192,6 +243,38 @@ export class SceneView {
     this.onSilhouetteComplete = handler;
   }
 
+  setOnExtrudeStatus(handler: ExtrudeStatusHandler | null): void {
+    this.onExtrudeStatus = handler;
+  }
+
+  setOnExtrudeLoopReady(handler: (() => void) | null): void {
+    this.onExtrudeLoopReady = handler;
+  }
+
+  setOnExtrudeComplete(handler: ExtrudeMeshHandler | null): void {
+    this.onExtrudeComplete = handler;
+  }
+
+  setOnLoopCutStatus(handler: SurfaceEditStatusHandler | null): void {
+    this.onLoopCutStatus = handler;
+  }
+
+  setOnLoopCutComplete(handler: SurfaceEditMeshHandler | null): void {
+    this.onLoopCutComplete = handler;
+  }
+
+  setOnLoopCutPhaseChange(handler: (() => void) | null): void {
+    this.onLoopCutPhaseChange = handler;
+  }
+
+  getLoopCutPhase(): LoopCutPhase {
+    return this.loopCutPhase;
+  }
+
+  getExtrudePhase(): ExtrudePhase {
+    return this.extrudePhase;
+  }
+
   /** Project screen-space points onto the z = 0 drawing plane (world coords). */
   projectScreenToMeshPlane(screenPoints: Vec2[]): Vec2[] {
     const hits = projectScreenStrokeToPlane(
@@ -204,8 +287,14 @@ export class SceneView {
 
   setInteractionMode(mode: InteractionMode): void {
     this.interactionMode = mode;
+    if (mode !== 'extrude') this.resetExtrudeState();
+    if (mode !== 'loopcut') this.resetLoopCutState();
     const overlayActive =
-      mode === 'silhouette' || mode === 'paint' || mode === 'cut';
+      mode === 'silhouette' ||
+      mode === 'paint' ||
+      mode === 'cut' ||
+      mode === 'extrude' ||
+      mode === 'loopcut';
     if (!overlayActive) {
       this.painting = false;
       this.paintStroke = [];
@@ -217,25 +306,52 @@ export class SceneView {
       this.paintStroke = [];
       this.discardPendingCut();
       this.scheduleCutSilhouetteRefreshImmediate();
+    } else if (mode === 'extrude') {
+      this.painting = false;
+      this.paintStroke = [];
+      this.discardPendingCut();
+      this.clearOverlay();
+      this.startExtrude();
+    } else if (mode === 'loopcut') {
+      this.painting = false;
+      this.paintStroke = [];
+      this.discardPendingCut();
+      this.clearOverlay();
+      this.resetLoopCutState();
+      this.onLoopCutStatus?.(
+        'Loop cut (step 1/3): draw a closed loop on the surface to project it onto the front face.',
+        'ok'
+      );
     }
     this.syncPointerAndOrbitState();
   }
 
-  /** Overlay captures strokes; orbit uses the canvas when reviewing a cut preview. */
+  /** Overlay captures strokes; orbit uses the canvas during a cut review or extrusion re-orient. */
   private syncPointerAndOrbitState(): void {
+    const cutReviewing =
+      this.interactionMode === 'cut' && this.pendingCut !== null;
+    const extrudeDrawing =
+      this.interactionMode === 'extrude' &&
+      (this.extrudePhase === 'loop' || this.extrudePhase === 'curve');
+    const extrudeOrbit =
+      this.interactionMode === 'extrude' && this.extrudePhase === 'orient';
+    const loopCutDrawing =
+      this.interactionMode === 'loopcut' && this.loopCutPhase === 'idle';
+    const loopCutReviewing =
+      this.interactionMode === 'loopcut' && this.loopCutPhase !== 'idle';
     const overlayActive =
       this.interactionMode === 'silhouette' ||
       this.interactionMode === 'paint' ||
-      this.interactionMode === 'cut';
-    const cutReviewing =
-      this.interactionMode === 'cut' && this.pendingCut !== null;
+      this.interactionMode === 'cut' ||
+      loopCutDrawing ||
+      extrudeDrawing;
 
     this.overlayCanvas.classList.toggle(
       'overlay-interactive',
       overlayActive && !cutReviewing
     );
     this.controls.enabled =
-      this.interactionMode === 'orbit' || cutReviewing;
+      this.interactionMode === 'orbit' || cutReviewing || extrudeOrbit || loopCutReviewing;
   }
 
   private cancelSilhouetteIdleRefresh(): void {
@@ -333,6 +449,13 @@ export class SceneView {
     this.overlayCanvas.addEventListener('pointerdown', (e) => {
       if (this.interactionMode === 'orbit') return;
       if (this.interactionMode !== 'silhouette' && !this.meshObject) return;
+      if (
+        this.interactionMode === 'extrude' &&
+        this.extrudePhase !== 'loop' &&
+        this.extrudePhase !== 'curve'
+      ) {
+        return;
+      }
       if (this.interactionMode === 'cut') {
         this.discardPendingCut();
       }
@@ -363,6 +486,10 @@ export class SceneView {
         this.finishPaintStroke();
       } else if (this.interactionMode === 'cut') {
         this.finishCutStroke();
+      } else if (this.interactionMode === 'extrude') {
+        this.finishExtrudeStroke();
+      } else if (this.interactionMode === 'loopcut') {
+        this.finishLoopCutStroke();
       }
     };
 
@@ -403,6 +530,269 @@ export class SceneView {
     if (projected.length < 2) return;
 
     this.addSurfaceLine(projected, PAINT_LINE_COLOR);
+  }
+
+  /**
+   * Loop cut — stage 1 of 3: project the drawn loop onto the front surface and show it as a
+   * ring. The actual cut (stage 2) and fill (stage 3) are triggered from the action buttons so
+   * each stage can be inspected on its own.
+   */
+  private finishLoopCutStroke(): void {
+    this.clearOverlay();
+    const stroke = [...this.paintStroke];
+    this.paintStroke = [];
+
+    if (this.loopCutPhase !== 'idle') return;
+    if (!this.meshObject || !this.currentMeshData) return;
+    if (stroke.length < 3) {
+      this.onLoopCutStatus?.('Loop is too short — draw a closed loop on the surface.', 'error');
+      return;
+    }
+
+    const closed = closeStroke(stroke, CLOSE_TOLERANCE);
+    // Require the whole loop to land on the front surface before cutting.
+    const projected = projectClosedLoopToFrontSurface(
+      closed,
+      this.camera,
+      this.meshObject,
+      this.overlayCanvas
+    );
+    if ('error' in projected) {
+      this.onLoopCutStatus?.(projected.error, 'error');
+      return;
+    }
+
+    // Imprint immediately with the *draw-time* camera, so a later orbit can't desync the
+    // screen-space loop from the mesh. The cut is only revealed in stage 2.
+    const before = this.currentMeshData;
+    const base = imprintLoop(before, closed, this.camera, this.overlayCanvas);
+    if ('error' in base) {
+      this.onLoopCutStatus?.(base.error, 'error');
+      return;
+    }
+    const removed = base.removedCount;
+
+    this.loopCutBase = base;
+    this.loopCutMeshBeforeCut = before;
+    this.loopCutPhase = 'projected';
+    // Show the exact opening boundary that will be cut (green = the imprinted loop).
+    this.showExtrudeRing(base.ringWorld, LOOPCUT_RING_COLOR);
+    this.syncPointerAndOrbitState();
+    this.onLoopCutPhaseChange?.();
+    this.onLoopCutStatus?.(
+      `Loop cut (step 1/3): loop imprinted — will remove ${removed} triangle(s); boundary has ` +
+        `${base.holeBoundary.length} vertices (green). [${base.debug ?? ''}] ` +
+        `Orbit to inspect, then press "Remove triangles".`,
+      'ok'
+    );
+  }
+
+  /** Loop cut — stage 2 of 3: reveal the cut by removing the enclosed front surface. */
+  applyLoopCut(): void {
+    if (this.interactionMode !== 'loopcut' || this.loopCutPhase !== 'projected') return;
+    if (!this.loopCutBase || !this.loopCutMeshBeforeCut) return;
+
+    const base = this.loopCutBase;
+    const removed = base.removedCount;
+    this.loopCutPhase = 'cut';
+
+    // Show the open cut (kept faces only — the hole is visible) and the exact opening boundary.
+    this.setMesh(
+      { vertices: base.vertices, faces: base.keptFaces },
+      { color: LOOPCUT_OPEN_COLOR, wireColor: 0x2d4a63, flatShading: true }
+    );
+    this.showExtrudeRing(base.ringWorld, LOOPCUT_RING_COLOR);
+    this.syncPointerAndOrbitState();
+    this.onLoopCutPhaseChange?.();
+    this.onLoopCutStatus?.(
+      `Loop cut (step 2/3): removed ${removed} triangle(s); opening boundary has ` +
+        `${base.holeBoundary.length} vertices (green). Orbit to inspect the hole, then press "Fill hole".`,
+      'ok'
+    );
+  }
+
+  /** Loop cut — stage 3 of 3: fill the opening left by the cut. */
+  fillLoopCut(): void {
+    if (this.interactionMode !== 'loopcut' || this.loopCutPhase !== 'cut') return;
+    if (!this.loopCutBase || !this.loopCutMeshBeforeCut) return;
+
+    const filled = fillLoopHole(this.loopCutMeshBeforeCut, this.loopCutBase);
+    if ('error' in filled) {
+      this.onLoopCutStatus?.(filled.error, 'error');
+      return;
+    }
+
+    const capFaces = filled.mesh.faces.length - this.loopCutBase.keptFaces.length;
+    this.clearExtrudeRing();
+    this.resetLoopCutState();
+    this.onLoopCutComplete?.(filled.mesh);
+    this.onLoopCutPhaseChange?.();
+    this.onLoopCutStatus?.(
+      `Loop cut (step 3/3): filled the opening with ${capFaces} triangle(s). ` +
+        `Mesh now has ${filled.mesh.faces.length} triangles.`,
+      'ok'
+    );
+  }
+
+  /** Discard an in-progress loop cut and restore the mesh as it was before the cut. */
+  cancelLoopCut(): void {
+    if (this.interactionMode !== 'loopcut') return;
+    const restore = this.loopCutMeshBeforeCut;
+    this.clearExtrudeRing();
+    this.resetLoopCutState();
+    if (restore) {
+      this.setMesh(restore, { color: DEFAULT_MESH_COLOR, flatShading: true });
+    }
+    this.syncPointerAndOrbitState();
+    this.onLoopCutPhaseChange?.();
+    this.onLoopCutStatus?.(
+      'Loop cut discarded. Draw a new closed loop on the surface.',
+      'ok'
+    );
+  }
+
+  private resetLoopCutState(): void {
+    this.loopCutPhase = 'idle';
+    this.loopCutBase = null;
+    this.loopCutMeshBeforeCut = null;
+    this.clearExtrudeRing();
+  }
+
+  /** Begin the extrusion gesture: await the closed base loop on the surface. */
+  private startExtrude(): void {
+    this.resetExtrudeState();
+    this.extrudePhase = 'loop';
+    this.onExtrudeStatus?.(
+      'Extrude: draw a closed loop on the object surface (front face).',
+      'ok'
+    );
+  }
+
+  private resetExtrudeState(): void {
+    this.extrudePhase = 'idle';
+    this.extrudeBase = null;
+    this.painting = false;
+    this.paintStroke = [];
+    this.clearExtrudeRing();
+  }
+
+  /** Step from the orient phase to the second (extruding) stroke. Returns false if not ready. */
+  confirmExtrudeOrientation(): boolean {
+    if (
+      this.interactionMode !== 'extrude' ||
+      this.extrudePhase !== 'orient' ||
+      !this.extrudeBase
+    ) {
+      return false;
+    }
+    this.extrudePhase = 'curve';
+    this.syncPointerAndOrbitState();
+    this.onExtrudeStatus?.(
+      'Now draw the extruding stroke: start on one side of the red loop and end on the other.',
+      'ok'
+    );
+    return true;
+  }
+
+  cancelExtrude(): void {
+    this.resetExtrudeState();
+    this.clearOverlay();
+    this.syncPointerAndOrbitState();
+  }
+
+  private finishExtrudeStroke(): void {
+    this.clearOverlay();
+    const stroke = [...this.paintStroke];
+    this.paintStroke = [];
+
+    if (!this.meshObject || !this.currentMeshData) return;
+
+    if (this.extrudePhase === 'loop') {
+      if (stroke.length < 3) {
+        this.onExtrudeStatus?.(
+          'Loop is too short — draw a closed loop on the surface.',
+          'error'
+        );
+        return;
+      }
+      const closed = closeStroke(stroke, CLOSE_TOLERANCE);
+      // First require the whole loop to land on the surface (front face only).
+      const projected = projectClosedLoopToFrontSurface(
+        closed,
+        this.camera,
+        this.meshObject,
+        this.overlayCanvas
+      );
+      if ('error' in projected) {
+        this.onExtrudeStatus?.(projected.error, 'error');
+        return;
+      }
+      // Imprint the loop into the mesh; the resulting opening boundary is the base ring.
+      const base = imprintLoop(this.currentMeshData, closed, this.camera, this.overlayCanvas);
+      if ('error' in base) {
+        this.onExtrudeStatus?.(base.error, 'error');
+        return;
+      }
+      this.extrudeBase = base;
+      this.showExtrudeRing(base.ringWorld);
+      this.extrudePhase = 'orient';
+      this.syncPointerAndOrbitState();
+      this.onExtrudeLoopReady?.();
+      this.onExtrudeStatus?.(
+        'Loop locked on the surface (red). Rotate the view, then Confirm orientation.',
+        'ok'
+      );
+      return;
+    }
+
+    if (this.extrudePhase === 'curve') {
+      if (!this.extrudeBase) return;
+      if (stroke.length < 2) {
+        this.onExtrudeStatus?.('Extruding stroke is too short.', 'error');
+        return;
+      }
+      const result = computeExtrusion(
+        this.extrudeBase,
+        stroke,
+        this.camera,
+        this.overlayCanvas
+      );
+      if ('error' in result) {
+        this.onExtrudeStatus?.(result.error, 'error');
+        return;
+      }
+      this.resetExtrudeState();
+      this.onExtrudeComplete?.(result.mesh);
+    }
+  }
+
+  private showExtrudeRing(ring: THREE.Vector3[], color = EXTRUDE_RING_COLOR): void {
+    this.clearExtrudeRing();
+    if (ring.length < 2) return;
+    const points = ring.map((p) => p.clone());
+    points.push(points[0].clone());
+    const geometry = new THREE.BufferGeometry().setFromPoints(points);
+    const line = new THREE.Line(
+      geometry,
+      new THREE.LineBasicMaterial({
+        color,
+        depthTest: false,
+        depthWrite: false,
+      })
+    );
+    line.renderOrder = 20;
+    this.extrudeRingGroup.add(line);
+  }
+
+  private clearExtrudeRing(): void {
+    while (this.extrudeRingGroup.children.length > 0) {
+      const child = this.extrudeRingGroup.children[0];
+      this.extrudeRingGroup.remove(child);
+      if (child instanceof THREE.Line) {
+        child.geometry.dispose();
+        (child.material as THREE.Material).dispose();
+      }
+    }
   }
 
   private finishCutStroke(): void {
@@ -615,12 +1005,9 @@ export class SceneView {
     this.overlayCtx.clearRect(0, 0, w, h);
     if (this.paintStroke.length < 2) return;
 
-    const isSilhouette = this.interactionMode === 'silhouette';
     this.overlayCtx.lineCap = 'round';
     this.overlayCtx.lineJoin = 'round';
-    this.overlayCtx.strokeStyle = isSilhouette
-      ? 'rgba(45, 90, 142, 0.75)'
-      : 'rgba(192, 57, 43, 0.55)';
+    this.overlayCtx.strokeStyle = this.overlayStrokeStyle();
     this.overlayCtx.lineWidth = 2.5;
     this.overlayCtx.beginPath();
     this.overlayCtx.moveTo(this.paintStroke[0].x, this.paintStroke[0].y);
@@ -628,6 +1015,17 @@ export class SceneView {
       this.overlayCtx.lineTo(this.paintStroke[i].x, this.paintStroke[i].y);
     }
     this.overlayCtx.stroke();
+  }
+
+  private overlayStrokeStyle(): string {
+    if (this.interactionMode === 'silhouette') return 'rgba(45, 90, 142, 0.75)';
+    if (this.interactionMode === 'loopcut') return 'rgba(26, 188, 156, 0.85)';
+    if (this.interactionMode === 'extrude') {
+      return this.extrudePhase === 'curve'
+        ? EXTRUDE_CURVE_PREVIEW
+        : EXTRUDE_LOOP_PREVIEW;
+    }
+    return 'rgba(192, 57, 43, 0.55)';
   }
 
   private clearOverlay(): void {
@@ -914,6 +1312,8 @@ export class SceneView {
 
   clear(): void {
     this.cancelSilhouetteIdleRefresh();
+    this.resetExtrudeState();
+    this.resetLoopCutState();
     this.setMesh(null);
     this.clearSecondaryMesh();
     this.clearSpineOverlay();

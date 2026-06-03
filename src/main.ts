@@ -19,9 +19,13 @@ const btnNext = document.querySelector<HTMLButtonElement>('#btn-next-step')!;
 const displayModeEl = document.querySelector<HTMLSelectElement>('#display-mode')!;
 const paintModeEl = document.querySelector<HTMLInputElement>('#paint-mode')!;
 const cutModeEl = document.querySelector<HTMLInputElement>('#cut-mode')!;
+const extrudeModeEl = document.querySelector<HTMLInputElement>('#extrude-mode')!;
+const loopcutModeEl = document.querySelector<HTMLInputElement>('#loopcut-mode')!;
 const btnApplyCut = document.querySelector<HTMLButtonElement>('#btn-apply-cut')!;
 const btnFillCut = document.querySelector<HTMLButtonElement>('#btn-fill-cut')!;
 const btnDiscardCut = document.querySelector<HTMLButtonElement>('#btn-discard-cut')!;
+const btnConfirmExtrude =
+  document.querySelector<HTMLButtonElement>('#btn-confirm-extrude')!;
 
 let stagedCutResult: TeddyCutResult | null = null;
 
@@ -73,6 +77,9 @@ function setInteractionMode(mode: InteractionMode): void {
   sceneView.setInteractionMode(mode);
   paintModeEl.checked = mode === 'paint';
   cutModeEl.checked = mode === 'cut';
+  extrudeModeEl.checked = mode === 'extrude';
+  loopcutModeEl.checked = mode === 'loopcut';
+  if (mode !== 'extrude') btnConfirmExtrude.disabled = true;
 }
 
 function classifiedFaceColors(types: TriangleType[]): number[] {
@@ -113,6 +120,16 @@ function updateHint(): void {
       'Stroke → review projection → Remove triangles → inspect open cut → Fill hole.';
     return;
   }
+  if (extrudeModeEl.checked) {
+    hintEl.textContent =
+      'Closed loop on surface → rotate → Confirm orientation → stroke across the loop.';
+    return;
+  }
+  if (loopcutModeEl.checked) {
+    hintEl.textContent =
+      'Loop cut: draw loop → Remove triangles → inspect hole → Fill hole.';
+    return;
+  }
   hintEl.textContent = 'Drag to rotate · scroll to zoom · right-drag to pan';
 }
 
@@ -120,12 +137,23 @@ function enablePostInflationControls(enabled: boolean): void {
   displayModeEl.disabled = !enabled;
   paintModeEl.disabled = !enabled;
   cutModeEl.disabled = !enabled;
+  extrudeModeEl.disabled = !enabled;
+  loopcutModeEl.disabled = !enabled;
   if (!enabled) {
+    btnConfirmExtrude.disabled = true;
     updateCutActionButtons();
   }
 }
 
 function updateCutActionButtons(): void {
+  if (loopcutModeEl.checked) {
+    // Loop cut reuses the same buttons across its three stages.
+    const phase = sceneView.getLoopCutPhase();
+    btnApplyCut.disabled = phase !== 'projected';
+    btnFillCut.disabled = phase !== 'cut';
+    btnDiscardCut.disabled = phase === 'idle';
+    return;
+  }
   const pending = sceneView.hasPendingCut();
   const staged = stagedCutResult !== null;
   btnApplyCut.disabled = !pending || staged;
@@ -310,6 +338,52 @@ btnNext.addEventListener('click', () => {
   }
 });
 
+sceneView.setOnExtrudeStatus((message, type) => {
+  setStatus(message, type);
+});
+
+sceneView.setOnExtrudeLoopReady(() => {
+  btnConfirmExtrude.disabled = false;
+});
+
+sceneView.setOnExtrudeComplete((mesh) => {
+  sceneView.setMesh(mesh, { color: INFLATED_COLOR, flatShading: true });
+  polygonReady = true;
+  inflationStep = 'done';
+  pipelineMeshes = null;
+  btnNext.disabled = true;
+  btnConfirmExtrude.disabled = true;
+  setStepLabel('done');
+  enablePostInflationControls(true);
+  setInteractionMode('orbit');
+  setStatus(
+    `Extrusion complete — swept mesh now has ${mesh.faces.length} triangles. Drag to rotate.`,
+    'ok'
+  );
+  updateHint();
+});
+
+sceneView.setOnLoopCutStatus((message, type) => {
+  setStatus(message, type);
+});
+
+sceneView.setOnLoopCutPhaseChange(() => {
+  updateCutActionButtons();
+});
+
+sceneView.setOnLoopCutComplete((mesh) => {
+  sceneView.setMesh(mesh, { color: INFLATED_COLOR, flatShading: true });
+  polygonReady = true;
+  inflationStep = 'done';
+  pipelineMeshes = null;
+  btnNext.disabled = true;
+  setStepLabel('done');
+  enablePostInflationControls(true);
+  setInteractionMode('orbit');
+  updateCutActionButtons();
+  updateHint();
+});
+
 sceneView.setOnCutRejected((message) => {
   setStatus(message, 'error');
 });
@@ -398,14 +472,26 @@ function applyFillCutHole(): void {
 }
 
 btnApplyCut.addEventListener('click', () => {
+  if (loopcutModeEl.checked) {
+    sceneView.applyLoopCut();
+    return;
+  }
   applyPendingCutRemoval();
 });
 
 btnFillCut.addEventListener('click', () => {
+  if (loopcutModeEl.checked) {
+    sceneView.fillLoopCut();
+    return;
+  }
   applyFillCutHole();
 });
 
 btnDiscardCut.addEventListener('click', () => {
+  if (loopcutModeEl.checked) {
+    sceneView.cancelLoopCut();
+    return;
+  }
   sceneView.clearPendingCut();
   sceneView.clearCutProjectionPreview();
   clearStagedCut();
@@ -418,13 +504,24 @@ displayModeEl.addEventListener('change', () => {
 });
 sceneView.setDisplayMode(displayModeEl.value as DisplayMode);
 
+function anyEditModeActive(): boolean {
+  return (
+    paintModeEl.checked ||
+    cutModeEl.checked ||
+    extrudeModeEl.checked ||
+    loopcutModeEl.checked
+  );
+}
+
 paintModeEl.addEventListener('change', () => {
   if (!polygonReady) return;
   if (paintModeEl.checked) {
     cutModeEl.checked = false;
+    extrudeModeEl.checked = false;
+    loopcutModeEl.checked = false;
     setInteractionMode('paint');
     setStatus('Paint mode: draw on the polygon (red).');
-  } else if (!cutModeEl.checked) {
+  } else if (!anyEditModeActive()) {
     setInteractionMode('orbit');
     setStatus('Drag to rotate · scroll to zoom · right-drag to pan.');
   }
@@ -435,17 +532,55 @@ cutModeEl.addEventListener('change', () => {
   if (!polygonReady) return;
   if (cutModeEl.checked) {
     paintModeEl.checked = false;
+    extrudeModeEl.checked = false;
+    loopcutModeEl.checked = false;
     setInteractionMode('cut');
     updateCutActionButtons();
     setStatus(
       'Cut: stroke → review projection → Remove triangles → Fill hole.',
     );
-  } else if (!paintModeEl.checked) {
+  } else if (!anyEditModeActive()) {
     setInteractionMode('orbit');
     setStatus('Drag to rotate · scroll to zoom · right-drag to pan.');
   }
   updateCutActionButtons();
   updateHint();
+});
+
+loopcutModeEl.addEventListener('change', () => {
+  if (!polygonReady) return;
+  if (loopcutModeEl.checked) {
+    paintModeEl.checked = false;
+    cutModeEl.checked = false;
+    extrudeModeEl.checked = false;
+    setInteractionMode('loopcut');
+  } else if (!anyEditModeActive()) {
+    setInteractionMode('orbit');
+    setStatus('Drag to rotate · scroll to zoom · right-drag to pan.');
+  }
+  updateCutActionButtons();
+  updateHint();
+});
+
+extrudeModeEl.addEventListener('change', () => {
+  if (!polygonReady) return;
+  if (extrudeModeEl.checked) {
+    paintModeEl.checked = false;
+    cutModeEl.checked = false;
+    loopcutModeEl.checked = false;
+    btnConfirmExtrude.disabled = true;
+    setInteractionMode('extrude');
+  } else if (!anyEditModeActive()) {
+    setInteractionMode('orbit');
+    setStatus('Drag to rotate · scroll to zoom · right-drag to pan.');
+  }
+  updateHint();
+});
+
+btnConfirmExtrude.addEventListener('click', () => {
+  if (sceneView.confirmExtrudeOrientation()) {
+    btnConfirmExtrude.disabled = true;
+  }
 });
 
 btnSquare.addEventListener('click', () => {
@@ -474,6 +609,9 @@ btnClear.addEventListener('click', () => {
   sceneView.clear();
   paintModeEl.checked = false;
   cutModeEl.checked = false;
+  extrudeModeEl.checked = false;
+  loopcutModeEl.checked = false;
+  btnConfirmExtrude.disabled = true;
   setStatus('Cleared. Draw a new closed loop on the 3D plane.');
   updateHint();
 });
