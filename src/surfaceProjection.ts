@@ -7,10 +7,6 @@ const SURFACE_LIFT = 0.4;
 const meshPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
 const planeHit = new THREE.Vector3();
 
-/**
- * Project screen stroke onto the mesh plane (z = 0 in view space).
- * Used for cuts so the stroke spans outside the mesh silhouette on screen.
- */
 export function projectScreenStrokeToPlane(
   stroke: Vec2[],
   camera: THREE.Camera,
@@ -34,10 +30,6 @@ export function projectScreenStrokeToPlane(
   return mergeNearbyHits(hits, 0.5);
 }
 
-/**
- * Project a 2D screen stroke onto a mesh surface (Teddy §5.2).
- * Rays are cast from the camera; the nearest mesh hit is kept.
- */
 export function projectScreenStroke(
   stroke: Vec2[],
   camera: THREE.Camera,

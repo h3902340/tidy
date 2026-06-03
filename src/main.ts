@@ -1,114 +1,96 @@
 import './style.css';
 import { cutPolygon } from './cutPolygon';
-import { DrawCanvas } from './drawCanvas';
+import { SceneView, type DisplayMode, type InteractionMode } from './sceneView';
 import { buildMeshFromPolygon, buildTeddyMesh } from './teddy';
-import { View3D, type DisplayMode, type InteractionMode } from './view3d';
 import type { Vec2 } from './math';
 
-let lastStroke: Vec2[] = [];
-let lastClosed: Vec2[] = [];
-
-const drawCanvasEl = document.querySelector<HTMLCanvasElement>('#draw-canvas')!;
-const view3dEl = document.querySelector<HTMLElement>('#view3d')!;
+const sceneEl = document.querySelector<HTMLElement>('#scene-view')!;
+const hintEl = document.querySelector<HTMLElement>('#canvas-hint')!;
 const statusEl = document.querySelector<HTMLElement>('#status')!;
-const btnGenerate = document.querySelector<HTMLButtonElement>('#btn-generate')!;
 const btnClear = document.querySelector<HTMLButtonElement>('#btn-clear')!;
 const btnSquare = document.querySelector<HTMLButtonElement>('#btn-square')!;
-
 const displayModeEl = document.querySelector<HTMLSelectElement>('#display-mode')!;
 const paintModeEl = document.querySelector<HTMLInputElement>('#paint-mode')!;
 const cutModeEl = document.querySelector<HTMLInputElement>('#cut-mode')!;
-const view3d = new View3D(view3dEl);
 
-displayModeEl.addEventListener('change', () => {
-  view3d.setDisplayMode(displayModeEl.value as DisplayMode);
-});
-view3d.setDisplayMode(displayModeEl.value as DisplayMode);
+let polygonReady = false;
 
-function setInteractionMode(mode: InteractionMode): void {
-  view3d.setInteractionMode(mode);
-  paintModeEl.checked = mode === 'paint';
-  cutModeEl.checked = mode === 'cut';
-}
-
-paintModeEl.addEventListener('change', () => {
-  if (paintModeEl.checked) {
-    cutModeEl.checked = false;
-    setInteractionMode('paint');
-    setStatus('Paint mode: draw on the 3D view to project a stroke onto the mesh (red).');
-  } else if (!cutModeEl.checked) {
-    setInteractionMode('orbit');
-  }
-});
-
-cutModeEl.addEventListener('change', () => {
-  if (cutModeEl.checked) {
-    paintModeEl.checked = false;
-    setInteractionMode('cut');
-    setStatus(
-      'Cut mode: draw across the polygon so the stroke crosses the boundary twice (orange). Keeps the larger piece.',
-    );
-  } else if (!paintModeEl.checked) {
-    setInteractionMode('orbit');
-  }
-});
+const sceneView = new SceneView(sceneEl);
+sceneView.setInteractionMode('silhouette');
 
 function setStatus(message: string, type: 'ok' | 'error' | '' = ''): void {
   statusEl.textContent = message;
   statusEl.className = `status ${type}`;
 }
 
-function applyPolygon(polygon: Vec2[], closed?: Vec2[]): void {
-  const { mesh, error, polygon: closedPoly } = buildMeshFromPolygon(polygon);
+function setInteractionMode(mode: InteractionMode): void {
+  sceneView.setInteractionMode(mode);
+  paintModeEl.checked = mode === 'paint';
+  cutModeEl.checked = mode === 'cut';
+}
+
+function updateHint(): void {
+  if (!polygonReady) {
+    hintEl.textContent = 'Draw one closed loop on the 3D plane';
+    return;
+  }
+  if (paintModeEl.checked) {
+    hintEl.textContent = 'Paint on surface (red)';
+    return;
+  }
+  if (cutModeEl.checked) {
+    hintEl.textContent = 'Cut: cross boundary twice (orange)';
+    return;
+  }
+  hintEl.textContent = 'Drag to rotate · scroll to zoom · right-drag to pan';
+}
+
+function showPolygon(mesh: ReturnType<typeof buildTeddyMesh>['mesh']): void {
+  if (!mesh) return;
+  polygonReady = true;
+  sceneView.setMesh(mesh);
+  displayModeEl.disabled = false;
+  paintModeEl.disabled = false;
+  cutModeEl.disabled = false;
+  setInteractionMode('orbit');
+  updateHint();
+}
+
+function applyMeshFromPolygon(ring: Vec2[]): boolean {
+  const { mesh, error } = buildMeshFromPolygon(ring);
+  if (error || !mesh) {
+    setStatus(error ?? 'Could not build mesh.', 'error');
+    return false;
+  }
+  sceneView.setMesh(mesh);
+  setStatus(
+    `Polygon updated — ${mesh.vertices.length} vertices, ${mesh.faces.length} triangles.`,
+    'ok'
+  );
+  setInteractionMode('orbit');
+  updateHint();
+  return true;
+}
+
+sceneView.setOnSilhouetteComplete((closed) => {
+  setStatus('Triangulating polygon (CDT)…');
+  const { mesh, error, polygon } = buildTeddyMesh(closed);
 
   if (error || !mesh) {
     setStatus(error ?? 'Could not build mesh.', 'error');
+    sceneView.setInteractionMode('silhouette');
     return;
   }
 
-  view3d.setMesh(mesh, { preserveView: true });
-  const ring = closed ?? closedPoly;
-  lastClosed = ring;
-  lastStroke = ring.slice(0, -1);
-  drawCanvas.setClosedStroke(ring);
-
+  showPolygon(mesh);
   setStatus(
-    `Mesh updated — ${polygon.length} boundary vertices, ${mesh.faces.length} triangles.`,
+    `Polygon created — ${polygon.length - 1} boundary vertices, ${mesh.faces.length} triangles.`,
     'ok'
   );
-}
-
-const drawCanvas = new DrawCanvas(drawCanvasEl, (raw, closed) => {
-  lastStroke = raw;
-  lastClosed = closed;
-  generate();
 });
 
-function generate(): void {
-  const stroke = lastClosed.length > 0 ? lastClosed : lastStroke;
-  if (stroke.length < 3) {
-    setStatus('Draw a closed shape first.', 'error');
-    return;
-  }
-
-  setStatus('Triangulating polygon (CDT)…');
-  const { mesh, error, polygon } = buildTeddyMesh(stroke);
-
-  if (error || !mesh) {
-    setStatus(error ?? 'Could not build mesh.', 'error');
-    view3d.clear();
-    return;
-  }
-
-  view3d.setMesh(mesh);
-  setStatus(
-    `3D model ready — ${polygon.length - 1} boundary vertices, ${mesh.faces.length} triangles.`,
-    'ok'
-  );
-}
-
-view3d.setOnCutComplete((cutPolyline) => {
-  const polygon = view3d.getMeshPolygon();
+sceneView.setOnCutComplete((cutPolyline) => {
+  const polygon = sceneView.getMeshPolygon();
   if (polygon.length < 3) {
     setStatus('No polygon to cut.', 'error');
     return false;
@@ -120,43 +102,89 @@ view3d.setOnCutComplete((cutPolyline) => {
     return false;
   }
 
-  applyPolygon(result.kept);
+  applyMeshFromPolygon(result.kept);
   setStatus(
-    `Cut applied — kept ${result.kept.length} vertices (discarded ${result.discarded.length}). Re-triangulated.`,
+    `Cut applied — kept ${result.kept.length} vertices (discarded ${result.discarded.length}).`,
     'ok'
   );
   return true;
 });
 
-btnGenerate.addEventListener('click', generate);
+displayModeEl.addEventListener('change', () => {
+  sceneView.setDisplayMode(displayModeEl.value as DisplayMode);
+});
+sceneView.setDisplayMode(displayModeEl.value as DisplayMode);
+
+paintModeEl.addEventListener('change', () => {
+  if (!polygonReady) return;
+  if (paintModeEl.checked) {
+    cutModeEl.checked = false;
+    setInteractionMode('paint');
+    setStatus('Paint mode: draw on the polygon (red).');
+  } else if (!cutModeEl.checked) {
+    setInteractionMode('orbit');
+    setStatus('Drag to rotate · scroll to zoom · right-drag to pan.');
+  }
+  updateHint();
+});
+
+cutModeEl.addEventListener('change', () => {
+  if (!polygonReady) return;
+  if (cutModeEl.checked) {
+    paintModeEl.checked = false;
+    setInteractionMode('cut');
+    setStatus(
+      'Cut mode: draw across the polygon; stroke must cross the boundary twice (orange).',
+    );
+  } else if (!paintModeEl.checked) {
+    setInteractionMode('orbit');
+    setStatus('Drag to rotate · scroll to zoom · right-drag to pan.');
+  }
+  updateHint();
+});
 
 btnSquare.addEventListener('click', () => {
-  const rect = drawCanvasEl.getBoundingClientRect();
+  if (polygonReady) {
+    setStatus('Clear first to create a new shape.', 'error');
+    return;
+  }
+  const rect = sceneEl.getBoundingClientRect();
   const cx = rect.width / 2;
   const cy = rect.height / 2;
-  const size = Math.min(rect.width, rect.height) * 0.45;
+  const size = Math.min(rect.width, rect.height) * 0.35;
   const half = size / 2;
-  const square: Vec2[] = [
+  const screenSquare = [
     { x: cx - half, y: cy - half },
     { x: cx + half, y: cy - half },
     { x: cx + half, y: cy + half },
     { x: cx - half, y: cy + half },
     { x: cx - half, y: cy - half },
   ];
-  lastStroke = square.slice(0, -1);
-  lastClosed = square;
-  drawCanvas.setClosedStroke(square);
-  generate();
-  setStatus('Test square created.', 'ok');
+  const square = sceneView.projectScreenToMeshPlane(screenSquare);
+  setStatus('Triangulating polygon (CDT)…');
+  const { mesh, error, polygon } = buildTeddyMesh(square);
+  if (error || !mesh) {
+    setStatus(error ?? 'Could not build mesh.', 'error');
+    return;
+  }
+  showPolygon(mesh);
+  setStatus(
+    `Test square — ${polygon.length - 1} vertices, ${mesh.faces.length} triangles.`,
+    'ok'
+  );
 });
 
 btnClear.addEventListener('click', () => {
-  lastStroke = [];
-  lastClosed = [];
-  drawCanvas.clear();
+  polygonReady = false;
+  sceneView.clear();
   paintModeEl.checked = false;
   cutModeEl.checked = false;
-  setInteractionMode('orbit');
-  view3d.clear();
-  setStatus('');
+  displayModeEl.disabled = true;
+  paintModeEl.disabled = true;
+  cutModeEl.disabled = true;
+  setStatus('Cleared. Draw a new closed loop on the 3D plane.');
+  updateHint();
 });
+
+setStatus('Draw a closed loop on the 3D view (once). It triangulates when you release.');
+updateHint();

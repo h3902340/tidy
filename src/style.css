@@ -40,16 +40,7 @@ body {
 }
 
 .workspace {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 1.25rem;
   margin-top: 1.25rem;
-}
-
-@media (max-width: 900px) {
-  .workspace {
-    grid-template-columns: 1fr;
-  }
 }
 
 .panel {
@@ -59,7 +50,7 @@ body {
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  min-height: 420px;
+  min-height: 520px;
 }
 
 .panel-head {
@@ -106,31 +97,24 @@ body {
 
 .canvas-wrap {
   flex: 1;
-  min-height: 320px;
+  min-height: 420px;
   position: relative;
 }
 
-#draw-canvas {
-  display: block;
+.scene-view {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
-  touch-action: none;
-  cursor: crosshair;
 }
 
-.view3d-wrap {
-  flex: 1;
-  min-height: 360px;
-  position: relative;
-}
-
-.view3d-wrap canvas {
+.scene-view canvas {
   display: block;
   width: 100% !important;
   height: 100% !important;
 }
 
-.view3d-wrap .paint-overlay {
+.scene-view .paint-overlay {
   position: absolute;
   inset: 0;
   width: 100%;

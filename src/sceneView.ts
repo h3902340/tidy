@@ -2,18 +2,20 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type { Mesh3D } from './teddy';
 import { projectScreenStroke, projectScreenStrokeToPlane } from './surfaceProjection';
+import { CLOSE_TOLERANCE, closeStroke } from './stroke';
 import type { Vec2 } from './math';
 
 export type DisplayMode = 'solid' | 'wireframe' | 'both';
-export type InteractionMode = 'orbit' | 'paint' | 'cut';
+export type InteractionMode = 'silhouette' | 'orbit' | 'paint' | 'cut';
+
+export type SilhouetteCompleteHandler = (closed: Vec2[]) => void;
 
 const PAINT_LINE_COLOR = 0xc0392b;
 const CUT_LINE_COLOR = 0xd35400;
 
-/** Return true if the cut was applied (line is drawn only on success). */
 export type CutCompleteHandler = (cutPolyline: Vec2[]) => boolean;
 
-export class View3D {
+export class SceneView {
   private container: HTMLElement;
   private renderer: THREE.WebGLRenderer;
   private scene: THREE.Scene;
@@ -22,20 +24,18 @@ export class View3D {
   private meshObject: THREE.Mesh | null = null;
   private wireframe: THREE.LineSegments | null = null;
   private displayMode: DisplayMode = 'wireframe';
-  private interactionMode: InteractionMode = 'orbit';
+  private interactionMode: InteractionMode = 'silhouette';
   private surfaceLinesGroup: THREE.Group;
   private overlayCanvas: HTMLCanvasElement;
   private overlayCtx: CanvasRenderingContext2D;
   private painting = false;
   private paintStroke: Vec2[] = [];
-  /** Fixed origin for mesh placement so cuts do not shift the model on screen. */
-  private displayAnchor: { x: number; y: number; z: number } | null = null;
-  private meshCenter = { x: 0, y: 0, z: 0 };
   private onCutComplete: CutCompleteHandler | null = null;
+  private onSilhouetteComplete: SilhouetteCompleteHandler | null = null;
 
   constructor(container: HTMLElement) {
     this.container = container;
-    container.classList.add('view3d-wrap');
+    container.classList.add('scene-view');
 
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0xf0eeea);
@@ -61,8 +61,11 @@ export class View3D {
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.08;
+    this.controls.enablePan = true;
+    this.controls.screenSpacePanning = true;
     this.controls.minDistance = 50;
     this.controls.maxDistance = 800;
+    this.controls.target.set(0, 0, 0);
 
     const ambient = new THREE.AmbientLight(0xffffff, 0.55);
     const dir = new THREE.DirectionalLight(0xffffff, 0.85);
@@ -80,13 +83,32 @@ export class View3D {
     this.animate();
   }
 
+  setVisible(visible: boolean): void {
+    this.container.classList.toggle('hidden', !visible);
+    if (visible) this.onResize();
+  }
+
   setOnCutComplete(handler: CutCompleteHandler | null): void {
     this.onCutComplete = handler;
   }
 
+  setOnSilhouetteComplete(handler: SilhouetteCompleteHandler | null): void {
+    this.onSilhouetteComplete = handler;
+  }
+
+  /** Project screen-space points onto the z = 0 drawing plane (world coords). */
+  projectScreenToMeshPlane(screenPoints: Vec2[]): Vec2[] {
+    const hits = projectScreenStrokeToPlane(
+      screenPoints,
+      this.camera,
+      this.overlayCanvas
+    );
+    return hits.map((p) => ({ x: p.x, y: -p.y }));
+  }
+
   setInteractionMode(mode: InteractionMode): void {
     this.interactionMode = mode;
-    const overlayActive = mode === 'paint' || mode === 'cut';
+    const overlayActive = mode === 'silhouette' || mode === 'paint' || mode === 'cut';
     this.overlayCanvas.style.pointerEvents = overlayActive ? 'auto' : 'none';
     this.overlayCanvas.style.cursor = overlayActive ? 'crosshair' : 'default';
     this.controls.enabled = mode === 'orbit';
@@ -97,20 +119,12 @@ export class View3D {
     }
   }
 
-  /** @deprecated Use setInteractionMode */
-  setPaintMode(enabled: boolean): void {
-    this.setInteractionMode(enabled ? 'paint' : 'orbit');
-  }
-
   getMeshPolygon(): Vec2[] {
     if (!this.meshObject) return [];
     const pos = this.meshObject.geometry.getAttribute('position');
     const out: Vec2[] = [];
     for (let i = 0; i < pos.count; i++) {
-      out.push({
-        x: pos.getX(i) + this.meshCenter.x,
-        y: -pos.getY(i) + this.meshCenter.y,
-      });
+      out.push({ x: pos.getX(i), y: -pos.getY(i) });
     }
     return out;
   }
@@ -133,7 +147,8 @@ export class View3D {
     };
 
     this.overlayCanvas.addEventListener('pointerdown', (e) => {
-      if (this.interactionMode === 'orbit' || !this.meshObject) return;
+      if (this.interactionMode === 'orbit') return;
+      if (this.interactionMode !== 'silhouette' && !this.meshObject) return;
       e.preventDefault();
       this.overlayCanvas.setPointerCapture(e.pointerId);
       this.painting = true;
@@ -155,7 +170,9 @@ export class View3D {
       if (!this.painting) return;
       this.painting = false;
       this.overlayCanvas.releasePointerCapture(e.pointerId);
-      if (this.interactionMode === 'paint') {
+      if (this.interactionMode === 'silhouette') {
+        this.finishSilhouetteStroke();
+      } else if (this.interactionMode === 'paint') {
         this.finishPaintStroke();
       } else if (this.interactionMode === 'cut') {
         this.finishCutStroke();
@@ -167,7 +184,23 @@ export class View3D {
   }
 
   private threeToMesh(p: THREE.Vector3): Vec2 {
-    return { x: p.x + this.meshCenter.x, y: -p.y + this.meshCenter.y };
+    return { x: p.x, y: -p.y };
+  }
+
+  private finishSilhouetteStroke(): void {
+    this.clearOverlay();
+    if (this.paintStroke.length < 3) {
+      this.paintStroke = [];
+      return;
+    }
+
+    const projected = this.projectScreenToMeshPlane(this.paintStroke);
+    this.paintStroke = [];
+
+    if (projected.length < 3) return;
+
+    const closed = closeStroke(projected, CLOSE_TOLERANCE);
+    this.onSilhouetteComplete?.(closed);
   }
 
   private finishPaintStroke(): void {
@@ -229,9 +262,14 @@ export class View3D {
     if (this.paintStroke.length < 2) return;
 
     const isCut = this.interactionMode === 'cut';
+    const isSilhouette = this.interactionMode === 'silhouette';
     this.overlayCtx.lineCap = 'round';
     this.overlayCtx.lineJoin = 'round';
-    this.overlayCtx.strokeStyle = isCut ? 'rgba(211, 84, 0, 0.6)' : 'rgba(192, 57, 43, 0.55)';
+    this.overlayCtx.strokeStyle = isSilhouette
+      ? 'rgba(45, 90, 142, 0.75)'
+      : isCut
+        ? 'rgba(211, 84, 0, 0.6)'
+        : 'rgba(192, 57, 43, 0.55)';
     this.overlayCtx.lineWidth = 2.5;
     this.overlayCtx.beginPath();
     this.overlayCtx.moveTo(this.paintStroke[0].x, this.paintStroke[0].y);
@@ -273,6 +311,7 @@ export class View3D {
   private onResize(): void {
     const w = this.container.clientWidth;
     const h = this.container.clientHeight;
+    if (w === 0 || h === 0) return;
     this.camera.aspect = w / Math.max(h, 1);
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
@@ -281,11 +320,13 @@ export class View3D {
 
   private animate = (): void => {
     requestAnimationFrame(this.animate);
-    this.controls.update();
-    this.renderer.render(this.scene, this.camera);
+    if (!this.container.classList.contains('hidden')) {
+      this.controls.update();
+      this.renderer.render(this.scene, this.camera);
+    }
   };
 
-  setMesh(mesh: Mesh3D | null, options?: { preserveView?: boolean }): void {
+  setMesh(mesh: Mesh3D | null): void {
     this.clearSurfaceLines();
 
     if (this.meshObject) {
@@ -302,37 +343,12 @@ export class View3D {
     }
 
     if (!mesh || mesh.vertices.length === 0) {
-      if (!options?.preserveView) {
-        this.displayAnchor = null;
-      }
       return;
     }
 
-    const preserveView = options?.preserveView === true && this.displayAnchor !== null;
-
-    if (!preserveView) {
-      let cx = 0;
-      let cy = 0;
-      let cz = 0;
-      for (const v of mesh.vertices) {
-        cx += v.x;
-        cy += v.y;
-        cz += v.z;
-      }
-      const inv = 1 / mesh.vertices.length;
-      this.displayAnchor = { x: cx * inv, y: cy * inv, z: cz * inv };
-    }
-
-    this.meshCenter = this.displayAnchor!;
-
-    const anchor = this.displayAnchor!;
     const positions: number[] = [];
     for (const v of mesh.vertices) {
-      positions.push(
-        v.x - anchor.x,
-        -(v.y - anchor.y),
-        v.z - anchor.z
-      );
+      positions.push(v.x, -v.y, v.z);
     }
 
     const indices: number[] = [];
@@ -366,21 +382,12 @@ export class View3D {
     this.scene.add(this.wireframe);
 
     this.applyDisplayMode();
-
-    if (!preserveView) {
-      geometry.computeBoundingSphere();
-      const r = geometry.boundingSphere?.radius ?? 100;
-      this.controls.target.set(0, 0, 0);
-      this.camera.position.set(0, 0, r * 2.2);
-      this.controls.update();
-    }
   }
 
   clear(): void {
-    this.displayAnchor = null;
     this.setMesh(null);
     this.clearSurfaceLines();
     this.clearOverlay();
-    this.meshCenter = { x: 0, y: 0, z: 0 };
+    this.setInteractionMode('silhouette');
   }
 }
