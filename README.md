@@ -11,6 +11,14 @@ Web app that turns a hand-drawn 2D silhouette into an inflated 3D polygonal mesh
 - **Flat 3D polygon** — CDT fills the interior; all vertices lie in the sketch plane (z = 0)
 - **3D viewer** — orbit (drag), zoom (scroll) via Three.js
 
+## Live demo (GitHub Pages)
+
+After the repo is on GitHub with Pages enabled (**Settings → Pages → Source: GitHub Actions**), the app is published at:
+
+**https://h3902340.github.io/tidy/**
+
+Each push to `main` rebuilds and deploys automatically.
+
 ## Run locally
 
 ```bash
