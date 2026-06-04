@@ -218,8 +218,11 @@ export function computeExtrusion(
   // Resample the centreline to evenly-spaced, smoothed layers for a smooth sweep.
   const layers = resampleCenterline(raw.centers, raw.widths, layerCount(raw.centers));
   smoothCenterline(layers);
-  const w0 = layers.widths[0] > 1e-6 ? layers.widths[0] : 1;
   const L = layers.centers.length;
+  // Extra smoothing over the trailing third: the two-pointer medial sweep is noisiest where the
+  // two stroke sides converge, so this de-wobbles the centre/width as the tip approaches.
+  smoothCenterlineTail(layers, Math.floor(L * 0.6));
+  const w0 = layers.widths[0] > 1e-6 ? layers.widths[0] : 1;
 
   const X = layers.centers.map((c) =>
     G.clone().addScaledVector(W, c.u).addScaledVector(N, c.h)
@@ -231,6 +234,15 @@ export function computeExtrusion(
     return t.lengthSq() > 1e-12 ? t.normalize() : N.clone();
   });
 
+  // Out-of-plane (doming) height of each base-rim vertex along the ring normal. We carry this into
+  // the first few swept layers and fade it out so the weld at layer 0→1 is smooth rather than
+  // creased — this is the "insufficiently planar base" issue from the paper.
+  const rh: number[] = ring0.map((r) => r.clone().sub(G).dot(N));
+  const blendLayers = Math.max(2, Math.floor(L / 6));
+  // Begin easing the cross-section radius to zero over the final stretch, so the tip closes as a
+  // clean cone instead of a recessed/ twisted disc.
+  const collapseStart = 0.8;
+
   // Vertices start as a copy of the cut mesh (original + imprinted boundary vertices).
   const vertices: Vec3[] = base.vertices.map((v) => ({ x: v.x, y: v.y, z: v.z }));
   const pushWorld = (p: THREE.Vector3): number => {
@@ -238,7 +250,8 @@ export function computeExtrusion(
     return vertices.length - 1;
   };
 
-  // Layer 0 = the imprinted opening boundary (already in the mesh). Layers 1..L-1 are swept.
+  // Layer 0 = the imprinted opening boundary (already in the mesh). Layers 1..L-2 are swept; the
+  // final layer collapses to a single apex vertex (clean cone tip).
   const layerIndices: number[][] = [base.holeBoundary.slice()];
 
   const Wc = W.clone();
@@ -246,29 +259,40 @@ export function computeExtrusion(
   const dirPrev = N.clone();
   const q = new THREE.Quaternion();
 
-  for (let i = 1; i < L; i++) {
+  for (let i = 1; i <= L - 2; i++) {
     q.setFromUnitVectors(dirPrev, tangents[i]);
     Wc.applyQuaternion(q).normalize();
     Pc.applyQuaternion(q).normalize();
     dirPrev.copy(tangents[i]);
 
-    const s = layers.widths[i] / w0;
+    let s = layers.widths[i] / w0;
+    const u = i / (L - 1);
+    if (u > collapseStart) {
+      const tt = (u - collapseStart) / (1 - collapseStart);
+      s *= 1 - smoothstep(clamp01(tt));
+    }
+    const decay = Math.max(0, 1 - (i - 1) / blendLayers);
+
     const idxRow: number[] = [];
     for (let j = 0; j < R; j++) {
       const world = X[i]
         .clone()
         .addScaledVector(Wc, s * rw[j])
         .addScaledVector(Pc, s * rq[j]);
+      if (decay > 0) world.addScaledVector(tangents[i], s * rh[j] * decay);
       idxRow.push(pushWorld(world));
     }
     layerIndices.push(idxRow);
   }
 
+  // Single apex at the centreline tip → the final segment is a cone (no flat disc, no apex twist).
+  const apexIdx = pushWorld(X[L - 1]);
+
   const newFaces: Triangle[] = [];
 
   // Sew consecutive layers into quads, then triangulate (paper fig. 18b). Layer 0 is the
   // imprinted opening boundary, so layer 0→1 quads weld the sweep onto the mesh directly.
-  for (let i = 0; i < L - 1; i++) {
+  for (let i = 0; i < layerIndices.length - 1; i++) {
     const cur = layerIndices[i];
     const nxt = layerIndices[i + 1];
     for (let j = 0; j < R; j++) {
@@ -281,17 +305,10 @@ export function computeExtrusion(
     }
   }
 
-  // Cap the tip with a fan to the last layer's centroid.
-  const lastRow = layerIndices[L - 1];
-  const tip = new THREE.Vector3();
-  for (const idx of lastRow) {
-    const v = vertices[idx];
-    tip.add(new THREE.Vector3(v.x, -v.y, v.z));
-  }
-  tip.multiplyScalar(1 / R);
-  const tipIdx = pushWorld(tip);
+  // Cone the last ring to the apex.
+  const lastRing = layerIndices[layerIndices.length - 1];
   for (let j = 0; j < R; j++) {
-    newFaces.push([tipIdx, lastRow[(j + 1) % R], lastRow[j]]);
+    newFaces.push([apexIdx, lastRing[(j + 1) % R], lastRing[j]]);
   }
 
   // Orient the new faces outward, using the solid's centroid as an interior point.
@@ -514,4 +531,33 @@ function smoothCenterline(layers: { centers: PlanePoint[]; widths: number[] }): 
       layers.widths[i] = (w[i - 1] + 2 * w[i] + w[i + 1]) / 4;
     }
   }
+}
+
+/** Extra smoothing passes applied only from `fromIndex` to the tip (the noisy apex region). */
+function smoothCenterlineTail(
+  layers: { centers: PlanePoint[]; widths: number[] },
+  fromIndex: number
+): void {
+  const n = layers.centers.length;
+  if (n < 3) return;
+  const start = Math.max(1, fromIndex);
+  for (let pass = 0; pass < 3; pass++) {
+    const c = layers.centers.map((p) => ({ ...p }));
+    const w = layers.widths.slice();
+    for (let i = start; i < n - 1; i++) {
+      layers.centers[i] = {
+        u: (c[i - 1].u + 2 * c[i].u + c[i + 1].u) / 4,
+        h: (c[i - 1].h + 2 * c[i].h + c[i + 1].h) / 4,
+      };
+      layers.widths[i] = (w[i - 1] + 2 * w[i] + w[i + 1]) / 4;
+    }
+  }
+}
+
+function clamp01(t: number): number {
+  return t < 0 ? 0 : t > 1 ? 1 : t;
+}
+
+function smoothstep(t: number): number {
+  return t * t * (3 - 2 * t);
 }

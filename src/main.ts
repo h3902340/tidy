@@ -21,6 +21,7 @@ const paintModeEl = document.querySelector<HTMLInputElement>('#paint-mode')!;
 const cutModeEl = document.querySelector<HTMLInputElement>('#cut-mode')!;
 const extrudeModeEl = document.querySelector<HTMLInputElement>('#extrude-mode')!;
 const loopcutModeEl = document.querySelector<HTMLInputElement>('#loopcut-mode')!;
+const sketchModeEl = document.querySelector<HTMLInputElement>('#sketch-mode')!;
 const btnApplyCut = document.querySelector<HTMLButtonElement>('#btn-apply-cut')!;
 const btnFillCut = document.querySelector<HTMLButtonElement>('#btn-fill-cut')!;
 const btnDiscardCut = document.querySelector<HTMLButtonElement>('#btn-discard-cut')!;
@@ -139,6 +140,7 @@ function enablePostInflationControls(enabled: boolean): void {
   cutModeEl.disabled = !enabled;
   extrudeModeEl.disabled = !enabled;
   loopcutModeEl.disabled = !enabled;
+  sketchModeEl.disabled = !enabled;
   if (!enabled) {
     btnConfirmExtrude.disabled = true;
     updateCutActionButtons();
@@ -577,6 +579,10 @@ extrudeModeEl.addEventListener('change', () => {
   updateHint();
 });
 
+sketchModeEl.addEventListener('change', () => {
+  sceneView.setSketchMode(sketchModeEl.checked);
+});
+
 btnConfirmExtrude.addEventListener('click', () => {
   if (sceneView.confirmExtrudeOrientation()) {
     btnConfirmExtrude.disabled = true;
@@ -611,6 +617,8 @@ btnClear.addEventListener('click', () => {
   cutModeEl.checked = false;
   extrudeModeEl.checked = false;
   loopcutModeEl.checked = false;
+  sketchModeEl.checked = false;
+  sceneView.setSketchMode(false);
   btnConfirmExtrude.disabled = true;
   setStatus('Cleared. Draw a new closed loop on the 3D plane.');
   updateHint();

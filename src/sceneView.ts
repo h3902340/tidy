@@ -17,6 +17,7 @@ import {
   type ExtrusionBase,
 } from './extrude';
 import { CLOSE_TOLERANCE, closeStroke } from './stroke';
+import { createSketchMaterials, PAPER_COLOR, type SketchMaterials } from './sketchShader';
 import type { Vec2, Vec3 } from './math';
 
 export type DisplayMode = 'solid' | 'wireframe' | 'both';
@@ -141,6 +142,11 @@ export class SceneView {
   private loopCutPhase: LoopCutPhase = 'idle';
   private loopCutBase: ExtrusionBase | null = null;
   private loopCutMeshBeforeCut: Mesh3D | null = null;
+  private sketchMode = false;
+  private sketchMaterials: SketchMaterials | null = null;
+  private outlineMesh: THREE.Mesh | null = null;
+  private grid: THREE.GridHelper | null = null;
+  private readonly defaultBackground = new THREE.Color(0xf0eeea);
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -199,6 +205,7 @@ export class SceneView {
     grid.rotation.x = Math.PI / 2;
     grid.position.z = -0.5;
     this.scene.add(grid);
+    this.grid = grid;
 
     this.bindOverlayEvents();
     window.addEventListener('resize', () => this.onResize());
@@ -1053,8 +1060,11 @@ export class SceneView {
 
   private applyDisplayMode(): void {
     const showSolid = this.displayMode === 'solid' || this.displayMode === 'both';
-    const showWire = this.displayMode === 'wireframe' || this.displayMode === 'both';
-    if (this.meshObject) this.meshObject.visible = showSolid;
+    // Wireframe is suppressed in sketch mode so the pencil look stays clean.
+    const showWire =
+      !this.sketchMode &&
+      (this.displayMode === 'wireframe' || this.displayMode === 'both');
+    if (this.meshObject) this.meshObject.visible = this.sketchMode || showSolid;
     if (this.wireframe) this.wireframe.visible = showWire;
     if (this.secondaryMeshObject) this.secondaryMeshObject.visible = showSolid;
     if (this.secondaryWireframe) this.secondaryWireframe.visible = showWire;
@@ -1077,6 +1087,9 @@ export class SceneView {
     requestAnimationFrame(this.animate);
     if (!this.container.classList.contains('hidden')) {
       this.controls.update();
+      if (this.sketchMode && this.sketchMaterials) {
+        this.sketchMaterials.update(this.camera, this.renderer);
+      }
       this.renderer.render(this.scene, this.camera);
       if (this.interactionMode === 'cut' && this.currentMeshData) {
         this.drawCutOverlay();
@@ -1249,11 +1262,14 @@ export class SceneView {
 
   setMesh(mesh: Mesh3D | null, options: MeshDisplayOptions = {}): void {
     this.clearSurfaceLines();
+    this.clearOutlineMesh(); // shares geometry with meshObject; drop before disposing it
 
     if (this.meshObject) {
       this.scene.remove(this.meshObject);
       this.meshObject.geometry.dispose();
-      (this.meshObject.material as THREE.Material).dispose();
+      const mat = this.meshObject.material as THREE.Material;
+      // The sketch fill material is shared/reused, so only dispose per-mesh (Phong) materials.
+      if (mat !== this.sketchMaterials?.fill) mat.dispose();
       this.meshObject = null;
     }
     if (this.wireframe) {
@@ -1297,7 +1313,52 @@ export class SceneView {
     this.wireframe.scale.set(1, -1, 1);
     this.scene.add(this.wireframe);
 
+    this.refreshSketchAppearance();
     this.applyDisplayMode();
+  }
+
+  /** Toggle the hand-drawn "pencil sketch" rendering (stipple shading + silhouette outline). */
+  setSketchMode(enabled: boolean): void {
+    if (this.sketchMode === enabled) return;
+    this.sketchMode = enabled;
+    this.scene.background = enabled
+      ? new THREE.Color(PAPER_COLOR)
+      : this.defaultBackground;
+    if (this.grid) this.grid.visible = !enabled;
+    this.refreshSketchAppearance();
+    this.applyDisplayMode();
+  }
+
+  /** Apply or remove the sketch material/outline on the current mesh to match `sketchMode`. */
+  private refreshSketchAppearance(): void {
+    this.clearOutlineMesh();
+
+    if (!this.sketchMode || !this.meshObject) {
+      return;
+    }
+    if (!this.sketchMaterials) {
+      this.sketchMaterials = createSketchMaterials();
+    }
+    // The sketched object is plain white paper; only the stipple ink conveys shading.
+    (this.sketchMaterials.fill.uniforms.uPaper.value as THREE.Color).setHex(0xffffff);
+
+    const phong = this.meshObject.material as THREE.Material;
+    this.meshObject.material = this.sketchMaterials.fill;
+    phong.dispose();
+
+    // Inverted-hull silhouette outline: a slightly inflated back-face shell behind the mesh.
+    const outline = new THREE.Mesh(this.meshObject.geometry, this.sketchMaterials.outline);
+    outline.scale.copy(this.meshObject.scale);
+    outline.renderOrder = -1;
+    this.outlineMesh = outline;
+    this.scene.add(outline);
+  }
+
+  private clearOutlineMesh(): void {
+    if (this.outlineMesh) {
+      this.scene.remove(this.outlineMesh);
+      this.outlineMesh = null; // geometry is shared with meshObject; material is reused
+    }
   }
 
   addCutSurfaceLines(front: Vec3[], back: Vec3[]): void {
