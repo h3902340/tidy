@@ -219,9 +219,10 @@ export function computeExtrusion(
   const layers = resampleCenterline(raw.centers, raw.widths, layerCount(raw.centers));
   smoothCenterline(layers);
   const L = layers.centers.length;
-  // Extra smoothing over the trailing third: the two-pointer medial sweep is noisiest where the
-  // two stroke sides converge, so this de-wobbles the centre/width as the tip approaches.
-  smoothCenterlineTail(layers, Math.floor(L * 0.6));
+  // Gently de-wobble only the very tip's width taper (the two-pointer is noisiest where the two
+  // stroke sides converge). We keep this light and confined to the last ~20% so the centreline
+  // still follows the drawn curve to the end instead of being straightened.
+  smoothCenterlineTail(layers, Math.floor(L * 0.8));
   const w0 = layers.widths[0] > 1e-6 ? layers.widths[0] : 1;
 
   const X = layers.centers.map((c) =>
@@ -239,9 +240,6 @@ export function computeExtrusion(
   // creased — this is the "insufficiently planar base" issue from the paper.
   const rh: number[] = ring0.map((r) => r.clone().sub(G).dot(N));
   const blendLayers = Math.max(2, Math.floor(L / 6));
-  // Begin easing the cross-section radius to zero over the final stretch, so the tip closes as a
-  // clean cone instead of a recessed/ twisted disc.
-  const collapseStart = 0.8;
 
   // Vertices start as a copy of the cut mesh (original + imprinted boundary vertices).
   const vertices: Vec3[] = base.vertices.map((v) => ({ x: v.x, y: v.y, z: v.z }));
@@ -271,12 +269,10 @@ export function computeExtrusion(
     Pc.applyQuaternion(q).normalize();
     dirPrev.copy(tangents[i]);
 
-    let s = layers.widths[i] / w0;
-    const u = i / (L - 1);
-    if (u > collapseStart) {
-      const tt = (u - collapseStart) / (1 - collapseStart);
-      s *= 1 - smoothstep(clamp01(tt));
-    }
+    // The cross-section radius follows the stroke's own width taper (which already shrinks toward
+    // the tip as the two pointers converge) — no artificial collapse, so the end rings keep the
+    // shape of the drawn stroke instead of pinching into a neck.
+    const s = layers.widths[i] / w0;
     const decay = Math.max(0, 1 - (i - 1) / blendLayers);
 
     // Minimum forward progress every vertex must make this layer, measured along the local sweep
@@ -307,12 +303,16 @@ export function computeExtrusion(
   }
 
   // Single apex at the centreline tip → the final segment is a cone (no flat disc, no apex twist).
-  // Keep it ahead of the last ring along the sweep direction so the cone never caves inward.
+  // It must sit a clear step *ahead* of the last ring along the curve, otherwise the cone is shallow
+  // and reads as a cavity. We follow the curve's end tangent and floor the forward gap to a fraction
+  // of the last layer spacing so the tip is a clean, convex point.
   const lastTan = tangents[L - 2];
+  const lastStep = Math.max(1e-4, X[L - 1].clone().sub(X[L - 2]).dot(lastTan));
+  const apexMargin = 0.5 * lastStep;
   const apexPos = X[L - 1].clone();
   let apexAdv = Infinity;
   for (const p of prevWorld) apexAdv = Math.min(apexAdv, apexPos.clone().sub(p).dot(lastTan));
-  if (apexAdv < 1e-4) apexPos.addScaledVector(lastTan, 1e-4 - apexAdv);
+  if (apexAdv < apexMargin) apexPos.addScaledVector(lastTan, apexMargin - apexAdv);
   const apexIdx = pushWorld(apexPos);
 
   const newFaces: Triangle[] = [];
@@ -563,31 +563,21 @@ function smoothCenterline(layers: { centers: PlanePoint[]; widths: number[] }): 
   }
 }
 
-/** Extra smoothing passes applied only from `fromIndex` to the tip (the noisy apex region). */
+/**
+ * Light de-wobbling of just the tip. Only the width taper is smoothed (2 passes) — the centres are
+ * left alone so the end rings keep following the drawn curve rather than being straightened.
+ */
 function smoothCenterlineTail(
   layers: { centers: PlanePoint[]; widths: number[] },
   fromIndex: number
 ): void {
-  const n = layers.centers.length;
+  const n = layers.widths.length;
   if (n < 3) return;
   const start = Math.max(1, fromIndex);
-  for (let pass = 0; pass < 3; pass++) {
-    const c = layers.centers.map((p) => ({ ...p }));
+  for (let pass = 0; pass < 2; pass++) {
     const w = layers.widths.slice();
     for (let i = start; i < n - 1; i++) {
-      layers.centers[i] = {
-        u: (c[i - 1].u + 2 * c[i].u + c[i + 1].u) / 4,
-        h: (c[i - 1].h + 2 * c[i].h + c[i + 1].h) / 4,
-      };
       layers.widths[i] = (w[i - 1] + 2 * w[i] + w[i + 1]) / 4;
     }
   }
-}
-
-function clamp01(t: number): number {
-  return t < 0 ? 0 : t > 1 ? 1 : t;
-}
-
-function smoothstep(t: number): number {
-  return t * t * (3 - 2 * t);
 }
