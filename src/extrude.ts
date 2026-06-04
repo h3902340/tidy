@@ -27,10 +27,10 @@ import { extractAllOpeningBoundaries, type ExtrusionBase } from './loopImprint';
 export { imprintLoop } from './loopImprint';
 export type { ExtrusionBase } from './loopImprint';
 
-/** Number of swept layers between the base ring and the tip. */
-const TARGET_LAYERS = 28;
-const MIN_LAYERS = 8;
-const MAX_LAYERS = 60;
+/** Number of swept layers between the base ring and the tip (kept low so the rings aren't dense). */
+const TARGET_LAYERS = 14;
+const MIN_LAYERS = 6;
+const MAX_LAYERS = 24;
 /** View-ray densification for the extruding stroke before plane projection. */
 const STROKE_SAMPLES = 6;
 
@@ -495,7 +495,10 @@ function strokeTangent(pts: PlanePoint[], i: number): PlanePoint {
 }
 
 function layerCount(centers: PlanePoint[]): number {
-  return Math.max(MIN_LAYERS, Math.min(MAX_LAYERS, Math.max(TARGET_LAYERS, centers.length)));
+  // Scale gently with stroke length (longer extrusions get a few more rings) but stay sparse —
+  // a third of the raw rib count, floored at TARGET and capped at MAX.
+  const adaptive = Math.max(TARGET_LAYERS, Math.round(centers.length / 3));
+  return Math.max(MIN_LAYERS, Math.min(MAX_LAYERS, adaptive));
 }
 
 /** Resample the rib centreline to `count` evenly arc-length-spaced layers (centres + widths). */
