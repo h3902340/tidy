@@ -5,6 +5,7 @@ import { validateCutCrossesBoundary, type CutBoundaryHit } from './cutPolygon';
 import { computeScreenSilhouetteFromRender } from './renderSilhouette';
 import {
   projectClosedLoopToFrontSurface,
+  validateClosedLoopOnSurface,
   projectScreenStroke,
   projectScreenStrokeFrontBack,
   projectScreenStrokeToPlane,
@@ -550,15 +551,16 @@ export class SceneView {
     }
 
     const closed = closeStroke(stroke, CLOSE_TOLERANCE);
-    // Require the whole loop to land on the front surface before cutting.
-    const projected = projectClosedLoopToFrontSurface(
+    // Bump removal: the loop may bulge past the silhouette (around a corner / the narrow bottom),
+    // so only require that most of it lies over the object — not the whole loop.
+    const validated = validateClosedLoopOnSurface(
       closed,
       this.camera,
       this.meshObject,
       this.overlayCanvas
     );
-    if ('error' in projected) {
-      this.onLoopCutStatus?.(projected.error, 'error');
+    if ('error' in validated) {
+      this.onLoopCutStatus?.(validated.error, 'error');
       return;
     }
 

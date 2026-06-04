@@ -17,6 +17,7 @@ import * as THREE from 'three';
 import { edgeKey, lerp3, parseEdgeKey, windingNumber, type Vec2, type Vec3 } from './math';
 import { meshCentroid, orientFaceOutward, type Triangle } from './meshWinding';
 import { meshVertexToScreen } from './screenSilhouette';
+import { mesh3DToRaycastObject } from './surfaceProjection';
 import type { Mesh3D } from './teddyPipeline';
 
 /** Result of imprinting the loop and removing the enclosed front surface. */
@@ -25,8 +26,10 @@ export interface ExtrusionBase {
   vertices: Vec3[];
   /** Faces that survive the cut (front surface inside the loop removed, crossed faces split). */
   keptFaces: Triangle[];
-  /** Ordered vertex indices around the opening — these lie on the drawn loop. */
+  /** Ordered vertex indices around the primary opening (largest imprinted loop). */
   holeBoundary: number[];
+  /** Every opening boundary after the cut (a fragmented cut can produce several). */
+  holeBoundaries: number[][];
   /** World-space positions of `holeBoundary` (the base ring for filling/sweeping). */
   ringWorld: THREE.Vector3[];
   /** Number of original front faces removed (fully inside) or split by the loop. */
@@ -53,9 +56,6 @@ export function imprintLoop(
   if (poly.length < 3) return { error: 'Loop is too small to enclose any surface.' };
 
   const camWorld = camera.getWorldPosition(new THREE.Vector3());
-  // World↔mesh use the renderer's (x, -y, z) flip (an involution), so the camera in mesh space is:
-  const camMesh: Vec3 = { x: camWorld.x, y: -camWorld.y, z: camWorld.z };
-  const meshCtr = meshCentroid(mesh.vertices);
 
   const origCount = mesh.vertices.length;
   const vertices: Vec3[] = mesh.vertices.map((v) => ({ x: v.x, y: v.y, z: v.z }));
@@ -71,25 +71,32 @@ export function imprintLoop(
     return insideCache[id] === 1;
   };
 
-  // Front test: only the camera-facing sheet should be cut (the bump), not the back sheet that
-  // happens to project into the same screen region. We derive each face's *outward* normal from
-  // the mesh centroid (winding-independent), then check whether it points toward the camera.
-  const facesCamera = (va: Vec3, vb: Vec3, vc: Vec3): boolean => {
-    const fcx = (va.x + vb.x + vc.x) / 3;
-    const fcy = (va.y + vb.y + vc.y) / 3;
-    const fcz = (va.z + vb.z + vc.z) / 3;
-    let nx = (vb.y - va.y) * (vc.z - va.z) - (vb.z - va.z) * (vc.y - va.y);
-    let ny = (vb.z - va.z) * (vc.x - va.x) - (vb.x - va.x) * (vc.z - va.z);
-    let nz = (vb.x - va.x) * (vc.y - va.y) - (vb.y - va.y) * (vc.x - va.x);
-    // Flip to outward (pointing away from the mesh centroid).
-    if (
-      nx * (fcx - meshCtr.x) + ny * (fcy - meshCtr.y) + nz * (fcz - meshCtr.z) < 0
-    ) {
-      nx = -nx;
-      ny = -ny;
-      nz = -nz;
-    }
-    return nx * (camMesh.x - fcx) + ny * (camMesh.y - fcy) + nz * (camMesh.z - fcz) > 0;
+  // Near/far test (occlusion, not normal direction): a face inside the loop is removed only if it
+  // is on the *visible near surface* along the view ray through its centroid — not the surface
+  // occluded behind it. This unifies bump removal (cut the near bump, keep the occluded far side)
+  // and edge-on rim cuts (both near sheets are visible → both cut; their far halves are kept).
+  //
+  // For each ray we compare the centroid's depth against the midpoint between the nearest and
+  // farthest mesh hits. The near sheet sits at ~nearest (≤ midpoint → cut); the far sheet sits at
+  // ~farthest (> midpoint → kept). Using the midpoint auto-scales to the local solid thickness, so
+  // no absolute distance tolerance is needed.
+  const raycastObj = mesh3DToRaycastObject(mesh);
+  const raycaster = new THREE.Raycaster();
+  const _wp = new THREE.Vector3();
+  const _ndc = new THREE.Vector2();
+  const isNearSurface = (cx: number, cy: number, cz: number): boolean => {
+    _wp.set(cx, -cy, cz);
+    const centroidDist = camWorld.distanceTo(_wp);
+    _wp.project(camera);
+    if (_wp.x < -1.05 || _wp.x > 1.05 || _wp.y < -1.05 || _wp.y > 1.05) return false;
+    _ndc.set(_wp.x, _wp.y);
+    raycaster.setFromCamera(_ndc, camera);
+    const hits = raycaster.intersectObject(raycastObj, false);
+    if (hits.length === 0) return false;
+    const nearest = hits[0].distance;
+    const farthest = hits[hits.length - 1].distance;
+    const midpoint = (nearest + farthest) / 2;
+    return centroidDist <= midpoint;
   };
 
   // Crossing vertex where edge (idA,idB) crosses the loop boundary. Keyed by the original edge
@@ -125,52 +132,60 @@ export function imprintLoop(
   let removedCount = 0;
   let wholeRemoved = 0;
   let crossed = 0;
-  let backKept = 0;
+  let farKept = 0;
 
-  for (const face of mesh.faces) {
-    const [a, b, c] = face;
-    const inA = insideVertex(a);
-    const inB = insideVertex(b);
-    const inC = insideVertex(c);
-    const inCount = (inA ? 1 : 0) + (inB ? 1 : 0) + (inC ? 1 : 0);
+  try {
+    for (const face of mesh.faces) {
+      const [a, b, c] = face;
+      const inA = insideVertex(a);
+      const inB = insideVertex(b);
+      const inC = insideVertex(c);
+      const inCount = (inA ? 1 : 0) + (inB ? 1 : 0) + (inC ? 1 : 0);
 
-    if (inCount === 0) {
-      keptFaces.push([a, b, c]); // fully outside the loop
-      continue;
-    }
-
-    // The face projects (at least partly) inside the loop. Only cut it if it is on the
-    // camera-facing sheet — otherwise it is the back surface and must be kept.
-    const va = mesh.vertices[a];
-    const vb = mesh.vertices[b];
-    const vc = mesh.vertices[c];
-    if (!facesCamera(va, vb, vc)) {
-      backKept++;
-      keptFaces.push([a, b, c]);
-      continue;
-    }
-
-    if (inCount === 3) {
-      wholeRemoved++; // fully inside the loop → removed
-      removedCount++;
-      continue;
-    }
-
-    // Mixed: split the triangle along the loop. Vertices outside the loop (plus the two edge
-    // crossings) form the kept polygon; the inside polygon is dropped.
-    crossed++;
-    removedCount++;
-    const inFlags = [inA, inB, inC];
-    const outPoly: number[] = [];
-    for (let i = 0; i < 3; i++) {
-      const cur = face[i];
-      const nxt = face[(i + 1) % 3];
-      if (!inFlags[i]) outPoly.push(cur);
-      if (inFlags[i] !== inFlags[(i + 1) % 3]) {
-        outPoly.push(crossingVertex(cur, nxt));
+      if (inCount === 0) {
+        keptFaces.push([a, b, c]); // fully outside the loop
+        continue;
       }
+
+      // The face projects (at least partly) inside the loop. Cut it only if it is the visible near
+      // surface there — otherwise it is the occluded far surface and must be kept.
+      const va = mesh.vertices[a];
+      const vb = mesh.vertices[b];
+      const vc = mesh.vertices[c];
+      const cx = (va.x + vb.x + vc.x) / 3;
+      const cy = (va.y + vb.y + vc.y) / 3;
+      const cz = (va.z + vb.z + vc.z) / 3;
+      if (!isNearSurface(cx, cy, cz)) {
+        farKept++;
+        keptFaces.push([a, b, c]);
+        continue;
+      }
+
+      if (inCount === 3) {
+        wholeRemoved++; // fully inside the loop → removed
+        removedCount++;
+        continue;
+      }
+
+      // Mixed: split the triangle along the loop. Vertices outside the loop (plus the two edge
+      // crossings) form the kept polygon; the inside polygon is dropped.
+      crossed++;
+      removedCount++;
+      const inFlags = [inA, inB, inC];
+      const outPoly: number[] = [];
+      for (let i = 0; i < 3; i++) {
+        const cur = face[i];
+        const nxt = face[(i + 1) % 3];
+        if (!inFlags[i]) outPoly.push(cur);
+        if (inFlags[i] !== inFlags[(i + 1) % 3]) {
+          outPoly.push(crossingVertex(cur, nxt));
+        }
+      }
+      fanTriangulate(outPoly, keptFaces);
     }
-    fanTriangulate(outPoly, keptFaces);
+  } finally {
+    raycastObj.geometry.dispose();
+    (raycastObj.material as THREE.Material).dispose();
   }
 
   if (removedCount === 0) {
@@ -183,10 +198,11 @@ export function imprintLoop(
     keptFaces[i] = orientFaceOutward(vertices, keptFaces[i], ref);
   }
 
-  const boundary = extractOpeningBoundary(keptFaces, origCount);
-  if (!boundary) {
+  const holeBoundaries = extractAllOpeningBoundaries(keptFaces, origCount);
+  if (holeBoundaries.length === 0) {
     return { error: 'Could not form a clean opening from the loop — redraw it on the surface.' };
   }
+  const boundary = holeBoundaries[0];
 
   const ringWorld = boundary.map(
     (i) => new THREE.Vector3(vertices[i].x, -vertices[i].y, vertices[i].z)
@@ -194,10 +210,18 @@ export function imprintLoop(
 
   const debug =
     `loopPts=${poly.length}, crossed=${crossed}, wholeRemoved=${wholeRemoved}, ` +
-    `backKept=${backKept}, insertedVerts=${vertices.length - origCount}, ` +
-    `boundary=${boundary.length}`;
+    `farKept=${farKept}, holes=${holeBoundaries.length}, ` +
+    `insertedVerts=${vertices.length - origCount}, boundary=${boundary.length}`;
 
-  return { vertices, keptFaces, holeBoundary: boundary, ringWorld, removedCount, debug };
+  return {
+    vertices,
+    keptFaces,
+    holeBoundary: boundary,
+    holeBoundaries,
+    ringWorld,
+    removedCount,
+    debug,
+  };
 }
 
 function fanTriangulate(poly: number[], out: Triangle[]): void {
@@ -206,8 +230,11 @@ function fanTriangulate(poly: number[], out: Triangle[]): void {
   }
 }
 
-/** Boundary loop of an opening = edges used by exactly one face; prefer the loop on the cut. */
-function extractOpeningBoundary(faces: Triangle[], origCount: number): number[] | null {
+/**
+ * Every opening boundary (edges used by exactly one face), ordered best-first. The "best" loop
+ * is the one made mostly of inserted cut vertices (the imprinted opening); ties break by length.
+ */
+export function extractAllOpeningBoundaries(faces: Triangle[], origCount: number): number[][] {
   const count = new Map<string, number>();
   for (const [a, b, c] of faces) {
     for (const [u, v] of [
@@ -224,24 +251,16 @@ function extractOpeningBoundary(faces: Triangle[], origCount: number): number[] 
   for (const [k, c] of count) {
     if (c === 1) boundaryEdges.push(parseEdgeKey(k));
   }
-  if (boundaryEdges.length === 0) return null;
+  if (boundaryEdges.length === 0) return [];
 
-  const loops = collectLoops(boundaryEdges);
-  if (loops.length === 0) return null;
-
-  // Prefer the loop made of inserted (cut) vertices; break ties by length.
-  let best: number[] | null = null;
-  let bestScore = -1;
-  for (const loop of loops) {
-    if (loop.length < 3) continue;
+  const score = (loop: number[]): number => {
     const inserted = loop.reduce((acc, v) => acc + (v >= origCount ? 1 : 0), 0);
-    const score = inserted * 100000 + loop.length;
-    if (score > bestScore) {
-      bestScore = score;
-      best = loop;
-    }
-  }
-  return best;
+    return inserted * 100000 + loop.length;
+  };
+
+  return collectLoops(boundaryEdges)
+    .filter((loop) => loop.length >= 3)
+    .sort((a, b) => score(b) - score(a));
 }
 
 /** Chain undirected edges into ordered vertex loops. */

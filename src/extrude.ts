@@ -21,7 +21,8 @@ import * as THREE from 'three';
 import type { Mesh3D } from './teddyPipeline';
 import type { Vec2, Vec3 } from './math';
 import { meshCentroid, orientFaceOutward, type Triangle } from './meshWinding';
-import type { ExtrusionBase } from './loopImprint';
+import { constrainedDelaunay } from './cdt';
+import { extractAllOpeningBoundaries, type ExtrusionBase } from './loopImprint';
 
 export { imprintLoop } from './loopImprint';
 export type { ExtrusionBase } from './loopImprint';
@@ -48,28 +49,20 @@ export type ExtrudeResult = { mesh: Mesh3D; layerCount: number } | { error: stri
  * Shares all geometry prep with extrusion, minus the sweep — a good way to validate the cut.
  */
 export function fillLoopHole(mesh: Mesh3D, base: ExtrusionBase): { mesh: Mesh3D } | { error: string } {
-  const boundary = base.holeBoundary;
-  const R = boundary.length;
-  if (R < 3) return { error: 'Opening is too small to fill.' };
+  const loops =
+    base.holeBoundaries.length > 0
+      ? base.holeBoundaries
+      : extractAllOpeningBoundaries(base.keptFaces, mesh.vertices.length);
+  if (loops.length === 0) return { error: 'Opening is too small to fill.' };
 
   const vertices: Vec3[] = base.vertices.map((v) => ({ x: v.x, y: v.y, z: v.z }));
-
-  // Cap: fan the opening loop to its centroid.
-  let cx = 0;
-  let cy = 0;
-  let cz = 0;
-  for (const i of boundary) {
-    cx += vertices[i].x;
-    cy += vertices[i].y;
-    cz += vertices[i].z;
-  }
-  const cIdx = vertices.length;
-  vertices.push({ x: cx / R, y: cy / R, z: cz / R });
-
   const newFaces: Triangle[] = [];
-  for (let j = 0; j < R; j++) {
-    newFaces.push([cIdx, boundary[j], boundary[(j + 1) % R]]);
+
+  for (const boundary of loops) {
+    if (boundary.length < 3) continue;
+    capOpening(vertices, boundary, newFaces);
   }
+  if (newFaces.length === 0) return { error: 'Opening is too small to fill.' };
 
   const ref = meshCentroid(mesh.vertices);
   for (let i = 0; i < newFaces.length; i++) {
@@ -77,6 +70,91 @@ export function fillLoopHole(mesh: Mesh3D, base: ExtrusionBase): { mesh: Mesh3D 
   }
 
   return { mesh: { vertices, faces: [...base.keptFaces, ...newFaces] } };
+}
+
+/**
+ * Cap one opening loop with a flat patch. The boundary is projected into its own best-fit plane
+ * and triangulated with a constrained Delaunay, so concave openings fill completely (a centroid
+ * fan would overlap or leave slivers). Falls back to a centroid fan if the CDT is degenerate.
+ */
+function capOpening(vertices: Vec3[], boundary: number[], out: Triangle[]): void {
+  const R = boundary.length;
+  const pts3 = boundary.map((i) => vertices[i]);
+  const { origin, u, v } = openingPlaneBasis(pts3);
+  const poly2: Vec2[] = pts3.map((p) => {
+    const dx = p.x - origin.x;
+    const dy = p.y - origin.y;
+    const dz = p.z - origin.z;
+    return { x: dx * u.x + dy * u.y + dz * u.z, y: dx * v.x + dy * v.y + dz * v.z };
+  });
+
+  try {
+    const cdt = constrainedDelaunay(poly2);
+    if (cdt.triangles.length === 0) throw new Error('degenerate opening');
+    for (const t of cdt.triangles) {
+      out.push([boundary[t.indices[0]], boundary[t.indices[1]], boundary[t.indices[2]]]);
+    }
+    return;
+  } catch {
+    // Fallback: fan to the boundary centroid.
+    let cx = 0;
+    let cy = 0;
+    let cz = 0;
+    for (const p of pts3) {
+      cx += p.x;
+      cy += p.y;
+      cz += p.z;
+    }
+    const cIdx = vertices.length;
+    vertices.push({ x: cx / R, y: cy / R, z: cz / R });
+    for (let j = 0; j < R; j++) {
+      out.push([cIdx, boundary[j], boundary[(j + 1) % R]]);
+    }
+  }
+}
+
+/** Best-fit plane of a 3D loop: area-weighted normal (Newell) + an orthonormal in-plane basis. */
+function openingPlaneBasis(pts: Vec3[]): { origin: Vec3; u: Vec3; v: Vec3 } {
+  const origin = { x: 0, y: 0, z: 0 };
+  for (const p of pts) {
+    origin.x += p.x;
+    origin.y += p.y;
+    origin.z += p.z;
+  }
+  const inv = 1 / Math.max(1, pts.length);
+  origin.x *= inv;
+  origin.y *= inv;
+  origin.z *= inv;
+
+  let nx = 0;
+  let ny = 0;
+  let nz = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i];
+    const b = pts[(i + 1) % pts.length];
+    nx += (a.y - b.y) * (a.z + b.z);
+    ny += (a.z - b.z) * (a.x + b.x);
+    nz += (a.x - b.x) * (a.y + b.y);
+  }
+  const nLen = Math.hypot(nx, ny, nz) || 1;
+  const n = { x: nx / nLen, y: ny / nLen, z: nz / nLen };
+
+  const ref = Math.abs(n.x) < 0.9 ? { x: 1, y: 0, z: 0 } : { x: 0, y: 1, z: 0 };
+  const u = {
+    x: ref.y * n.z - ref.z * n.y,
+    y: ref.z * n.x - ref.x * n.z,
+    z: ref.x * n.y - ref.y * n.x,
+  };
+  const uLen = Math.hypot(u.x, u.y, u.z) || 1;
+  u.x /= uLen;
+  u.y /= uLen;
+  u.z /= uLen;
+  const v = {
+    x: n.y * u.z - n.z * u.y,
+    y: n.z * u.x - n.x * u.z,
+    z: n.x * u.y - n.y * u.x,
+  };
+  return { origin, u, v };
 }
 
 /**

@@ -135,6 +135,43 @@ export function projectClosedLoopToFrontSurface(
   return { ring };
 }
 
+/**
+ * Lenient on-surface check for the *loop cut* (bump removal). Unlike the extrusion base ring, a
+ * loop drawn around a protruding corner or the narrow bottom of the object legitimately bulges
+ * past the silhouette into empty space, so we must NOT require every sample to hit the mesh. We
+ * only require that the loop is meaningfully over the object (a good fraction of samples hit it).
+ */
+export function validateClosedLoopOnSurface(
+  loop: Vec2[],
+  camera: THREE.Camera,
+  mesh: THREE.Object3D,
+  domElement: HTMLElement,
+  minHitFraction = 0.4
+): { ok: true } | { error: string } {
+  if (loop.length < 3) return { error: 'Loop is too short — draw a closed loop on the surface.' };
+
+  const raycaster = new THREE.Raycaster();
+  const ndc = new THREE.Vector2();
+  const rect = domElement.getBoundingClientRect();
+  let hits = 0;
+  let total = 0;
+
+  for (const p of densifyStroke(loop, SEGMENT_SAMPLES)) {
+    ndc.x = (p.x / rect.width) * 2 - 1;
+    ndc.y = -(p.y / rect.height) * 2 + 1;
+    raycaster.setFromCamera(ndc, camera);
+    total++;
+    if (raycaster.intersectObject(mesh, false).length > 0) hits++;
+  }
+
+  if (hits < 3 || hits / Math.max(1, total) < minHitFraction) {
+    return {
+      error: 'Draw the loop over the object — most of it must lie on the surface.',
+    };
+  }
+  return { ok: true };
+}
+
 /** Build a raycast target from mesh data (world y-flip matches SceneView). */
 export function mesh3DToRaycastObject(mesh: {
   vertices: { x: number; y: number; z: number }[];
