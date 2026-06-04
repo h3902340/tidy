@@ -4,7 +4,6 @@ import type { Mesh3D } from './teddy';
 import { validateCutCrossesBoundary, type CutBoundaryHit } from './cutPolygon';
 import { computeScreenSilhouetteFromRender } from './renderSilhouette';
 import {
-  projectClosedLoopToFrontSurface,
   validateClosedLoopOnSurface,
   projectScreenStroke,
   projectScreenStrokeFrontBack,
@@ -718,18 +717,20 @@ export class SceneView {
         return;
       }
       const closed = closeStroke(stroke, CLOSE_TOLERANCE);
-      // First require the whole loop to land on the surface (front face only).
-      const projected = projectClosedLoopToFrontSurface(
+      // Same base as loop cut: the loop may bulge past the silhouette (around a corner / edge),
+      // so only require that most of it lies over the object.
+      const validated = validateClosedLoopOnSurface(
         closed,
         this.camera,
         this.meshObject,
         this.overlayCanvas
       );
-      if ('error' in projected) {
-        this.onExtrudeStatus?.(projected.error, 'error');
+      if ('error' in validated) {
+        this.onExtrudeStatus?.(validated.error, 'error');
         return;
       }
-      // Imprint the loop into the mesh; the resulting opening boundary is the base ring.
+      // Imprint the loop into the mesh (occlusion-based, like loop cut): the enclosed near surface
+      // is removed and the resulting opening boundary becomes the extrusion base ring.
       const base = imprintLoop(this.currentMeshData, closed, this.camera, this.overlayCanvas);
       if ('error' in base) {
         this.onExtrudeStatus?.(base.error, 'error');
