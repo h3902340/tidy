@@ -145,6 +145,8 @@ export class SceneView {
   private sketchMode = false;
   private sketchMaterials: SketchMaterials | null = null;
   private outlineMesh: THREE.Mesh | null = null;
+  /** The mesh's normal (Phong) material, kept aside while the sketch fill is shown so it can be restored. */
+  private suspendedFillMaterial: THREE.Material | null = null;
   private grid: THREE.GridHelper | null = null;
   private readonly defaultBackground = new THREE.Color(0xf0eeea);
 
@@ -1272,6 +1274,11 @@ export class SceneView {
       if (mat !== this.sketchMaterials?.fill) mat.dispose();
       this.meshObject = null;
     }
+    // Dispose any Phong material hidden behind the sketch fill from the previous mesh.
+    if (this.suspendedFillMaterial) {
+      this.suspendedFillMaterial.dispose();
+      this.suspendedFillMaterial = null;
+    }
     if (this.wireframe) {
       this.scene.remove(this.wireframe);
       this.wireframe.geometry.dispose();
@@ -1333,18 +1340,31 @@ export class SceneView {
   private refreshSketchAppearance(): void {
     this.clearOutlineMesh();
 
-    if (!this.sketchMode || !this.meshObject) {
+    if (!this.meshObject) return;
+
+    if (!this.sketchMode) {
+      // Restore the normal material if the sketch fill is currently shown.
+      if (
+        this.suspendedFillMaterial &&
+        this.meshObject.material === this.sketchMaterials?.fill
+      ) {
+        this.meshObject.material = this.suspendedFillMaterial;
+        this.suspendedFillMaterial = null;
+      }
       return;
     }
+
     if (!this.sketchMaterials) {
       this.sketchMaterials = createSketchMaterials();
     }
     // The sketched object is plain white paper; only the stipple ink conveys shading.
     (this.sketchMaterials.fill.uniforms.uPaper.value as THREE.Color).setHex(0xffffff);
 
-    const phong = this.meshObject.material as THREE.Material;
-    this.meshObject.material = this.sketchMaterials.fill;
-    phong.dispose();
+    // Swap in the sketch fill, keeping the Phong material aside so toggling off can restore it.
+    if (this.meshObject.material !== this.sketchMaterials.fill) {
+      this.suspendedFillMaterial = this.meshObject.material as THREE.Material;
+      this.meshObject.material = this.sketchMaterials.fill;
+    }
 
     // Inverted-hull silhouette outline: a slightly inflated back-face shell behind the mesh.
     const outline = new THREE.Mesh(this.meshObject.geometry, this.sketchMaterials.outline);
