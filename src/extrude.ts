@@ -259,6 +259,12 @@ export function computeExtrusion(
   const dirPrev = N.clone();
   const q = new THREE.Quaternion();
 
+  // Track the previous layer's world positions (per strand) and centre so we can stop a tilted
+  // ring from dipping back into the ring before it on the concave side of a bend — the cause of
+  // the surface wrinkles. Strand j is consistent: ring0[j] → layer1[j] → layer2[j] → …
+  let prevWorld: THREE.Vector3[] = ring0.map((r) => r.clone());
+  let prevCenter = X[0].clone();
+
   for (let i = 1; i <= L - 2; i++) {
     q.setFromUnitVectors(dirPrev, tangents[i]);
     Wc.applyQuaternion(q).normalize();
@@ -273,6 +279,14 @@ export function computeExtrusion(
     }
     const decay = Math.max(0, 1 - (i - 1) / blendLayers);
 
+    // Minimum forward progress every vertex must make this layer, measured along the local sweep
+    // direction as a fraction of how far the centreline advanced. Concave-side vertices that fall
+    // short (or go backward) are pushed forward to this floor, so rings never overlap; the joint
+    // fans into a smooth miter instead of folding.
+    const centerStep = Math.max(1e-4, X[i].clone().sub(prevCenter).dot(tangents[i]));
+    const minStep = 0.2 * centerStep;
+
+    const curWorld: THREE.Vector3[] = [];
     const idxRow: number[] = [];
     for (let j = 0; j < R; j++) {
       const world = X[i]
@@ -280,13 +294,26 @@ export function computeExtrusion(
         .addScaledVector(Wc, s * rw[j])
         .addScaledVector(Pc, s * rq[j]);
       if (decay > 0) world.addScaledVector(tangents[i], s * rh[j] * decay);
+
+      const adv = world.clone().sub(prevWorld[j]).dot(tangents[i]);
+      if (adv < minStep) world.addScaledVector(tangents[i], minStep - adv);
+
+      curWorld.push(world);
       idxRow.push(pushWorld(world));
     }
     layerIndices.push(idxRow);
+    prevWorld = curWorld;
+    prevCenter = X[i].clone();
   }
 
   // Single apex at the centreline tip → the final segment is a cone (no flat disc, no apex twist).
-  const apexIdx = pushWorld(X[L - 1]);
+  // Keep it ahead of the last ring along the sweep direction so the cone never caves inward.
+  const lastTan = tangents[L - 2];
+  const apexPos = X[L - 1].clone();
+  let apexAdv = Infinity;
+  for (const p of prevWorld) apexAdv = Math.min(apexAdv, apexPos.clone().sub(p).dot(lastTan));
+  if (apexAdv < 1e-4) apexPos.addScaledVector(lastTan, 1e-4 - apexAdv);
+  const apexIdx = pushWorld(apexPos);
 
   const newFaces: Triangle[] = [];
 
