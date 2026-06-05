@@ -3,10 +3,15 @@ import type { Mesh3D } from './teddyPipeline';
 import type { Vec2, Vec3 } from './math';
 import { cross2, lerp3 } from './math';
 import type { CutBoundaryHit } from './cutPolygon';
-import { meshVertexToScreen } from './screenSilhouette';
+import {
+  meshVertexToScreen,
+  meshVertexToWorld,
+  prepareCameraForScreenProjection,
+} from './screenSilhouette';
+import { meshCentroid, orientFaceOutward } from './meshWinding';
 import {
   mesh3DToRaycastObject,
-  projectScreenStrokeFrontBack,
+  projectScreenStrokeFrontBackPaired,
   worldHitToMeshVertex,
 } from './surfaceProjection';
 
@@ -23,7 +28,8 @@ export type TeddyCutResult = {
 };
 
 /**
- * Teddy §5.4 cut in two phases: (1) remove the side with fewer vertices, (2) cap the hole.
+ * Teddy §5.4 cut: remove polygons left of the stroke, then cap the section by triangulating
+ * the planar quads formed from paired front/back projections along each stroke segment.
  */
 export function computeTeddyCut(
   mesh: Mesh3D,
@@ -37,17 +43,23 @@ export function computeTeddyCut(
   worldRoot?: THREE.Object3D,
   projectedPaths?: { frontPath: Vec3[]; backPath: Vec3[] }
 ): TeddyCutResult | { error: string } {
-  const rect = domElement.getBoundingClientRect();
+  prepareCameraForScreenProjection(camera);
+  if (worldRoot) worldRoot.updateMatrixWorld(true);
+
+  const rect = {
+    width: Math.max(1, domElement.clientWidth),
+    height: Math.max(1, domElement.clientHeight),
+  };
 
   let frontPath: Vec3[];
   let backPath: Vec3[];
 
-  if (projectedPaths) {
+  if (projectedPaths && projectedPaths.frontPath.length >= 2 && projectedPaths.backPath.length >= 2) {
     frontPath = projectedPaths.frontPath;
     backPath = projectedPaths.backPath;
   } else {
     const raycastMesh = mesh3DToRaycastObject(mesh);
-    const { front: frontWorld, back: backWorld } = projectScreenStrokeFrontBack(
+    const { front: frontWorld, back: backWorld } = projectScreenStrokeFrontBackPaired(
       screenStroke,
       camera,
       raycastMesh,
@@ -80,12 +92,18 @@ export function computeTeddyCut(
     faces: keptFaces,
   };
 
-  // Cap the hole from the trimmed mesh's *actual* open boundary (the crossing vertices
-  // created by the split) so the cap welds onto the new cut triangles and follows the cut
-  // exactly, rather than floating on a separately-projected path over the old triangles.
-  const capFaces = buildCapFromBoundary(
+  const holeLoop = findCutHoleLoop(
     split.vertices,
     keptFaces,
+    split.cutSegments,
+    camera,
+    rect,
+    screenStroke,
+    worldRoot
+  );
+  const capFaces = buildCapFromProjectedSection(
+    split.vertices,
+    holeLoop,
     camera,
     rect,
     screenStroke,
@@ -328,19 +346,34 @@ function signedDistanceToPolyline(p: Vec2, path: Vec2[]): number {
 }
 
 /**
- * Phase 2: cap the hole left by the removed side. The trimmed mesh's only open boundary is
- * the cut rim — the crossing vertices the split inserted exactly along the stroke. We stitch
- * a ribbon across that rim reusing those same vertex indices, so the cap welds directly onto
- * the new cut triangles and follows the drawn stroke instead of a separately-projected path.
+ * Teddy §5.4 cap: splice planar quads between the front and back section boundaries and
+ * triangulate each quad (two triangles). The hole rim from the mesh split is the section
+ * outline; front/back arcs are stitched with ribbon quads along stroke parameter so every
+ * cap edge is shared with the open boundary.
  */
-function buildCapFromBoundary(
+function buildCapFromProjectedSection(
   vertices: Vec3[],
-  keptFaces: Triangle[],
+  holeLoop: number[] | null,
   camera: THREE.Camera,
   rect: { width: number; height: number },
   screenStroke: Vec2[],
   worldRoot?: THREE.Object3D
 ): Triangle[] {
+  if (!holeLoop) return [];
+
+  const stroke = screenStroke.filter(
+    (p, i) => i === 0 || Math.hypot(p.x - screenStroke[i - 1].x, p.y - screenStroke[i - 1].y) > 1e-6
+  );
+  const out: Triangle[] = [];
+  capBoundaryLoop(holeLoop, vertices, camera, rect, stroke, worldRoot, out);
+  const ref = meshCentroid(vertices);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = orientFaceOutward(vertices, out[i], ref);
+  }
+  return out;
+}
+
+function extractBoundaryLoops(keptFaces: Triangle[]): number[][] {
   const edgeUse = new Map<string, number>();
   for (const [a, b, c] of keptFaces) {
     for (const [u, v] of [
@@ -352,24 +385,29 @@ function buildCapFromBoundary(
       edgeUse.set(key, (edgeUse.get(key) ?? 0) + 1);
     }
   }
-
   const boundaryEdges: [number, number][] = [];
   for (const [key, count] of edgeUse) {
     if (count !== 1) continue;
     const [a, b] = key.split('_').map(Number);
     boundaryEdges.push([a, b]);
   }
+  return collectLoops(boundaryEdges);
+}
 
-  const loops = collectLoops(boundaryEdges);
+function findCutHoleLoop(
+  vertices: Vec3[],
+  keptFaces: Triangle[],
+  cutSegments: [number, number][],
+  camera: THREE.Camera,
+  rect: { width: number; height: number },
+  screenStroke: Vec2[],
+  worldRoot?: THREE.Object3D
+): number[] | null {
+  const loops = extractBoundaryLoops(keptFaces);
   const stroke = screenStroke.filter(
     (p, i) => i === 0 || Math.hypot(p.x - screenStroke[i - 1].x, p.y - screenStroke[i - 1].y) > 1e-6
   );
-
-  const out: Triangle[] = [];
-  for (const loop of loops) {
-    capBoundaryLoop(loop, vertices, camera, rect, stroke, worldRoot, out);
-  }
-  return out;
+  return pickCutHoleLoop(loops, cutSegments, vertices, camera, rect, stroke, worldRoot);
 }
 
 /**
@@ -421,13 +459,115 @@ function capBoundaryLoop(
     if (k === maxI) break;
   }
 
-  // arcA is the front surface, arcB the back; both run from the same silhouette end (min param)
-  // to the other (max param). Sort each strictly by param so the ribbon pairs front/back vertices
-  // that come from the same point along the cut — even if the rim wiggles or perspective makes the
-  // walk order non-monotonic. This is what keeps the hole fully closed.
-  const a = sortArcByParam(arcA, pA);
-  const b = sortArcByParam(arcB, pB);
-  ribbonStitch(a.arc, a.params, b.arc, b.params, out);
+  const depthA = meanDistanceToCamera(arcA, vertices, camera, worldRoot);
+  const depthB = meanDistanceToCamera(arcB, vertices, camera, worldRoot);
+  if (depthA <= depthB) {
+    stitchCapsule(arcA, pA, arcB, pB, out);
+  } else {
+    stitchCapsule(arcB, pB, arcA, pA, out);
+  }
+}
+
+const PARAM_EPS = 1e-6;
+
+/** Pick the rim loop created by the cut (shares edges with split cut segments). */
+function pickCutHoleLoop(
+  loops: number[][],
+  cutSegments: [number, number][],
+  vertices: Vec3[],
+  camera: THREE.Camera,
+  rect: { width: number; height: number },
+  stroke: Vec2[],
+  worldRoot?: THREE.Object3D
+): number[] | null {
+  const cutEdgeSet = new Set(
+    cutSegments.map(([a, b]) => (a < b ? `${a}_${b}` : `${b}_${a}`))
+  );
+
+  let best: number[] | null = null;
+  let bestCutHits = -1;
+  let bestSpan = -1;
+
+  if (cutEdgeSet.size === 0) {
+    return pickLoopByStrokeSpan(loops, vertices, camera, rect, stroke, worldRoot);
+  }
+
+  for (const loop of loops) {
+    let cutHits = 0;
+    for (let i = 0; i < loop.length; i++) {
+      const a = loop[i];
+      const b = loop[(i + 1) % loop.length];
+      const key = a < b ? `${a}_${b}` : `${b}_${a}`;
+      if (cutEdgeSet.has(key)) cutHits++;
+    }
+
+    let minP = Infinity;
+    let maxP = -Infinity;
+    for (const vid of loop) {
+      const s = meshVertexToScreen(vertices[vid], camera, rect, worldRoot);
+      if (!s) continue;
+      const p = paramAlongPolyline(s, stroke);
+      minP = Math.min(minP, p);
+      maxP = Math.max(maxP, p);
+    }
+    const span = maxP - minP;
+
+    if (cutHits > bestCutHits || (cutHits === bestCutHits && span > bestSpan)) {
+      bestCutHits = cutHits;
+      bestSpan = span;
+      best = loop;
+    }
+  }
+
+  if (bestCutHits <= 0) {
+    return pickLoopByStrokeSpan(loops, vertices, camera, rect, stroke, worldRoot);
+  }
+
+  return best;
+}
+
+function pickLoopByStrokeSpan(
+  loops: number[][],
+  vertices: Vec3[],
+  camera: THREE.Camera,
+  rect: { width: number; height: number },
+  stroke: Vec2[],
+  worldRoot?: THREE.Object3D
+): number[] | null {
+  let best: number[] | null = null;
+  let bestSpan = -1;
+  for (const loop of loops) {
+    let minP = Infinity;
+    let maxP = -Infinity;
+    for (const vid of loop) {
+      const s = meshVertexToScreen(vertices[vid], camera, rect, worldRoot);
+      if (!s) continue;
+      const p = paramAlongPolyline(s, stroke);
+      minP = Math.min(minP, p);
+      maxP = Math.max(maxP, p);
+    }
+    const span = maxP - minP;
+    if (span > bestSpan) {
+      bestSpan = span;
+      best = loop;
+    }
+  }
+  return best;
+}
+
+function meanDistanceToCamera(
+  arc: number[],
+  vertices: Vec3[],
+  camera: THREE.Camera,
+  worldRoot?: THREE.Object3D
+): number {
+  const camPos = new THREE.Vector3();
+  camera.getWorldPosition(camPos);
+  let sum = 0;
+  for (const vid of arc) {
+    sum += meshVertexToWorld(vertices[vid], worldRoot).distanceTo(camPos);
+  }
+  return sum / Math.max(1, arc.length);
 }
 
 /** Sort a rim arc and its parameters together, ascending by parameter. */
@@ -435,14 +575,30 @@ function sortArcByParam(
   arc: number[],
   params: number[]
 ): { arc: number[]; params: number[] } {
-  const order = arc.map((_, k) => k).sort((x, y) => params[x] - params[y]);
+  const order = arc.map((_, k) => k).sort((x, y) => params[x] - params[y] || arc[x] - arc[y]);
   return {
     arc: order.map((k) => arc[k]),
     params: order.map((k) => params[k]),
   };
 }
 
-/** Stitch a triangle strip between two arcs that share endpoints, marching by parameter. */
+/**
+ * Stitch a ribbon between front/back rim arcs using existing boundary vertices only
+ * (no mid-edge inserts), so every cap triangle shares an edge with the open rim.
+ */
+function stitchCapsule(
+  frontArc: number[],
+  frontParams: number[],
+  backArc: number[],
+  backParams: number[],
+  out: Triangle[]
+): void {
+  const front = sortArcByParam(frontArc, frontParams);
+  const back = sortArcByParam(backArc, backParams);
+  ribbonStitch(front.arc, front.params, back.arc, back.params, out);
+}
+
+/** Stitch a triangle strip between two rim arcs sorted by stroke parameter. */
 function ribbonStitch(
   arcA: number[],
   pA: number[],
@@ -452,11 +608,38 @@ function ribbonStitch(
 ): void {
   let i = 0;
   let j = 0;
+
   while (i < arcA.length - 1 || j < arcB.length - 1) {
     const canA = i < arcA.length - 1;
     const canB = j < arcB.length - 1;
-    const advanceA = canA && (!canB || pA[i + 1] <= pB[j + 1]);
-    if (advanceA) {
+
+    if (!canA && canB) {
+      while (j < arcB.length - 1) {
+        if (arcA[i] !== arcB[j] && arcA[i] !== arcB[j + 1] && arcB[j] !== arcB[j + 1]) {
+          out.push([arcA[i], arcB[j + 1], arcB[j]]);
+        }
+        j++;
+      }
+      break;
+    }
+    if (canA && !canB) {
+      while (i < arcA.length - 1) {
+        if (arcA[i] !== arcB[j] && arcA[i + 1] !== arcB[j] && arcA[i] !== arcA[i + 1]) {
+          out.push([arcA[i], arcA[i + 1], arcB[j]]);
+        }
+        i++;
+      }
+      break;
+    }
+
+    const nextPA = pA[i + 1];
+    const nextPB = pB[j + 1];
+
+    if (Math.abs(nextPA - nextPB) <= PARAM_EPS) {
+      addCapQuad(arcA[i], arcA[i + 1], arcB[j + 1], arcB[j], out);
+      i++;
+      j++;
+    } else if (nextPA < nextPB) {
       if (arcA[i] !== arcB[j] && arcA[i + 1] !== arcB[j] && arcA[i] !== arcA[i + 1]) {
         out.push([arcA[i], arcA[i + 1], arcB[j]]);
       }
@@ -468,6 +651,12 @@ function ribbonStitch(
       j++;
     }
   }
+}
+
+function addCapQuad(a: number, b: number, c: number, d: number, out: Triangle[]): void {
+  if (a < 0 || b < 0 || c < 0 || d < 0) return;
+  if (a !== b && b !== c && a !== c) out.push([a, b, c]);
+  if (a !== c && c !== d && a !== d) out.push([a, c, d]);
 }
 
 /**
@@ -582,6 +771,26 @@ function extractTopBoundaryPolygon(vertices: Vec3[], faces: Triangle[]): Vec2[] 
     .filter(({ v }) => v.z >= -1e-4)
     .map(({ v }) => ({ x: v.x, y: v.y }));
   return convexHull2(topVerts);
+}
+
+/** Count mesh edges used by exactly one triangle (open boundary). */
+export function countBoundaryEdges(mesh: Mesh3D): number {
+  const edgeUse = new Map<string, number>();
+  for (const [a, b, c] of mesh.faces) {
+    for (const [u, v] of [
+      [a, b],
+      [b, c],
+      [c, a],
+    ] as [number, number][]) {
+      const key = u < v ? `${u}_${v}` : `${v}_${u}`;
+      edgeUse.set(key, (edgeUse.get(key) ?? 0) + 1);
+    }
+  }
+  let open = 0;
+  for (const count of edgeUse.values()) {
+    if (count === 1) open++;
+  }
+  return open;
 }
 
 function collectLoops(edges: [number, number][]): number[][] {

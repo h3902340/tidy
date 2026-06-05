@@ -11,7 +11,6 @@
       <header class="header">
         <div class="header-text">
           <h1>Tidy</h1>
-          <p class="subtitle">Draw a closed loop to inflate it into a 3D shape, then paint, cut, or extrude.</p>
         </div>
         <label class="debug-toggle">
           <input type="checkbox" id="debug-mode" />
@@ -23,7 +22,6 @@
         <section class="panel">
           <div class="toolbar">
             <div class="toolbar-group">
-              <span class="toolbar-label">New shape</span>
               <div class="btn-row preset-row">
                 <button id="btn-circle" type="button" class="icon-btn secondary" aria-label="Circle">
                   <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.75"/></svg>
@@ -45,7 +43,6 @@
             </div>
 
             <div class="toolbar-group" id="edit-tools" hidden>
-              <span class="toolbar-label">Tools</span>
               <div class="btn-row">
                 <div class="tool-tabs" role="group" aria-label="Editing tools">
                   <button type="button" class="tool-tab is-active" data-mode="orbit">View</button>
@@ -103,23 +100,14 @@
               Confirm orientation
             </button>
             <div id="scene-view" class="scene-view"></div>
+            <div class="debug-panel" id="debug-panel" hidden>
+              <button id="btn-next-step" type="button" disabled hidden>Next step</button>
+              <button id="btn-discard-cut" type="button" class="secondary" disabled hidden>Discard cut</button>
+            </div>
           </div>
 
           <div class="canvas-footer">
-            <div class="hint-bar">
-              <p id="canvas-hint" class="hint">Draw a closed loop on the plane, or pick a preset shape</p>
-              <p id="status" class="status" role="status"></p>
-            </div>
-            <div class="nav-help" id="nav-help" aria-label="Camera and drawing controls"></div>
-          </div>
-
-          <div class="debug-panel" id="debug-panel" hidden>
-            <span class="toolbar-label">Pipeline debug</span>
-            <span class="inflation-step" id="inflation-step" aria-live="polite"></span>
-            <div class="btn-row">
-              <button id="btn-next-step" type="button" disabled>Next step</button>
-              <button id="btn-discard-cut" type="button" class="secondary" disabled>Discard cut</button>
-            </div>
+            <p id="status" class="status" role="status" hidden></p>
           </div>
         </section>
       </main>

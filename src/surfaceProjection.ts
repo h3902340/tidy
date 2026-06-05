@@ -84,6 +84,45 @@ export function projectScreenStrokeFrontBack(
 }
 
 /**
+ * Teddy §5.4 paired projection: front and back samples stay aligned per stroke sample so each
+ * segment forms a planar quadrilateral (f0, f1, b1, b0).
+ */
+export function projectScreenStrokeFrontBackPaired(
+  stroke: Vec2[],
+  camera: THREE.Camera,
+  mesh: THREE.Object3D,
+  domElement: HTMLElement
+): { front: THREE.Vector3[]; back: THREE.Vector3[] } {
+  if (stroke.length < 2) return { front: [], back: [] };
+
+  const raycaster = new THREE.Raycaster();
+  const ndc = new THREE.Vector2();
+  const rect = domElement.getBoundingClientRect();
+  const front: THREE.Vector3[] = [];
+  const back: THREE.Vector3[] = [];
+  const towardCamera = new THREE.Vector3();
+
+  for (const p of densifyStroke(stroke, SEGMENT_SAMPLES)) {
+    ndc.x = (p.x / rect.width) * 2 - 1;
+    ndc.y = -(p.y / rect.height) * 2 + 1;
+    raycaster.setFromCamera(ndc, camera);
+    const intersections = raycaster
+      .intersectObject(mesh, false)
+      .sort((a, b) => a.distance - b.distance);
+    if (intersections.length === 0) continue;
+
+    towardCamera.copy(raycaster.ray.direction).normalize();
+    const liftBy = (hit: THREE.Intersection, sign: number) =>
+      hit.point.clone().addScaledVector(towardCamera, sign * SURFACE_LIFT);
+
+    front.push(liftBy(intersections[0], -1));
+    back.push(liftBy(intersections[intersections.length - 1], 1));
+  }
+
+  return dedupePairedHits(front, back, 0.5);
+}
+
+/**
  * Project a screen stroke onto the nearest (front) surface, returning the raw hit points with no
  * lift — used for painting, where the brush must sit exactly on the surface. Points that miss the
  * object are skipped so the rest of the stroke still paints.
@@ -258,4 +297,28 @@ function mergeNearbyHits(points: THREE.Vector3[], epsilon: number): THREE.Vector
     }
   }
   return out;
+}
+
+/** Drop paired samples only when both front and back barely moved (keeps segment alignment). */
+function dedupePairedHits(
+  front: THREE.Vector3[],
+  back: THREE.Vector3[],
+  epsilon: number
+): { front: THREE.Vector3[]; back: THREE.Vector3[] } {
+  const outF: THREE.Vector3[] = [];
+  const outB: THREE.Vector3[] = [];
+  for (let i = 0; i < front.length; i++) {
+    if (outF.length === 0) {
+      outF.push(front[i]);
+      outB.push(back[i]);
+      continue;
+    }
+    const df = outF[outF.length - 1].distanceTo(front[i]);
+    const db = outB[outB.length - 1].distanceTo(back[i]);
+    if (df > epsilon || db > epsilon) {
+      outF.push(front[i]);
+      outB.push(back[i]);
+    }
+  }
+  return { front: outF, back: outB };
 }

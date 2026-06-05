@@ -57,13 +57,6 @@ body {
   letter-spacing: -0.02em;
 }
 
-.subtitle {
-  margin-top: 0.35rem;
-  color: var(--text-muted);
-  font-size: 0.95rem;
-  max-width: 42rem;
-}
-
 .debug-toggle {
   display: flex;
   align-items: center;
@@ -223,21 +216,12 @@ body {
 }
 
 .canvas-footer {
-  border-top: 1px solid var(--border-light);
-  background: var(--surface-muted);
   flex-shrink: 0;
+  padding: 0 1rem;
 }
 
-.hint-bar {
-  padding: 0.6rem 1rem 0.25rem;
-  display: flex;
-  flex-direction: column;
-  gap: 0.25rem;
-}
-
-.hint {
-  font-size: 0.88rem;
-  color: var(--text-muted);
+.canvas-footer:not(:has(.status:not([hidden]))) {
+  display: none;
 }
 
 .canvas-wrap {
@@ -284,39 +268,6 @@ body {
 
 .scene-view .webgl-layer.paint-cursor {
   cursor: crosshair;
-}
-
-.nav-help {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.35rem 1rem;
-  align-items: center;
-  padding: 0.25rem 1rem 0.75rem;
-  font-size: 0.78rem;
-  color: var(--text-subtle);
-}
-
-.nav-help-item {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.35rem;
-}
-
-.nav-help-item kbd {
-  font: inherit;
-  font-size: 0.72rem;
-  font-weight: 600;
-  padding: 0.1rem 0.4rem;
-  border-radius: 4px;
-  border: 1px solid var(--border);
-  background: #fff;
-  color: var(--text-muted);
-  white-space: nowrap;
-}
-
-.nav-help-sep {
-  color: var(--border);
-  user-select: none;
 }
 
 .paint-palette {
@@ -401,25 +352,25 @@ body {
 }
 
 .debug-panel {
+  position: absolute;
+  left: 0.75rem;
+  right: 0.75rem;
+  bottom: 0.75rem;
+  z-index: 20;
   display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  padding: 0.75rem 1rem;
-  margin: 0.75rem 1rem 1rem;
-  border: 1px dashed #b8c4d4;
-  border-radius: 8px;
-  background: #f0f4f8;
-  flex-shrink: 0;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.75rem;
+  padding: 0;
+  pointer-events: none;
+}
+
+.debug-panel button {
+  pointer-events: auto;
 }
 
 .debug-panel[hidden] {
   display: none;
-}
-
-.inflation-step {
-  font-size: 0.78rem;
-  font-weight: 600;
-  color: #2d5a8e;
 }
 
 .inline-control {
@@ -479,16 +430,12 @@ button.secondary:disabled:hover {
 
 .status {
   font-size: 0.82rem;
-  min-height: 1.2em;
-  color: var(--text-subtle);
-}
-
-.status.error {
+  padding: 0.5rem 0 0.75rem;
   color: #a63d3d;
 }
 
-.status.ok {
-  color: #3d6b4a;
+.status[hidden] {
+  display: none;
 }
 
 @media (max-width: 640px) {

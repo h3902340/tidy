@@ -5,7 +5,7 @@ import { validateCutCrossesBoundary, type CutBoundaryHit } from './cutPolygon';
 import { computeScreenSilhouetteFromRender } from './renderSilhouette';
 import {
   validateClosedLoopOnSurface,
-  projectScreenStrokeFrontBack,
+  projectScreenStrokeFrontBackPaired,
   projectScreenStrokeToPlane,
   projectScreenStrokeOntoSurface,
   worldHitToMeshVertex,
@@ -179,10 +179,14 @@ export class SceneView {
   private suspendedFillMaterial: THREE.Material | null = null;
   private grid: THREE.GridHelper | null = null;
   private readonly defaultBackground = new THREE.Color(0xcccccc);
+  private readonly resizeObserver: ResizeObserver;
+  /** `.canvas-wrap` — flex-sized box that defines the drawable viewport. */
+  private readonly sizeTarget: HTMLElement;
 
   constructor(container: HTMLElement) {
     this.container = container;
     container.classList.add('scene-view');
+    this.sizeTarget = container.parentElement ?? container;
 
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0xcccccc);
@@ -291,8 +295,15 @@ export class SceneView {
     this.bindPaintEvents();
     this.bindCutEvents();
     window.addEventListener('resize', () => this.onResize());
+    this.resizeObserver = new ResizeObserver(() => this.onResize());
+    this.resizeObserver.observe(this.sizeTarget);
     this.resizeOverlay();
     this.animate();
+  }
+
+  /** Re-fit renderer and camera when the canvas container changes size (e.g. debug panel toggle). */
+  resize(): void {
+    this.onResize();
   }
 
   setVisible(visible: boolean): void {
@@ -556,6 +567,11 @@ export class SceneView {
 
   getOverlayElement(): HTMLElement {
     return this.overlayCanvas;
+  }
+
+  /** WebGL canvas — use for cut/paint raycasts and mesh splits (same coords as cut strokes). */
+  getProjectionElement(): HTMLElement {
+    return this.renderer.domElement;
   }
 
   clearSurfaceLines(): void {
@@ -1079,7 +1095,7 @@ export class SceneView {
       return;
     }
 
-    const { front, back } = projectScreenStrokeFrontBack(
+    const { front, back } = projectScreenStrokeFrontBackPaired(
       stroke,
       this.camera,
       this.meshObject,
@@ -1305,8 +1321,8 @@ export class SceneView {
   }
 
   private resizeOverlay(): void {
-    const w = this.container.clientWidth;
-    const h = this.container.clientHeight;
+    const w = this.sizeTarget.clientWidth;
+    const h = this.sizeTarget.clientHeight;
     const dpr = window.devicePixelRatio || 1;
     this.overlayCanvas.width = w * dpr;
     this.overlayCanvas.height = h * dpr;
@@ -1333,8 +1349,8 @@ export class SceneView {
   }
 
   private onResize(): void {
-    const w = this.container.clientWidth;
-    const h = this.container.clientHeight;
+    const w = this.sizeTarget.clientWidth;
+    const h = this.sizeTarget.clientHeight;
     if (w === 0 || h === 0) return;
     this.camera.aspect = w / Math.max(h, 1);
     this.camera.updateProjectionMatrix();
