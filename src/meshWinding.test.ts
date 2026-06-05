@@ -4,6 +4,7 @@ import {
   enforceConsistentOutwardWinding,
   findInwardFaces,
   flipTriangle,
+  inflatedTopVertexCount,
   isFaceNormalOutward,
   teddyInteriorReference,
   type Triangle,
@@ -17,7 +18,7 @@ function assertMeshWinding(
   boundaryPolygon: { x: number; y: number }[]
 ): void {
   const boundaryCount = boundaryPolygon.length;
-  const topVertexCount = mesh.vertices.length / 2;
+  const topVertexCount = inflatedTopVertexCount(mesh.vertices.length, boundaryCount);
 
   const interior = teddyInteriorReference(boundaryPolygon, mesh.vertices);
   const { indices } = findInwardFaces(mesh.vertices, mesh.faces, interior, {
@@ -125,7 +126,7 @@ describe('Teddy inflated mesh — all normals outward', () => {
     const { mesh, error } = buildTeddyMesh(star);
     expect(error).toBeNull();
     expect(mesh).not.toBeNull();
-    const topVertexCount = mesh!.vertices.length / 2;
+    const topVertexCount = inflatedTopVertexCount(mesh!.vertices.length, star.length);
     assertBoundaryCapsOutward(
       mesh!.vertices,
       mesh!.faces,

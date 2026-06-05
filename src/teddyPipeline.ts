@@ -147,7 +147,7 @@ function buildElevatedFanSolid(
     { ...hubMeta, triangles: zeyapTris, axisSegments }
   );
   enforceWindingTowardView(elevatedVerts, topFaces, vec3(0, 0, 1));
-  const { vertices, faces } = drawBackface(topFaces, elevatedVerts);
+  const { vertices, faces } = drawBackface(topFaces, elevatedVerts, polygon.length);
   enforceSolidMeshWinding(vertices, faces, polygon, elevatedVerts.length);
   return { vertices, faces };
 }
@@ -173,7 +173,7 @@ function buildInflatedTopMesh(
 
 function sealInflatedSolid(polygon: Vec2[], top: Mesh3D): Mesh3D {
   const topVertexCount = top.vertices.length;
-  const { vertices, faces } = drawBackface(top.faces, top.vertices);
+  const { vertices, faces } = drawBackface(top.faces, top.vertices, polygon.length);
 
   const interior = teddyInteriorReference(polygon, vertices);
   const windingOpts = {

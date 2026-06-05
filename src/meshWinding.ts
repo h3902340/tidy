@@ -420,12 +420,25 @@ function touchesBoundaryVertex(
 ): boolean {
   for (const v of face) {
     if (v < boundaryVertexCount) return true;
-    const back = v - topVertexCount;
-    if (v >= topVertexCount && back >= 0 && back < boundaryVertexCount) {
+    // Legacy layout: mirrored silhouette ring lived at topVertexCount + i.
+    const legacyBack = v - topVertexCount;
+    if (
+      legacyBack >= 0 &&
+      legacyBack < boundaryVertexCount &&
+      v >= topVertexCount + boundaryVertexCount
+    ) {
       return true;
     }
   }
   return false;
+}
+
+/** Top vertex count after drawBackface with a shared silhouette ring. */
+export function inflatedTopVertexCount(
+  totalVertexCount: number,
+  boundaryVertexCount: number
+): number {
+  return (totalVertexCount + boundaryVertexCount) / 2;
 }
 
 /**

@@ -2689,34 +2689,47 @@ export function buildInflatedTopFaces(
   );
 }
 
-/** Closed solid via mirrored back face (zeyap drawBackface). */
+/**
+ * Closed solid via mirrored back face (zeyap drawBackface).
+ * Silhouette ring vertices (0 .. boundaryVertexCount-1) are shared by top and bottom caps;
+ * only interior vertices are duplicated and mirrored across z = 0.
+ */
 export function drawBackface(
   triangles: [number, number, number][],
-  verts: Vec3[]
+  verts: Vec3[],
+  boundaryVertexCount = 0
 ): InflatedMesh {
   const n = verts.length;
+  const bc = Math.max(0, Math.min(boundaryVertexCount, n));
   const vertices: Vec3[] = [...verts];
   const faces: [number, number, number][] = [...triangles];
 
-  for (let i = 0; i < n; i++) {
+  for (let i = bc; i < n; i++) {
     vertices.push(vec3(verts[i].x, verts[i].y, -verts[i].z));
   }
 
+  const mirrorIndex = (id: number): number => {
+    if (id < bc) return id;
+    return n + (id - bc);
+  };
+
   for (const [a, b, c] of triangles) {
-    faces.push([c + n, b + n, a + n]);
+    faces.push([mirrorIndex(c), mirrorIndex(b), mirrorIndex(a)]);
   }
 
   return { vertices, faces };
 }
 
-/** Connect top and bottom along the original polygon ring (after drawBackface). */
+/** Connect top and bottom along the original polygon ring (legacy duplicate-vertex layout). */
 export function stitchSilhouetteRim(
   vertices: Vec3[],
   faces: Triangle[],
   boundaryPolygon: Vec2[],
-  topVertexCount: number
+  topVertexCount: number,
+  options?: { sharedBoundaryVertices?: boolean }
 ): void {
   const n = boundaryPolygon.length;
+  const shared = options?.sharedBoundaryVertices ?? false;
 
   for (let i = 0; i < n; i++) {
     const a = i;
@@ -2725,6 +2738,8 @@ export function stitchSilhouetteRim(
     const pb = vertices[b];
     const outX = pb.y - pa.y;
     const outY = pa.x - pb.x;
+
+    if (shared) continue;
 
     const aBack = a + topVertexCount;
     const bBack = b + topVertexCount;

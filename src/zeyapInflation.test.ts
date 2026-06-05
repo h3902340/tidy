@@ -9,6 +9,7 @@ import {
   buildSpineElevationDebugSteps,
   buildTerminalPruneDebugSteps,
   cdtToZeyapTriangles,
+  drawBackface,
   propagateSpineElevationAlongAxis,
   pruneToWedges,
   wedgesToFanFacesFiltered,
@@ -412,7 +413,7 @@ describe('terminal fan pruning', () => {
     expect(subdivElevated).toBeGreaterThan(subdivFlat);
 
     const inf = meshes!.inflated;
-    const topCount = inf.vertices.length / 2;
+    const topCount = meshes!.inflatedTop.vertices.length;
     let infElevated = 0;
     for (const [a, b, c] of inf.faces) {
       if (a >= topCount || b >= topCount || c >= topCount) continue;
@@ -622,6 +623,32 @@ describe('terminal fan pruning', () => {
     expect(inflatedTop.faces.length).toBeGreaterThan(fan.faces.length);
     expect(inflated.faces.length).toBeGreaterThan(inflatedTop.faces.length);
     expect(inflated.faces.length).toBe(inflatedTop.faces.length * 2);
+  });
+
+  it('drawBackface shares silhouette ring vertices between top and bottom', () => {
+    const verts = [
+      vec3(0, 0, 0),
+      vec3(1, 0, 0),
+      vec3(0, 1, 0),
+      vec3(0.2, 0.2, 0.5),
+    ];
+    const tris: [number, number, number][] = [[0, 1, 3], [1, 2, 3], [2, 0, 3]];
+    const { vertices, faces } = drawBackface(tris, verts, 3);
+
+    expect(vertices).toHaveLength(5);
+    expect(vertices[0]).toEqual(verts[0]);
+    expect(vertices[1]).toEqual(verts[1]);
+    expect(vertices[2]).toEqual(verts[2]);
+    expect(vertices[4]).toEqual(vec3(0.2, 0.2, -0.5));
+
+    const bottom = faces.slice(tris.length);
+    const usesSharedBoundary = (face: [number, number, number]) =>
+      face.some((v) => v < 3);
+    const usesMirroredInterior = (face: [number, number, number]) =>
+      face.some((v) => v >= 4);
+    expect(bottom.some(usesSharedBoundary)).toBe(true);
+    expect(bottom.some(usesMirroredInterior)).toBe(true);
+    expect(bottom.every((face) => !face.includes(3))).toBe(true);
   });
 
   it('buildTeddyPipeline resampled square: terminal fans cover all T triangles', () => {
