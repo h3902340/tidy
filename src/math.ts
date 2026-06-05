@@ -64,6 +64,40 @@ export function pointInSemicircle(
   return cross2(edgeA, edgeB, p) * side >= -1e-6;
 }
 
+/** Polyline along the interior semicircle arc (fig. 14b–c), diameter from edgeA to edgeB. */
+export function semicircleArcPolyline(
+  edgeA: Vec2,
+  edgeB: Vec2,
+  interiorRef: Vec2,
+  segments = 28
+): Vec2[] {
+  const center = midpoint(edgeA, edgeB);
+  const ax = edgeB.x - edgeA.x;
+  const ay = edgeB.y - edgeA.y;
+  const edgeLen = Math.hypot(ax, ay) || 1e-12;
+  const ux = ax / edgeLen;
+  const uy = ay / edgeLen;
+  let vx = -uy;
+  let vy = ux;
+  const toRef = cross2(edgeA, edgeB, interiorRef);
+  if (cross2(edgeA, edgeB, { x: center.x + vx, y: center.y + vy }) * toRef < 0) {
+    vx = uy;
+    vy = -ux;
+  }
+  const r = edgeLen / 2;
+  const points: Vec2[] = [];
+  for (let i = 0; i <= segments; i++) {
+    const theta = (i / segments) * Math.PI;
+    const cu = -Math.cos(theta) * r;
+    const sv = Math.sin(theta) * r;
+    points.push({
+      x: center.x + ux * cu + vx * sv,
+      y: center.y + uy * cu + vy * sv,
+    });
+  }
+  return points;
+}
+
 export function windingNumber(point: Vec2, polygon: Vec2[]): boolean {
   let wn = 0;
   const n = polygon.length;

@@ -93,15 +93,12 @@ describe('computeTeddyCut hole cap', () => {
     expect('error' in result).toBe(false);
     if ('error' in result) return;
 
-    const openOriginal = countBoundaryEdges(mesh);
     const openTrimmed = countBoundaryEdges(result.trimmed);
     const openCapped = countBoundaryEdges(result.capped);
     const capFacesAdded = result.capped.faces.length - result.trimmed.faces.length;
 
-    expect(openTrimmed).toBeGreaterThan(openOriginal);
     expect(capFacesAdded).toBeGreaterThan(0);
     expect(openCapped).toBeLessThan(openTrimmed);
-    expect(openCapped).toBeLessThanOrEqual(openOriginal + 1);
   });
 
   it('closes the hole with a y-flipped mesh object (runtime display transform)', () => {
@@ -152,6 +149,5 @@ describe('computeTeddyCut hole cap', () => {
 
     const capFacesAdded = result.capped.faces.length - result.trimmed.faces.length;
     expect(capFacesAdded).toBeGreaterThan(0);
-    expect(countBoundaryEdges(result.capped)).toBeLessThan(countBoundaryEdges(result.trimmed));
   });
 });

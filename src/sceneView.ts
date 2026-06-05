@@ -19,7 +19,13 @@ import {
 import { CLOSE_TOLERANCE, closeStroke } from './stroke';
 import { createSketchMaterials, PAPER_COLOR, type SketchMaterials } from './sketchShader';
 import { SurfacePainter } from './surfacePaint';
-import type { Vec2, Vec3 } from './math';
+import {
+  pointInSemicircle,
+  semicircleArcPolyline,
+  type Vec2,
+  type Vec3,
+} from './math';
+import type { TerminalPruneDebugStep } from './zeyapInflation';
 
 export type DisplayMode = 'solid' | 'wireframe' | 'both';
 export type InteractionMode =
@@ -100,6 +106,15 @@ const SPINE_TUBE_RADIUS = 0.4;
 /** Colour and radius for the internal-edge midpoint dots drawn on the spine step. */
 const SPINE_DOT_COLOR = 0x000000;
 const SPINE_DOT_RADIUS = 1.0;
+/** Fig. 14 semicircle sweep during terminal-prune debug stepping. */
+const PRUNE_SEMICIRCLE_COLOR = 0xd62828;
+const PRUNE_SEMICIRCLE_LIFT_Z = 0.6;
+/** Fig. 14c: boundary verts outside the semicircle (paper half-plane test). */
+const PRUNE_OUTSIDE_VERTEX_COLOR = 0xff2d6a;
+const PRUNE_OUTSIDE_VERTEX_RADIUS = 1.4;
+/** Vertices still inside the semicircle arc. */
+const PRUNE_TRACKED_VERTEX_COLOR = 0x8b95a5;
+const PRUNE_TRACKED_VERTEX_RADIUS = 1.0;
 /** Recompute cut silhouette after the camera has been idle this long (incl. damping). */
 const SILHOUETTE_IDLE_MS = 200;
 const DEFAULT_CAMERA_POSITION = new THREE.Vector3(0, -180, 220);
@@ -142,6 +157,10 @@ export class SceneView {
   private spineTubeMaterial: THREE.MeshBasicMaterial | null = null;
   private spineDotMaterial: THREE.MeshBasicMaterial | null = null;
   private spineLabelGroup: THREE.Group;
+  private semicircleOverlayGroup: THREE.Group;
+  private semicircleLineMaterial: THREE.LineBasicMaterial | null = null;
+  private semicircleOutsideDotMaterial: THREE.MeshBasicMaterial | null = null;
+  private semicircleTrackedDotMaterial: THREE.MeshBasicMaterial | null = null;
   private overlayCanvas: HTMLCanvasElement;
   private overlayCtx: CanvasRenderingContext2D;
   private painting = false;
@@ -200,6 +219,9 @@ export class SceneView {
     // Height labels are billboard sprites; they must NOT inherit the y-flip (it would mirror text).
     this.spineLabelGroup = new THREE.Group();
     this.scene.add(this.spineLabelGroup);
+    this.semicircleOverlayGroup = new THREE.Group();
+    this.semicircleOverlayGroup.scale.set(1, -1, 1);
+    this.scene.add(this.semicircleOverlayGroup);
     // Base ring lives in world space so it stays put while the camera orbits around it.
     this.extrudeRingGroup = new THREE.Group();
     this.scene.add(this.extrudeRingGroup);
@@ -1375,6 +1397,130 @@ export class SceneView {
     }
   };
 
+  clearTerminalPruneOverlay(): void {
+    while (this.semicircleOverlayGroup.children.length > 0) {
+      const child = this.semicircleOverlayGroup.children[0];
+      this.semicircleOverlayGroup.remove(child);
+      if (child instanceof THREE.Line || child instanceof THREE.Mesh) {
+        child.geometry.dispose();
+      }
+    }
+    this.semicircleLineMaterial?.dispose();
+    this.semicircleLineMaterial = null;
+    this.semicircleOutsideDotMaterial?.dispose();
+    this.semicircleOutsideDotMaterial = null;
+    this.semicircleTrackedDotMaterial?.dispose();
+    this.semicircleTrackedDotMaterial = null;
+  }
+
+  /** Red semicircle for fig. 14 terminal-prune debug (diameter + interior arc). */
+  setTerminalPruneOverlay(
+    step: TerminalPruneDebugStep | null,
+    meshVertices: Vec3[] = []
+  ): void {
+    this.clearTerminalPruneOverlay();
+    if (!step || step.kind === 'fan' || step.semicircle.radius < 1e-6) return;
+
+    const { edgeA, edgeB, interiorRef } = step.semicircle;
+    const arc = semicircleArcPolyline(edgeA, edgeB, interiorRef);
+    const lift = PRUNE_SEMICIRCLE_LIFT_Z;
+
+    this.semicircleLineMaterial?.dispose();
+    this.semicircleLineMaterial = new THREE.LineBasicMaterial({
+      color: PRUNE_SEMICIRCLE_COLOR,
+      depthTest: true,
+      depthWrite: false,
+    });
+    const material = this.semicircleLineMaterial;
+
+    const addPolyline = (pts: Vec2[]) => {
+      if (pts.length < 2) return;
+      const positions = new Float32Array(pts.length * 3);
+      for (let i = 0; i < pts.length; i++) {
+        positions[i * 3] = pts[i].x;
+        positions[i * 3 + 1] = pts[i].y;
+        positions[i * 3 + 2] = lift;
+      }
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      const line = new THREE.Line(geometry, material);
+      line.renderOrder = 5;
+      this.semicircleOverlayGroup.add(line);
+    };
+
+    addPolyline([edgeA, edgeB]);
+    addPolyline(arc);
+
+    if (
+      (step.kind === 'advance' || step.kind === 'stop') &&
+      step.trackedVertexIds.length > 0
+    ) {
+      const insideIds: number[] = [];
+      const semicircleOutsideIds: number[] = [];
+      for (const vid of step.trackedVertexIds) {
+        const v = meshVertices[vid];
+        if (!v) continue;
+        const p = { x: v.x, y: v.y };
+        if (pointInSemicircle(p, edgeA, edgeB, interiorRef)) {
+          insideIds.push(vid);
+        } else {
+          semicircleOutsideIds.push(vid);
+        }
+      }
+
+      const addVertexDots = (
+        vertexIds: number[],
+        color: number,
+        radius: number,
+        materialRef: 'outside' | 'tracked'
+      ) => {
+        if (vertexIds.length === 0) return;
+        if (materialRef === 'outside') {
+          this.semicircleOutsideDotMaterial?.dispose();
+          this.semicircleOutsideDotMaterial = new THREE.MeshBasicMaterial({
+            color,
+            depthTest: false,
+            depthWrite: false,
+          });
+        } else {
+          this.semicircleTrackedDotMaterial?.dispose();
+          this.semicircleTrackedDotMaterial = new THREE.MeshBasicMaterial({
+            color,
+            depthTest: false,
+            depthWrite: false,
+          });
+        }
+        const material =
+          materialRef === 'outside'
+            ? this.semicircleOutsideDotMaterial!
+            : this.semicircleTrackedDotMaterial!;
+        const dotGeometry = new THREE.SphereGeometry(radius, 10, 8);
+        for (const vid of vertexIds) {
+          const v = meshVertices[vid];
+          if (!v) continue;
+          const dot = new THREE.Mesh(dotGeometry.clone(), material);
+          dot.position.set(v.x, v.y, lift + 0.2);
+          dot.renderOrder = materialRef === 'outside' ? 7 : 6;
+          this.semicircleOverlayGroup.add(dot);
+        }
+        dotGeometry.dispose();
+      };
+
+      addVertexDots(
+        insideIds,
+        PRUNE_TRACKED_VERTEX_COLOR,
+        PRUNE_TRACKED_VERTEX_RADIUS,
+        'tracked'
+      );
+      addVertexDots(
+        semicircleOutsideIds,
+        PRUNE_OUTSIDE_VERTEX_COLOR,
+        PRUNE_OUTSIDE_VERTEX_RADIUS,
+        'outside'
+      );
+    }
+  }
+
   clearSpineOverlay(): void {
     while (this.spineLinesGroup.children.length > 0) {
       const child = this.spineLinesGroup.children[0];
@@ -1553,13 +1699,13 @@ export class SceneView {
       depthWrite: opacity >= 1,
       shininess: 30,
       polygonOffset: true,
-      polygonOffsetFactor: -1,
-      polygonOffsetUnits: -1,
+      polygonOffsetFactor: -4,
+      polygonOffsetUnits: -4,
     });
 
     this.secondaryMeshObject = new THREE.Mesh(built.geometry, material);
     this.secondaryMeshObject.scale.set(1, -1, 1);
-    this.secondaryMeshObject.renderOrder = 1;
+    this.secondaryMeshObject.renderOrder = 10;
     this.scene.add(this.secondaryMeshObject);
 
     const wireGeom = new THREE.WireframeGeometry(built.geometry);
@@ -1572,7 +1718,7 @@ export class SceneView {
       })
     );
     this.secondaryWireframe.scale.set(1, -1, 1);
-    this.secondaryWireframe.renderOrder = 2;
+    this.secondaryWireframe.renderOrder = 11;
     this.scene.add(this.secondaryWireframe);
 
     this.applyDisplayMode();
@@ -1690,6 +1836,7 @@ export class SceneView {
 
     this.meshObject = new THREE.Mesh(geometry, material);
     this.meshObject.scale.set(1, -1, 1);
+    this.meshObject.renderOrder = 0;
     this.scene.add(this.meshObject);
 
     const wireGeom = new THREE.WireframeGeometry(geometry);
@@ -1698,6 +1845,7 @@ export class SceneView {
       new THREE.LineBasicMaterial({ color: options.wireColor ?? DEFAULT_WIRE_COLOR })
     );
     this.wireframe.scale.set(1, -1, 1);
+    this.wireframe.renderOrder = 1;
     this.scene.add(this.wireframe);
 
     this.refreshSketchAppearance();
@@ -1816,6 +1964,7 @@ export class SceneView {
     this.setMesh(null);
     this.clearSecondaryMesh();
     this.clearSpineOverlay();
+    this.clearTerminalPruneOverlay();
     this.clearSurfaceLines();
     this.discardPendingCut();
     this.clearOverlay();

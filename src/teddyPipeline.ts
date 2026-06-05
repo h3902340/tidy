@@ -12,6 +12,7 @@ import {
 } from './meshWinding';
 import {
   applySpineElevation,
+  buildTerminalPruneDebugSteps,
   cdtToZeyapTriangles,
   drawBackface,
   propagateSpineElevationAlongAxis,
@@ -21,7 +22,10 @@ import {
   wedgesToElevatedFanFaces,
   wedgesToFanFaces,
   wedgesToFanFacesFiltered,
+  type TerminalPruneDebugStep,
 } from './zeyapInflation';
+
+export type { TerminalPruneDebugStep } from './zeyapInflation';
 
 export type TriangleType = 'T' | 'S' | 'J';
 
@@ -39,6 +43,8 @@ export interface TeddyPipelineMeshes {
   classifiedFaceTypes: TriangleType[];
   /** Paper (d): terminal-prune fan triangles only (overlay on classified). */
   terminalFans: Mesh3D;
+  /** Fig. 14: semicircle advance frames for debug stepping (classified → fan). */
+  terminalPruneSteps: TerminalPruneDebugStep[];
   /** Paper (f): full 2D mesh between spine and boundary (z = 0). */
   fan: Mesh3D;
   /** Paper (e): branched chordal-axis overlay (same vertices as fan). */
@@ -157,6 +163,9 @@ export function buildTeddyPipeline(ring: Vec2[]): {
 
   const pruneVerts = polygon.map((p) => vec3(p.x, p.y, 0));
   const zeyapTris = cdtToZeyapTriangles(triangles);
+  const terminalPruneSteps = buildTerminalPruneDebugSteps(zeyapTris, [
+    ...pruneVerts,
+  ]);
   const { wedges, interiorVerts, axisSegments } = pruneToWedges(zeyapTris, pruneVerts);
 
   const fanFaces = wedgesToFanFaces(wedges);
@@ -191,6 +200,7 @@ export function buildTeddyPipeline(ring: Vec2[]): {
       classified,
       classifiedFaceTypes,
       terminalFans,
+      terminalPruneSteps,
       fan,
       spineSegments: axisSegments,
       elevatedSpineVertices,

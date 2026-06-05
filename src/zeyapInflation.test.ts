@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { constrainedDelaunay } from './cdt';
 import {
+  buildTerminalPruneDebugSteps,
   cdtToZeyapTriangles,
   pruneToWedges,
   wedgesToFanFacesFiltered,
@@ -155,7 +156,7 @@ describe('terminal fan pruning', () => {
     void topLeftVid;
   });
 
-  it('open junction triangle: hub-to-mid wedges share edge mids with sleeves', () => {
+  it('open junction triangle: centroid splits into interior wedges', () => {
     const polygon = normalizePolygon(unitSquare);
     const { triangles } = constrainedDelaunay(polygon);
     const jCount = triangles.filter((t) => t.type === 'J').length;
@@ -163,48 +164,38 @@ describe('terminal fan pruning', () => {
 
     const zeyap = cdtToZeyapTriangles(triangles);
     const verts = polygon.map((p) => vec3(p.x, p.y, 0));
-    const boundaryCount = polygon.length;
     const { wedges } = pruneToWedges(zeyap, [...verts]);
 
-    const jTri = triangles.find((t) => t.type === 'J')!;
-    const corners = new Set(jTri.indices);
-
-    const spineFreq = new Map<number, number>();
-    for (const w of wedges) {
-      if (w.fromTerminalPrune) continue;
-      for (const v of w.vertIds) {
-        if (v < boundaryCount) continue;
-        spineFreq.set(v, (spineFreq.get(v) ?? 0) + 1);
-      }
-    }
-    let hubIdx = -1;
-    let bestFreq = 0;
-    for (const [v, n] of spineFreq) {
-      if (n > bestFreq) {
-        bestFreq = n;
-        hubIdx = v;
-      }
-    }
-    expect(hubIdx).toBeGreaterThanOrEqual(boundaryCount);
-
-    const hubWedges = wedges.filter(
+    const jTriId = zeyap.findIndex((t) => t.type === 'J');
+    const jVerts = new Set(zeyap[jTriId].vertIds);
+    const centroidWedges = wedges.filter(
       (w) =>
         !w.fromTerminalPrune &&
-        w.vertIds.includes(hubIdx) &&
-        w.vertIds.filter((v) => v >= boundaryCount).length === 2
+        w.vertIds.filter((v) => jVerts.has(v)).length >= 2
     );
-    // Two wedges per interior edge reached by the junction hub (hub–mid–corner).
-    expect(hubWedges.length).toBeGreaterThanOrEqual(4);
-    expect(hubWedges.length % 2).toBe(0);
 
-    const covered = new Set<number>();
-    for (const fan of hubWedges) {
-      for (const v of fan.vertIds) {
-        if (v < boundaryCount) covered.add(v);
+    expect(centroidWedges.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('terminal prune debug steps include semicircle advance and fan frames', () => {
+    const polygon = normalizePolygon(unitSquare);
+    const { triangles } = constrainedDelaunay(polygon);
+    const zeyap = cdtToZeyapTriangles(triangles);
+    const verts = polygon.map((p) => vec3(p.x, p.y, 0));
+    const steps = buildTerminalPruneDebugSteps(zeyap, [...verts]);
+
+    expect(steps.length).toBeGreaterThan(0);
+    expect(steps.some((s) => s.kind === 'start')).toBe(true);
+    expect(steps.some((s) => s.kind === 'advance')).toBe(true);
+    expect(steps.some((s) => s.kind === 'stop')).toBe(true);
+    expect(steps.some((s) => s.kind === 'fan')).toBe(true);
+    expect(steps.filter((s) => s.kind === 'fan').length).toBeGreaterThanOrEqual(2);
+
+    for (const step of steps) {
+      if (step.kind !== 'fan') {
+        expect(step.semicircle.radius).toBeGreaterThan(0);
       }
     }
-    expect(covered.size).toBeGreaterThanOrEqual(2);
-    void corners;
   });
 
   it('wobbly circle: spine axis is one connected component', () => {

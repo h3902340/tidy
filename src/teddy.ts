@@ -10,6 +10,7 @@ export type {
   Mesh3D,
   TeddyPipelineMeshes,
   TeddyPipelineResult,
+  TerminalPruneDebugStep,
   TriangleType,
 } from './teddyPipeline';
 export { FAN_TERMINAL_COLOR } from './teddyPipeline';

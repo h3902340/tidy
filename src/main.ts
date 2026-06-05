@@ -7,6 +7,7 @@ import {
   FAN_TERMINAL_COLOR,
   type Mesh3D,
   type TeddyPipelineMeshes,
+  type TerminalPruneDebugStep,
   type TriangleType,
 } from './teddy';
 import type { Vec2 } from './math';
@@ -23,6 +24,7 @@ const btnSquare = document.querySelector<HTMLButtonElement>('#btn-square')!;
 const btnTriangle = document.querySelector<HTMLButtonElement>('#btn-triangle')!;
 const btnStar = document.querySelector<HTMLButtonElement>('#btn-star')!;
 const btnNext = document.querySelector<HTMLButtonElement>('#btn-next-step')!;
+const btnSkipPrune = document.querySelector<HTMLButtonElement>('#btn-skip-prune')!;
 const displayModeEl = document.querySelector<HTMLSelectElement>('#display-mode')!;
 const sketchModeEl = document.querySelector<HTMLInputElement>('#sketch-mode')!;
 const paintPaletteEl = document.querySelector<HTMLDivElement>('#paint-palette')!;
@@ -44,10 +46,14 @@ const toolTabEls = Array.from(
 type InflationStep =
   | 'idle'
   | 'classified'
+  | 'prune'
   | 'fan'
   | 'spine'
   | 'elevated'
   | 'done';
+
+const PRUNE_CONSUMED_FACE_COLOR = 0x4a4a48;
+const PRUNE_ACTIVE_FACE_COLOR = 0xffd700;
 
 const TRIANGLE_TYPE_COLORS: Record<TriangleType, number> = {
   T: 0xf5c842,
@@ -58,6 +64,7 @@ const TRIANGLE_TYPE_COLORS: Record<TriangleType, number> = {
 let polygonReady = false;
 let inflationStep: InflationStep = 'idle';
 let pipelineMeshes: TeddyPipelineMeshes | null = null;
+let pruneStepIndex = 0;
 
 const INFLATED_COLOR = 0xffffff;
 
@@ -217,13 +224,115 @@ function classifiedFaceColors(types: TriangleType[]): number[] {
   return types.map((t) => TRIANGLE_TYPE_COLORS[t]);
 }
 
+function classifiedFaceColorsForPrune(
+  types: TriangleType[],
+  activeTriangleId: number,
+  consumedTriangleIds: number[]
+): number[] {
+  const consumed = new Set(consumedTriangleIds);
+  return types.map((t, i) => {
+    if (consumed.has(i)) return PRUNE_CONSUMED_FACE_COLOR;
+    if (i === activeTriangleId) return PRUNE_ACTIVE_FACE_COLOR;
+    return TRIANGLE_TYPE_COLORS[t];
+  });
+}
+
+/** Classified CDT faces consumed by terminal pruning (replaced by green fans). */
+function allConsumedClassifiedTriangleIds(
+  steps: TerminalPruneDebugStep[]
+): Set<number> {
+  const consumed = new Set<number>();
+  for (const step of steps) {
+    if (step.kind !== 'fan') continue;
+    for (const id of step.consumedTriangleIds) consumed.add(id);
+  }
+  return consumed;
+}
+
+function classifiedMeshAfterTerminalPrune(
+  classified: Mesh3D,
+  faceTypes: TriangleType[],
+  consumedIds: Set<number>
+): { mesh: Mesh3D; faceColors: number[] } {
+  const faces: [number, number, number][] = [];
+  const faceColors: number[] = [];
+  for (let i = 0; i < classified.faces.length; i++) {
+    if (consumedIds.has(i)) continue;
+    faces.push(classified.faces[i]);
+    faceColors.push(TRIANGLE_TYPE_COLORS[faceTypes[i]]);
+  }
+  return {
+    mesh: { vertices: classified.vertices, faces },
+    faceColors,
+  };
+}
+
+/** Classified mesh for a prune debug frame — hide consumed T when green fans overlay. */
+function classifiedMeshForPruneStep(
+  classified: Mesh3D,
+  faceTypes: TriangleType[],
+  step: TerminalPruneDebugStep
+): { mesh: Mesh3D; faceColors: number[] } {
+  const hideConsumed =
+    step.kind === 'fan' || step.fanMesh.faces.length > 0;
+  if (!hideConsumed) {
+    return {
+      mesh: classified,
+      faceColors: classifiedFaceColorsForPrune(
+        faceTypes,
+        step.activeTriangleId,
+        step.consumedTriangleIds
+      ),
+    };
+  }
+
+  const consumed = new Set(step.consumedTriangleIds);
+  const faces: [number, number, number][] = [];
+  const faceColors: number[] = [];
+  for (let i = 0; i < classified.faces.length; i++) {
+    if (consumed.has(i)) continue;
+    faces.push(classified.faces[i]);
+    faceColors.push(
+      i === step.activeTriangleId
+        ? PRUNE_ACTIVE_FACE_COLOR
+        : TRIANGLE_TYPE_COLORS[faceTypes[i]]
+    );
+  }
+  return {
+    mesh: { vertices: classified.vertices, faces },
+    faceColors,
+  };
+}
+
+function pruneStepButtonLabel(step: TerminalPruneDebugStep | undefined): string {
+  if (!step) return 'Next: fan triangles';
+  const n = step.terminalIndex + 1;
+  switch (step.kind) {
+    case 'start':
+      return `Next: advance semicircle (terminal ${n})`;
+    case 'advance':
+      return `Next: advance semicircle (terminal ${n})`;
+    case 'stop': {
+      if (step.stopReason === 'junction') {
+        return `Next: fan triangles (terminal ${n}, junction)`;
+      }
+      if (step.stopReason === 'outside' && step.outsideVertexIds.length > 0) {
+        return `Next: fan triangles (terminal ${n}, vertex outside radius)`;
+      }
+      return `Next: fan triangles (terminal ${n})`;
+    }
+    case 'fan':
+      return 'Next: advance semicircle';
+    default:
+      return 'Next step';
+  }
+}
+
 function enablePostInflationControls(enabled: boolean): void {
   editToolsEl.hidden = !enabled;
-  displayModeEl.disabled = !enabled;
   sketchModeEl.disabled = !enabled;
   btnUndo.disabled = !enabled || !editHistory.canUndo();
   btnRedo.disabled = !enabled || !editHistory.canRedo();
-  btnTopView.disabled = !enabled;
   if (!enabled) {
     updateExtrudeConfirmButton();
     updateDebugActions();
@@ -250,33 +359,56 @@ function updateDebugActions(): void {
 
   if (!isDebugMode()) {
     btnNext.hidden = true;
+    btnSkipPrune.hidden = true;
     btnDiscardCut.disabled = true;
     return;
   }
 
   if (inflationPipelineActive()) {
     btnDiscardCut.disabled = true;
-    const labels: Record<InflationStep, string> = {
-      idle: 'Next step',
-      classified: 'Next: fan triangles',
-      fan: 'Next: show spine',
-      spine: 'Next: elevate spine',
-      elevated: 'Next: full inflation',
-      done: 'Done',
-    };
     btnNext.hidden = false;
     btnNext.disabled = false;
-    btnNext.textContent = labels[inflationStep];
+    const canSkipPrune =
+      inflationStep === 'classified' || inflationStep === 'prune';
+    btnSkipPrune.hidden = !canSkipPrune;
+    btnSkipPrune.disabled = !canSkipPrune;
+    if (inflationStep === 'classified') {
+      const hasPrune =
+        (pipelineMeshes?.terminalPruneSteps.length ?? 0) > 0;
+      btnNext.textContent = hasPrune
+        ? 'Next: terminal prune (fig. 14)'
+        : 'Next: fan triangles';
+    } else if (inflationStep === 'prune' && pipelineMeshes) {
+      const steps = pipelineMeshes.terminalPruneSteps;
+      const nextStep = steps[pruneStepIndex + 1];
+      btnNext.textContent =
+        pruneStepIndex + 1 >= steps.length
+          ? 'Next: all fan triangles'
+          : pruneStepButtonLabel(nextStep);
+    } else {
+      const labels: Record<InflationStep, string> = {
+        idle: 'Next step',
+        classified: 'Next: terminal prune',
+        prune: 'Next step',
+        fan: 'Next: show spine',
+        spine: 'Next: elevate spine',
+        elevated: 'Next: full inflation',
+        done: 'Done',
+      };
+      btnNext.textContent = labels[inflationStep];
+    }
     return;
   }
 
   if (!inCutMode) {
     btnDiscardCut.disabled = true;
     btnNext.hidden = true;
+    btnSkipPrune.hidden = true;
     return;
   }
 
   if (isLoopCutActive()) {
+    btnSkipPrune.hidden = true;
     const phase = sceneView.getLoopCutPhase();
     btnDiscardCut.disabled = false;
     if (phase === 'projected') {
@@ -293,6 +425,7 @@ function updateDebugActions(): void {
     return;
   }
 
+  btnSkipPrune.hidden = true;
   const pending = sceneView.hasPendingCut();
   btnDiscardCut.disabled = false;
   if (pending) {
@@ -322,6 +455,7 @@ function advanceCutDebugStep(): void {
 function resetInflationFlow(): void {
   inflationStep = 'idle';
   pipelineMeshes = null;
+  pruneStepIndex = 0;
   polygonReady = false;
   enablePostInflationControls(false);
   editHistory.seedEmpty();
@@ -332,7 +466,9 @@ function resetInflationFlow(): void {
 function showClassifiedStep(): void {
   if (!pipelineMeshes) return;
   inflationStep = 'classified';
+  pruneStepIndex = 0;
   sceneView.clearSpineOverlay();
+  sceneView.clearTerminalPruneOverlay();
   sceneView.clearSecondaryMesh();
   sceneView.setMesh(pipelineMeshes.classified, {
     faceColors: classifiedFaceColors(pipelineMeshes.classifiedFaceTypes),
@@ -343,12 +479,63 @@ function showClassifiedStep(): void {
   updateDebugActions();
 }
 
+function showPruneStep(index: number): void {
+  if (!pipelineMeshes) return;
+  const steps = pipelineMeshes.terminalPruneSteps;
+  if (index >= steps.length) {
+    showFanStep();
+    return;
+  }
+
+  inflationStep = 'prune';
+  pruneStepIndex = index;
+  const step = steps[index];
+
+  sceneView.clearSpineOverlay();
+  const { mesh, faceColors } = classifiedMeshForPruneStep(
+    pipelineMeshes.classified,
+    pipelineMeshes.classifiedFaceTypes,
+    step
+  );
+  sceneView.setMesh(mesh, {
+    faceColors,
+    wireColor: 0x4a4a48,
+  });
+
+  if (step.fanMesh.faces.length > 0) {
+    sceneView.setSecondaryMesh(step.fanMesh, {
+      color: FAN_TERMINAL_COLOR,
+      wireColor: 0x2d5c2d,
+      opacity: step.kind === 'fan' ? 0.92 : 0.55,
+    });
+  } else {
+    sceneView.clearSecondaryMesh();
+  }
+
+  sceneView.setTerminalPruneOverlay(
+    step.kind === 'fan' ? null : step,
+    pipelineMeshes.classified.vertices
+  );
+  setStatus('');
+  updateDebugActions();
+}
+
 function showFanStep(): void {
   if (!pipelineMeshes) return;
   inflationStep = 'fan';
+  pruneStepIndex = pipelineMeshes.terminalPruneSteps.length;
+  sceneView.clearTerminalPruneOverlay();
   sceneView.clearSpineOverlay();
-  sceneView.setMesh(pipelineMeshes.classified, {
-    faceColors: classifiedFaceColors(pipelineMeshes.classifiedFaceTypes),
+  const consumed = allConsumedClassifiedTriangleIds(
+    pipelineMeshes.terminalPruneSteps
+  );
+  const { mesh, faceColors } = classifiedMeshAfterTerminalPrune(
+    pipelineMeshes.classified,
+    pipelineMeshes.classifiedFaceTypes,
+    consumed
+  );
+  sceneView.setMesh(mesh, {
+    faceColors,
     wireColor: 0x4a4a48,
   });
   sceneView.setSecondaryMesh(pipelineMeshes.terminalFans, {
@@ -454,6 +641,12 @@ sceneView.setOnSilhouetteComplete((closed) => {
   startPipeline(closed);
 });
 
+btnSkipPrune.addEventListener('click', () => {
+  if (!pipelineMeshes || !isDebugMode()) return;
+  if (inflationStep !== 'classified' && inflationStep !== 'prune') return;
+  showFanStep();
+});
+
 btnNext.addEventListener('click', () => {
   if (isDebugMode() && !inflationPipelineActive() && isCutDebugActive()) {
     advanceCutDebugStep();
@@ -462,7 +655,14 @@ btnNext.addEventListener('click', () => {
   if (!pipelineMeshes) return;
   switch (inflationStep) {
     case 'classified':
-      showFanStep();
+      if ((pipelineMeshes.terminalPruneSteps.length ?? 0) > 0) {
+        showPruneStep(0);
+      } else {
+        showFanStep();
+      }
+      break;
+    case 'prune':
+      showPruneStep(pruneStepIndex + 1);
       break;
     case 'fan':
       showSpineStep();

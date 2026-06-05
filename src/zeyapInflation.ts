@@ -6,7 +6,40 @@
 
 import type { Triangle2D } from './cdt';
 import { faceNormal, flipTriangle, type Triangle } from './meshWinding';
-import { dist3, type Vec2, type Vec3, vec3 } from './math';
+import { dist3, edgeKey, type Vec2, type Vec3, vec3 } from './math';
+
+export interface SemicirclePose {
+  edgeA: Vec2;
+  edgeB: Vec2;
+  center: Vec2;
+  interiorRef: Vec2;
+  radius: number;
+}
+
+export type TerminalPruneStepKind = 'start' | 'advance' | 'stop' | 'fan';
+
+/** Why a terminal prune chain ended before fanning (fig. 14). */
+export type TerminalPruneStopReason =
+  | 'outside'
+  | 'junction'
+  | 'exhausted'
+  | null;
+
+/** One frame of fig. 14 terminal pruning for debug stepping. */
+export interface TerminalPruneDebugStep {
+  terminalIndex: number;
+  kind: TerminalPruneStepKind;
+  semicircle: SemicirclePose;
+  activeTriangleId: number;
+  consumedTriangleIds: number[];
+  /** Vertices collected so far at the stop semicircle (fig. 14c). */
+  trackedVertexIds: number[];
+  /** Subset of trackedVertexIds outside the stop semicircle (pink markers). */
+  outsideVertexIds: number[];
+  /** Set on stop frames only. */
+  stopReason: TerminalPruneStopReason;
+  fanMesh: { vertices: Vec3[]; faces: [number, number, number][] };
+}
 
 export interface ZeyapTriangle {
   vertIds: [number, number, number];
@@ -84,12 +117,16 @@ function buildEdgeToTriangleMap(triangles: ZeyapTriangle[]): Map<string, number[
   return map;
 }
 
+function sameUndirectedEdge(a: number, b: number, u: number, v: number): boolean {
+  return edgeKey(a, b) === edgeKey(u, v);
+}
+
 function removeInteriorEdge(
   interiorEdges: [number, number][],
   p1: number,
   p2: number
 ): void {
-  const i = interiorEdges.findIndex(([a, b]) => a === p1 && b === p2);
+  const i = interiorEdges.findIndex(([a, b]) => sameUndirectedEdge(a, b, p1, p2));
   if (i >= 0) interiorEdges.splice(i, 1);
 }
 
@@ -152,6 +189,67 @@ function terminalFanCoversCorner(
         w.vertIds[1] === cornerVid ||
         w.vertIds[2] === cornerVid)
   );
+}
+
+function edgeInList(
+  edges: [number, number][],
+  a: number,
+  b: number
+): boolean {
+  return edges.some(([u, v]) => sameUndirectedEdge(u, v, a, b));
+}
+
+/**
+ * Fig. 13f: split each sleeve / junction triangle from its center to the three
+ * vertices. Skip a region only when a terminal fan has invaded across that edge
+ * (the interior edge was removed during pruning).
+ */
+function subdivideInteriorTrianglesAtCenters(
+  triangles: ZeyapTriangle[],
+  verts: Vec3[],
+  originalInteriorEdges: [number, number][][],
+  prunedTriangles: PrunedWedge[],
+  hubByTri: Map<number, number>,
+  activeInteriorEdges: [number, number][][]
+): void {
+  const getHub = (triId: number, tri: ZeyapTriangle): number => {
+    const cached = hubByTri.get(triId);
+    if (cached !== undefined) return cached;
+    const c = tri.centroid!;
+    const hubIdx = verts.length;
+    verts.push(vec3(c.x, c.y, c.z));
+    hubByTri.set(triId, hubIdx);
+    return hubIdx;
+  };
+
+  for (let triId = 0; triId < triangles.length; triId++) {
+    const tri = triangles[triId];
+    if (tri.type !== 'S' && tri.type !== 'J') continue;
+
+    const [a, b, c] = tri.vertIds;
+    const hub = getHub(triId, tri);
+    const regions: [number, number][] = [
+      [a, b],
+      [b, c],
+      [c, a],
+    ];
+
+    for (const [va, vb] of regions) {
+      const wasInterior = edgeInList(originalInteriorEdges[triId], va, vb);
+      const stillInterior = edgeInList(activeInteriorEdges[triId], va, vb);
+      const isExternal = edgeInList(tri.externalEdges, va, vb);
+      if (wasInterior && !stillInterior && !isExternal) continue;
+
+      prunedTriangles.push({
+        vertIds: [hub, va, vb],
+        spineEdges: [
+          [hub, va],
+          [hub, vb],
+        ],
+        fromTerminalPrune: false,
+      });
+    }
+  }
 }
 
 /**
@@ -312,6 +410,220 @@ function linkOrphanFanTipsToAxis(
   }
 }
 
+function semicirclePoseFromEdge(
+  verts: Vec3[],
+  inA: number,
+  inB: number,
+  interiorRef: Vec2
+): SemicirclePose {
+  const edgeA = { x: verts[inA].x, y: verts[inA].y };
+  const edgeB = { x: verts[inB].x, y: verts[inB].y };
+  const center = {
+    x: (edgeA.x + edgeB.x) / 2,
+    y: (edgeA.y + edgeB.y) / 2,
+  };
+  return {
+    edgeA,
+    edgeB,
+    center,
+    interiorRef,
+    radius: dist3(verts[inA], verts[inB]) / 2,
+  };
+}
+
+/** Third vertex of triangle — same side of the interior edge as triangle X (fig. 14). */
+function oppositeVertexId(tri: ZeyapTriangle, inA: number, inB: number): number {
+  return tri.vertIds[0] ^ tri.vertIds[1] ^ tri.vertIds[2] ^ inA ^ inB;
+}
+
+/**
+ * Record fig. 14 terminal-prune frames: semicircle advance per T triangle, then fan wedges.
+ * Does not mutate the input mesh — used for debug stepping only.
+ */
+export function buildTerminalPruneDebugSteps(
+  triangles: ZeyapTriangle[],
+  verts: Vec3[]
+): TerminalPruneDebugStep[] {
+  if (triangles.length < 2) return [];
+
+  for (const tri of triangles) {
+    if (!tri.centroid) {
+      tri.centroid = triangleCentroid(verts, tri.vertIds);
+    }
+  }
+
+  const triangleDeleted = triangles.map(() => false);
+  const edgeToTriangle = buildEdgeToTriangleMap(triangles);
+  const steps: TerminalPruneDebugStep[] = [];
+  let terminalIndex = 0;
+
+  const fanVertices: Vec3[] = verts.map((v) => vec3(v.x, v.y, v.z));
+  const fanFaces: [number, number, number][] = [];
+
+  const pushStep = (
+    kind: TerminalPruneStepKind,
+    activeTriangleId: number,
+    semicircle: SemicirclePose,
+    options: {
+      trackedVertexIds?: number[];
+      outsideVertexIds?: number[];
+      stopReason?: TerminalPruneStopReason;
+    } = {}
+  ) => {
+    steps.push({
+      terminalIndex,
+      kind,
+      semicircle,
+      activeTriangleId,
+      consumedTriangleIds: triangles
+        .map((_, i) => i)
+        .filter((i) => triangleDeleted[i]),
+      trackedVertexIds: options.trackedVertexIds ?? [],
+      outsideVertexIds: options.outsideVertexIds ?? [],
+      stopReason: options.stopReason ?? null,
+      fanMesh: {
+        vertices: fanVertices.map((v) => vec3(v.x, v.y, v.z)),
+        faces: fanFaces.map((f) => [...f] as [number, number, number]),
+      },
+    });
+  };
+
+  const pushStopStep = (
+    activeTriangleId: number,
+    semicircle: SemicirclePose,
+    trackedVertexIds: number[],
+    outsideVertexIds: number[],
+    stopReason: Exclude<TerminalPruneStopReason, null>
+  ) => {
+    const last = steps[steps.length - 1];
+    if (last?.kind === 'stop' && last.terminalIndex === terminalIndex) return;
+    pushStep('stop', activeTriangleId, semicircle, {
+      trackedVertexIds: [...trackedVertexIds],
+      outsideVertexIds: [...outsideVertexIds],
+      stopReason,
+    });
+  };
+
+  for (let i = 0; i < triangles.length; i++) {
+    if (triangles[i].type !== 'T' || triangleDeleted[i]) continue;
+
+    let triangle = triangles[i];
+    let triangleId = i;
+    const edgeBuffer: [number, number][] = [];
+    const vertBuffer: number[] = [];
+    let interiorEdge = triangle.interiorEdges[0];
+    let semicircleCenter = edgeCenter(
+      verts[interiorEdge[0]],
+      verts[interiorEdge[1]]
+    );
+    const [startA, startB] = interiorEdge;
+    const startOpposite = oppositeVertexId(triangle, startA, startB);
+    // Fig. 14: semicircle stays on the boundary side of X — anchor to the starting T corner.
+    const anchorInteriorRef = {
+      x: verts[startOpposite].x,
+      y: verts[startOpposite].y,
+    };
+    pushStep(
+      'start',
+      triangleId,
+      semicirclePoseFromEdge(verts, startA, startB, anchorInteriorRef)
+    );
+
+    let lastPose = semicirclePoseFromEdge(verts, startA, startB, anchorInteriorRef);
+    let stopReason: Exclude<TerminalPruneStopReason, null> = 'exhausted';
+
+    while (true) {
+      triangleDeleted[triangleId] = true;
+
+      const [inA, inB] = interiorEdge;
+      semicircleCenter = edgeCenter(verts[inA], verts[inB]);
+      const oppositeId =
+        triangle.vertIds[0] ^ triangle.vertIds[1] ^ triangle.vertIds[2] ^ inA ^ inB;
+      vertBuffer.push(oppositeId);
+
+      const pose = semicirclePoseFromEdge(verts, inA, inB, anchorInteriorRef);
+      lastPose = pose;
+      pushStep('advance', triangleId, pose, {
+        trackedVertexIds: [...vertBuffer],
+      });
+
+      if (triangle.type === 'T') {
+        for (const ext of triangle.externalEdges) edgeBuffer.push(ext);
+      } else if (triangle.type === 'S') {
+        for (const ext of triangle.externalEdges) edgeBuffer.push(ext);
+      }
+
+      const radius = dist3(semicircleCenter, verts[inA]);
+      const outsideVertexIds: number[] = [];
+      for (const vid of vertBuffer) {
+        if (dist3(semicircleCenter, verts[vid]) > radius + 1e-6) {
+          outsideVertexIds.push(vid);
+        }
+      }
+      if (outsideVertexIds.length > 0) {
+        pushStopStep(triangleId, pose, vertBuffer, outsideVertexIds, 'outside');
+        stopReason = 'outside';
+        break;
+      }
+
+      const adj =
+        edgeToTriangle.get(inA < inB ? `${inA}_${inB}` : `${inB}_${inA}`) ?? [];
+      const nextId = adj.find((id) => id !== triangleId);
+      if (nextId === undefined || triangleDeleted[nextId]) {
+        stopReason = 'exhausted';
+        break;
+      }
+
+      const nextTri = triangles[nextId];
+
+      triangleId = nextId;
+      triangle = nextTri;
+
+      if (triangle.type === 'J') {
+        semicircleCenter = triangle.centroid!;
+        removeInteriorEdge(triangle.interiorEdges, inA, inB);
+        pushStopStep(
+          triangleId,
+          semicirclePoseFromEdge(verts, inA, inB, anchorInteriorRef),
+          vertBuffer,
+          [],
+          'junction'
+        );
+        stopReason = 'junction';
+        break;
+      }
+
+      interiorEdge = triangle.interiorEdges.find(
+        ([a, b]) => !sameUndirectedEdge(a, b, inA, inB)
+      )!;
+      if (!interiorEdge) {
+        stopReason = 'exhausted';
+        break;
+      }
+    }
+
+    if (stopReason !== 'outside' && stopReason !== 'junction') {
+      pushStopStep(triangleId, lastPose, vertBuffer, [], stopReason);
+    }
+
+    const spineIdx = fanVertices.length;
+    fanVertices.push(semicircleCenter);
+
+    for (const [e0, e1] of removeDoublyDefinedEdges(edgeBuffer)) {
+      fanFaces.push([e0, e1, spineIdx]);
+    }
+
+    pushStep('fan', triangleId, {
+      ...lastPose,
+      center: { x: semicircleCenter.x, y: semicircleCenter.y },
+    });
+
+    terminalIndex++;
+  }
+
+  return steps;
+}
+
 /** Port of zeyap pruneTrianglesAndElevateVertices (Fig. 13–15). */
 export function pruneToWedges(
   triangles: ZeyapTriangle[],
@@ -331,8 +643,14 @@ export function pruneToWedges(
     }
   }
 
+  const originalInteriorEdges = triangles.map((tri) =>
+    tri.interiorEdges.map((e) => [...e] as [number, number])
+  );
+
   const boundaryVertexCount = verts.length;
+  const subdivisionHubByTri = new Map<number, number>();
   const triangleDeleted: boolean[] = triangles.map(() => false);
+  const sleeveProcessed: boolean[] = triangles.map(() => false);
   const prunedTriangles: PrunedWedge[] = [];
   const interiorVerts = new Map<number, Map<number, number[]>>();
   const spineEndpointsId: number[] = [];
@@ -423,15 +741,6 @@ export function pruneToWedges(
       verts[interiorEdge[0]],
       verts[interiorEdge[1]]
     );
-    // Width of the terminal's own interior edge. A genuine limb stays roughly this wide as the fan
-    // walks down it; a corner of a blocky shape (e.g. a square) widens quickly into the body. We
-    // stop the fan once it widens past this, so each terminal stays LOCAL. Without it the first
-    // terminal processed walks all the way to the central junction and swallows the whole sleeve,
-    // leaving the other corners (or, here, the opposite corner) without their own fan — the steep
-    // cliff. Keeping fans local makes the result order-independent and symmetric.
-    const terminalEdgeLen = dist3(verts[interiorEdge[0]], verts[interiorEdge[1]]);
-    const WIDEN_FACTOR = 1.6;
-
     while (true) {
       triangleDeleted[triangleId] = true;
 
@@ -469,12 +778,6 @@ export function pruneToWedges(
       if (nextId === undefined || triangleDeleted[nextId]) break;
 
       const nextTri = triangles[nextId];
-      // Stop before stepping into a triangle that widens past the terminal width: keep the fan local.
-      if (nextTri.type !== 'J') {
-        const ni = nextTri.interiorEdges.find(([a, b]) => !(a === inA && b === inB));
-        if (!ni) break;
-        if (dist3(verts[ni[0]], verts[ni[1]]) > terminalEdgeLen * WIDEN_FACTOR) break;
-      }
 
       triangleId = nextId;
       triangle = nextTri;
@@ -486,7 +789,7 @@ export function pruneToWedges(
       }
 
       interiorEdge = triangle.interiorEdges.find(
-        ([a, b]) => !(a === inA && b === inB)
+        ([a, b]) => !sameUndirectedEdge(a, b, inA, inB)
       )!;
       if (!interiorEdge) break;
     }
@@ -519,30 +822,20 @@ export function pruneToWedges(
     spineEndpointsTriangleId
   );
 
-  const pushHubMidWedges = (
-    hubIdx: number,
-    e: [number, number]
-  ) => {
-    const midIdx = getOrCreateInteriorEdgeMid(e[0], e[1]);
-    prunedTriangles.push({
-      vertIds: [hubIdx, midIdx, e[0]],
-      spineEdges: [
-        [hubIdx, e[0]],
-        [midIdx, e[0]],
-      ],
-      fromTerminalPrune: false,
-    });
-    prunedTriangles.push({
-      vertIds: [hubIdx, midIdx, e[1]],
-      spineEdges: [
-        [hubIdx, e[1]],
-        [midIdx, e[1]],
-      ],
-      fromTerminalPrune: false,
-    });
-  };
+  const postPruneInteriorEdges = triangles.map((tri) =>
+    tri.interiorEdges.map((e) => [...e] as [number, number])
+  );
 
-  // --- Sleeve / terminal / junction (fig. 13f): grow from fan tips through S and J ---
+  subdivideInteriorTrianglesAtCenters(
+    triangles,
+    verts,
+    originalInteriorEdges,
+    prunedTriangles,
+    subdivisionHubByTri,
+    postPruneInteriorEdges
+  );
+
+  // --- Sleeve / junction chordal axis (fig. 13e): grow from fan tips through S and J ---
   for (let i = 0; i < spineEndpointsId.length; i++) {
     const startTriId = spineEndpointsTriangleId[i];
 
@@ -553,9 +846,7 @@ export function pruneToWedges(
       const triangleId = queueTri.shift()!;
       const startVertId = queueVert.shift()!;
 
-      if (triangleId !== startTriId && triangleDeleted[triangleId]) {
-        continue;
-      }
+      if (sleeveProcessed[triangleId] && triangleId !== startTriId) continue;
 
       const triangle = triangles[triangleId];
       if (
@@ -567,6 +858,16 @@ export function pruneToWedges(
         continue;
       }
 
+      // Terminal prune marks consumed T (and walked S) deleted; sleeve still subdivides S/J.
+      if (
+        triangleId !== startTriId &&
+        triangleDeleted[triangleId] &&
+        triangle.type === 'T'
+      ) {
+        continue;
+      }
+
+      sleeveProcessed[triangleId] = true;
       triangleDeleted[triangleId] = true;
 
       const sleeveMids =
@@ -590,27 +891,6 @@ export function pruneToWedges(
           if (triangle.type === 'S') sleeveInboundAxis = true;
         }
 
-        if (triangle.type === 'J') {
-          pushHubMidWedges(startVertId, e);
-        } else if (startVertId !== midIdx) {
-          prunedTriangles.push({
-            vertIds: [startVertId, midIdx, e[0]],
-            spineEdges: [
-              [startVertId, e[0]],
-              [midIdx, e[0]],
-            ],
-            fromTerminalPrune: false,
-          });
-          prunedTriangles.push({
-            vertIds: [startVertId, midIdx, e[1]],
-            spineEdges: [
-              [startVertId, e[1]],
-              [midIdx, e[1]],
-            ],
-            fromTerminalPrune: false,
-          });
-        }
-
         const ek = interiorEdgeKey(e[0], e[1]);
         const adj = edgeToTriangle.get(ek) ?? [];
         const nextId =
@@ -619,7 +899,7 @@ export function pruneToWedges(
 
         if (
           (next?.type === 'S' || next?.type === 'J') &&
-          !triangleDeleted[nextId!]
+          !sleeveProcessed[nextId!]
         ) {
           queueTri.push(nextId!);
           queueVert.push(
@@ -633,16 +913,6 @@ export function pruneToWedges(
 
       if (triangle.type === 'S') {
         connectSleeveAxisMids(triangle);
-
-        const ext = triangle.externalEdges[0];
-        prunedTriangles.push({
-          vertIds: [startVertId, ext[0], ext[1]],
-          spineEdges: [
-            [startVertId, ext[0]],
-            [startVertId, ext[1]],
-          ],
-          fromTerminalPrune: false,
-        });
       } else if (triangle.type === 'J') {
         connectJunctionAxis(triangleId, triangle);
       }
@@ -652,12 +922,8 @@ export function pruneToWedges(
   // Open junctions never reached by a sleeve walk (interior J hubs).
   for (let i = 0; i < triangles.length; i++) {
     const triangle = triangles[i];
-    if (triangle.type !== 'J' || triangleDeleted[i]) continue;
+    if (triangle.type !== 'J' || sleeveProcessed[i]) continue;
 
-    const hubIdx = getJunctionHub(i, triangle);
-    for (const e of triangle.interiorEdges) {
-      pushHubMidWedges(hubIdx, e);
-    }
     connectJunctionAxis(i, triangle);
     triangleDeleted[i] = true;
   }

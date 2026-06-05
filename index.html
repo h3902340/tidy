@@ -39,6 +39,17 @@
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5 14.2 9.2 20.3 9.6 15.6 13.5 17.1 19.5 12 16.2 6.9 19.5 8.4 13.5 3.7 9.6 9.8 9.2Z" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round"/></svg>
                 </button>
                 <button id="btn-clear" type="button" class="secondary">Clear</button>
+                <button id="btn-top-view" type="button" class="icon-btn secondary" aria-label="Top view" title="Top view">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1" fill="none" stroke="currentColor" stroke-width="1.75"/><circle cx="12" cy="12" r="2" fill="currentColor"/></svg>
+                </button>
+                <label class="inline-control display-control">
+                  Display
+                  <select id="display-mode" aria-label="Mesh display mode">
+                    <option value="solid" selected>Solid</option>
+                    <option value="wireframe">Wireframe</option>
+                    <option value="both">Both</option>
+                  </select>
+                </label>
               </div>
             </div>
 
@@ -56,17 +67,6 @@
                 <button id="btn-redo" type="button" class="icon-btn secondary" aria-label="Redo" disabled>
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 7h4v4" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/><path d="M19 11c-1.5-3-4.5-5-8-5-4.4 0-8 3.6-8 8s3.6 8 8 8a8.1 8.1 0 0 0 5.2-1.9" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/></svg>
                 </button>
-                <button id="btn-top-view" type="button" class="icon-btn secondary" aria-label="Top view" title="Top view">
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1" fill="none" stroke="currentColor" stroke-width="1.75"/><circle cx="12" cy="12" r="2" fill="currentColor"/></svg>
-                </button>
-                <label class="inline-control display-control">
-                  Display
-                  <select id="display-mode" aria-label="Mesh display mode" disabled>
-                    <option value="solid" selected>Solid</option>
-                    <option value="wireframe">Wireframe</option>
-                    <option value="both">Both</option>
-                  </select>
-                </label>
                 <label class="inline-control">
                   <input type="checkbox" id="sketch-mode" disabled />
                   Sketch
@@ -102,6 +102,7 @@
             <div id="scene-view" class="scene-view"></div>
             <div class="debug-panel" id="debug-panel" hidden>
               <button id="btn-next-step" type="button" disabled hidden>Next step</button>
+              <button id="btn-skip-prune" type="button" class="secondary" disabled hidden>Skip to fan triangles</button>
               <button id="btn-discard-cut" type="button" class="secondary" disabled hidden>Discard cut</button>
             </div>
           </div>
