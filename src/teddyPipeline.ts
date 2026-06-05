@@ -12,22 +12,34 @@ import {
 } from './meshWinding';
 import {
   applySpineElevation,
+  buildFanElevationDebugSteps,
+  buildInternalFlatElevationDebugSteps,
+  buildInternalQuarterOvalDebugSteps,
+  buildQuarterOvalDebugSteps,
   buildSpineElevationDebugSteps,
   buildTerminalPruneDebugSteps,
   cdtToZeyapTriangles,
   drawBackface,
+  elevateSubdivisionHubHeights,
   propagateSpineElevationAlongAxis,
+  buildInflatedTopFaces,
   pruneToWedges,
-  pruneTrianglesAndElevateVertices,
-  stitchSilhouetteRim,
   wedgesToElevatedFanFaces,
   wedgesToFanFaces,
   wedgesToFanFacesFiltered,
+  type FanElevationDebugStep,
+  type QuarterOvalDebugStep,
   type SpineElevationDebugStep,
   type TerminalPruneDebugStep,
+  type ZeyapTriangle,
 } from './zeyapInflation';
 
-export type { SpineElevationDebugStep, TerminalPruneDebugStep } from './zeyapInflation';
+export type {
+  FanElevationDebugStep,
+  QuarterOvalDebugStep,
+  SpineElevationDebugStep,
+  TerminalPruneDebugStep,
+} from './zeyapInflation';
 
 export type TriangleType = 'T' | 'S' | 'J';
 
@@ -53,11 +65,21 @@ export interface TeddyPipelineMeshes {
   spineSegments: [number, number][];
   /** Paper §5.1: per-spine-vertex elevation frames for debug stepping. */
   spineElevationSteps: SpineElevationDebugStep[];
+  /** Per-wedge flat fan elevation after spine heights are set (§5.1 → §5.2). */
+  fanElevationSteps: FanElevationDebugStep[];
+  /** Per-wedge quarter-oval subdivision for terminal fan wedges (paper §5.2). */
+  quarterOvalSteps: QuarterOvalDebugStep[];
+  /** Per-wedge flat elevation for internal chord wedges before quarter ovals. */
+  internalFlatElevationSteps: FanElevationDebugStep[];
+  /** Per-wedge quarter-oval subdivision for internal chord wedges (paper §5.2). */
+  internalQuarterOvalSteps: QuarterOvalDebugStep[];
   /** Fan vertices with spine elevation applied — spine nodes lifted to their height (z > 0). */
   elevatedSpineVertices: Vec3[];
   /** Elevated fans, mirrored back; no quarter-ovals or rim. */
   elevated: Mesh3D;
-  /** Full inflation: quarter-ovals, rim, winding fixes. */
+  /** Top inflated surface — matches the last debug step before the solid cap. */
+  inflatedTop: Mesh3D;
+  /** Full inflation: top surface mirrored (paper §5.1 fig. 15) plus winding fixes. */
   inflated: Mesh3D;
 }
 
@@ -108,7 +130,12 @@ function buildElevatedFanSolid(
   wedges: ReturnType<typeof pruneToWedges>['wedges'],
   interiorVerts: ReturnType<typeof pruneToWedges>['interiorVerts'],
   axisSegments: [number, number][],
-  verts: Vec3[]
+  verts: Vec3[],
+  zeyapTris: ZeyapTriangle[],
+  hubMeta: Pick<
+    ReturnType<typeof pruneToWedges>,
+    'subdivisionHubByTri' | 'junctionHubByTri' | 'interiorEdgeMid'
+  >
 ): Mesh3D {
   const elevatedVerts = verts.map((v) => vec3(v.x, v.y, v.z));
   const topFaces = wedgesToElevatedFanFaces(
@@ -116,7 +143,8 @@ function buildElevatedFanSolid(
     interiorVerts,
     elevatedVerts,
     axisSegments,
-    polygon.length
+    polygon.length,
+    { ...hubMeta, triangles: zeyapTris, axisSegments }
   );
   enforceWindingTowardView(elevatedVerts, topFaces, vec3(0, 0, 1));
   const { vertices, faces } = drawBackface(topFaces, elevatedVerts);
@@ -124,17 +152,28 @@ function buildElevatedFanSolid(
   return { vertices, faces };
 }
 
-/** Step 5 — quarter-oval spokes, back face, rim, winding fixes. */
-export function buildInflatedMesh(polygon: Vec2[]): Mesh3D {
-  const { triangles } = constrainedDelaunay(polygon);
-  const verts: Vec3[] = polygon.map((p) => vec3(p.x, p.y, 0));
-  const zeyapTris = cdtToZeyapTriangles(triangles);
-  const topFaces = pruneTrianglesAndElevateVertices(zeyapTris, verts);
-  enforceWindingTowardViewSelective(verts, topFaces, vec3(0, 0, 1));
+function buildInflatedTopMesh(
+  polygon: Vec2[],
+  wedges: ReturnType<typeof pruneToWedges>['wedges'],
+  interiorVerts: ReturnType<typeof pruneToWedges>['interiorVerts'],
+  axisSegments: [number, number][],
+  pruneVerts: Vec3[]
+): Mesh3D {
+  const verts = pruneVerts.map((v) => vec3(v.x, v.y, v.z));
+  const faces = buildInflatedTopFaces(
+    wedges,
+    interiorVerts,
+    verts,
+    axisSegments,
+    polygon.length
+  );
+  enforceWindingTowardViewSelective(verts, faces, vec3(0, 0, 1));
+  return { vertices: verts, faces };
+}
 
-  const topVertexCount = verts.length;
-  const { vertices, faces } = drawBackface(topFaces, verts);
-  stitchSilhouetteRim(vertices, faces, polygon, topVertexCount);
+function sealInflatedSolid(polygon: Vec2[], top: Mesh3D): Mesh3D {
+  const topVertexCount = top.vertices.length;
+  const { vertices, faces } = drawBackface(top.faces, top.vertices);
 
   const interior = teddyInteriorReference(polygon, vertices);
   const windingOpts = {
@@ -148,6 +187,12 @@ export function buildInflatedMesh(polygon: Vec2[]): Mesh3D {
   enforceBoundaryCapWinding(vertices, faces, polygon.length, topVertexCount);
   fixInwardFaces(vertices, faces, windingOpts);
   return { vertices, faces };
+}
+
+/** Step 5 — quarter-oval top cap mirrored to close the solid (paper §5.1), plus winding fixes. */
+export function buildInflatedMesh(polygon: Vec2[]): Mesh3D {
+  const result = buildTeddyPipeline(polygon);
+  return result.meshes?.inflated ?? { vertices: [], faces: [] };
 }
 
 export function buildTeddyPipeline(ring: Vec2[]): {
@@ -170,7 +215,14 @@ export function buildTeddyPipeline(ring: Vec2[]): {
   const terminalPruneSteps = buildTerminalPruneDebugSteps(zeyapTris, [
     ...pruneVerts,
   ]);
-  const { wedges, interiorVerts, axisSegments } = pruneToWedges(zeyapTris, pruneVerts);
+  const {
+    wedges,
+    interiorVerts,
+    axisSegments,
+    subdivisionHubByTri,
+    junctionHubByTri,
+    interiorEdgeMid,
+  } = pruneToWedges(zeyapTris, pruneVerts);
 
   const fanFaces = wedgesToFanFaces(wedges);
   enforceWindingTowardView(pruneVerts, fanFaces, vec3(0, 0, 1));
@@ -188,11 +240,46 @@ export function buildTeddyPipeline(ring: Vec2[]): {
     polygon.length
   );
 
-  // Spine lifted into the air: same node indices as spineSegments, but z = elevation.
   const elevatedSpineVertices = pruneVerts.map((v) => vec3(v.x, v.y, v.z));
   applySpineElevation(interiorVerts, elevatedSpineVertices);
   propagateSpineElevationAlongAxis(
     elevatedSpineVertices,
+    axisSegments,
+    polygon.length
+  );
+  elevateSubdivisionHubHeights(
+    elevatedSpineVertices,
+    subdivisionHubByTri,
+    junctionHubByTri,
+    interiorEdgeMid,
+    zeyapTris,
+    polygon.length,
+    axisSegments
+  );
+
+  const fanElevationSteps = buildFanElevationDebugSteps(
+    wedges,
+    elevatedSpineVertices,
+    axisSegments,
+    polygon.length
+  );
+  const quarterOvalSteps = buildQuarterOvalDebugSteps(
+    wedges,
+    elevatedSpineVertices,
+    interiorVerts,
+    axisSegments,
+    polygon.length
+  );
+  const internalFlatElevationSteps = buildInternalFlatElevationDebugSteps(
+    wedges,
+    elevatedSpineVertices,
+    axisSegments,
+    polygon.length
+  );
+  const internalQuarterOvalSteps = buildInternalQuarterOvalDebugSteps(
+    wedges,
+    elevatedSpineVertices,
+    interiorVerts,
     axisSegments,
     polygon.length
   );
@@ -202,9 +289,18 @@ export function buildTeddyPipeline(ring: Vec2[]): {
     wedges,
     interiorVerts,
     axisSegments,
+    pruneVerts,
+    zeyapTris,
+    { subdivisionHubByTri, junctionHubByTri, interiorEdgeMid }
+  );
+  const inflatedTop = buildInflatedTopMesh(
+    polygon,
+    wedges,
+    interiorVerts,
+    axisSegments,
     pruneVerts
   );
-  const inflated = buildInflatedMesh(polygon);
+  const inflated = sealInflatedSolid(polygon, inflatedTop);
 
   return {
     meshes: {
@@ -215,8 +311,13 @@ export function buildTeddyPipeline(ring: Vec2[]): {
       fan,
       spineSegments: axisSegments,
       spineElevationSteps,
+      fanElevationSteps,
+      quarterOvalSteps,
+      internalFlatElevationSteps,
+      internalQuarterOvalSteps,
       elevatedSpineVertices,
       elevated,
+      inflatedTop,
       inflated,
     },
     error: null,

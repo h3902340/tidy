@@ -6,6 +6,8 @@ import { buildTeddyPipelineFromStroke } from './teddy';
 import {
   FAN_TERMINAL_COLOR,
   type Mesh3D,
+  type FanElevationDebugStep,
+  type QuarterOvalDebugStep,
   type SpineElevationDebugStep,
   type TeddyPipelineMeshes,
   type TerminalPruneDebugStep,
@@ -28,6 +30,8 @@ const btnStar = document.querySelector<HTMLButtonElement>('#btn-star')!;
 const btnNext = document.querySelector<HTMLButtonElement>('#btn-next-step')!;
 const btnSkipPrune = document.querySelector<HTMLButtonElement>('#btn-skip-prune')!;
 const btnSkipElevation = document.querySelector<HTMLButtonElement>('#btn-skip-elevation')!;
+const btnSkipFan = document.querySelector<HTMLButtonElement>('#btn-skip-fan')!;
+const btnSkipResult = document.querySelector<HTMLButtonElement>('#btn-skip-result')!;
 const displayModeEl = document.querySelector<HTMLSelectElement>('#display-mode')!;
 const sketchModeEl = document.querySelector<HTMLInputElement>('#sketch-mode')!;
 const paintPaletteEl = document.querySelector<HTMLDivElement>('#paint-palette')!;
@@ -54,6 +58,12 @@ type InflationStep =
   | 'spine'
   | 'elevation'
   | 'elevated'
+  | 'fanElevation'
+  | 'quarterOval'
+  | 'internalFlatElevation'
+  | 'internalQuarterOval'
+  | 'completeTop'
+  | 'mirroredSolid'
   | 'done';
 
 const PRUNE_CONSUMED_FACE_COLOR = 0x4a4a48;
@@ -70,9 +80,16 @@ let inflationStep: InflationStep = 'idle';
 let pipelineMeshes: TeddyPipelineMeshes | null = null;
 let pruneStepIndex = 0;
 let elevationStepIndex = 0;
-
+let fanElevationStepIndex = 0;
+let quarterOvalStepIndex = 0;
+let internalFlatElevationStepIndex = 0;
+let internalQuarterOvalStepIndex = 0;
 const INFLATED_COLOR = 0xffffff;
-
+const DEBUG_MESH_BASE = 0xe8e8e8;
+const DEBUG_MESH_ACTIVE = 0xffd700;
+const DEBUG_MESH_QUARTER_OVAL = 0x7cb87c;
+const DEBUG_INTERNAL_FLAT = 0xd4c4e8;
+const DEBUG_INTERNAL_QUARTER_OVAL = 0xa8c8a0;
 const editHistory = new EditHistory();
 let restoringHistory = false;
 
@@ -366,6 +383,8 @@ function updateDebugActions(): void {
     btnNext.hidden = true;
     btnSkipPrune.hidden = true;
     btnSkipElevation.hidden = true;
+    btnSkipFan.hidden = true;
+    btnSkipResult.hidden = true;
     btnDiscardCut.disabled = true;
     return;
   }
@@ -374,6 +393,8 @@ function updateDebugActions(): void {
     btnDiscardCut.disabled = true;
     btnNext.hidden = false;
     btnNext.disabled = false;
+    btnSkipResult.hidden = false;
+    btnSkipResult.disabled = false;
     const canSkipPrune =
       inflationStep === 'classified' || inflationStep === 'prune';
     btnSkipPrune.hidden = !canSkipPrune;
@@ -383,6 +404,12 @@ function updateDebugActions(): void {
       (pipelineMeshes?.spineElevationSteps.length ?? 0) > 0;
     btnSkipElevation.hidden = !canSkipElevation;
     btnSkipElevation.disabled = !canSkipElevation;
+    const canSkipFan =
+      inflationStep === 'elevated' ||
+      inflationStep === 'fanElevation' ||
+      inflationStep === 'quarterOval';
+    btnSkipFan.hidden = !canSkipFan;
+    btnSkipFan.disabled = !canSkipFan;
     if (inflationStep === 'classified') {
       const hasPrune =
         (pipelineMeshes?.terminalPruneSteps.length ?? 0) > 0;
@@ -403,6 +430,40 @@ function updateDebugActions(): void {
         elevationStepIndex + 1 >= steps.length
           ? 'Next: all elevated'
           : elevationStepButtonLabel(next);
+    } else if (inflationStep === 'fanElevation' && pipelineMeshes) {
+      const steps = pipelineMeshes.fanElevationSteps;
+      btnNext.textContent =
+        fanElevationStepIndex + 1 >= steps.length
+          ? 'Next: quarter ovals'
+          : `Next: fan wedge ${fanElevationStepIndex + 2} elevation`;
+    } else if (inflationStep === 'quarterOval' && pipelineMeshes) {
+      const steps = pipelineMeshes.quarterOvalSteps;
+      const internal = pipelineMeshes.internalFlatElevationSteps;
+      btnNext.textContent =
+        quarterOvalStepIndex + 1 >= steps.length
+          ? internal.length > 0
+            ? 'Next: internal triangles'
+            : 'Next: complete top surface'
+          : `Next: fan quarter oval (wedge ${quarterOvalStepIndex + 2})`;
+    } else if (inflationStep === 'internalFlatElevation' && pipelineMeshes) {
+      const steps = pipelineMeshes.internalFlatElevationSteps;
+      const internalOvals = pipelineMeshes.internalQuarterOvalSteps;
+      btnNext.textContent =
+        internalFlatElevationStepIndex + 1 >= steps.length
+          ? internalOvals.length > 0
+            ? 'Next: internal quarter ovals'
+            : 'Next: complete top surface'
+          : `Next: internal triangle (wedge ${internalFlatElevationStepIndex + 2})`;
+    } else if (inflationStep === 'internalQuarterOval' && pipelineMeshes) {
+      const steps = pipelineMeshes.internalQuarterOvalSteps;
+      btnNext.textContent =
+        internalQuarterOvalStepIndex + 1 >= steps.length
+          ? 'Next: complete top surface'
+          : `Next: internal quarter oval (wedge ${internalQuarterOvalStepIndex + 2})`;
+    } else if (inflationStep === 'completeTop') {
+      btnNext.textContent = 'Next: mirrored solid';
+    } else if (inflationStep === 'mirroredSolid') {
+      btnNext.textContent = 'Next: done';
     } else {
       const labels: Record<InflationStep, string> = {
         idle: 'Next step',
@@ -411,7 +472,13 @@ function updateDebugActions(): void {
         fan: 'Next: show spine',
         spine: 'Next: spine elevation',
         elevation: 'Next step',
-        elevated: 'Next: full inflation',
+        elevated: 'Next: fan elevation',
+        fanElevation: 'Next step',
+        quarterOval: 'Next step',
+        internalFlatElevation: 'Next step',
+        internalQuarterOval: 'Next step',
+        completeTop: 'Next step',
+        mirroredSolid: 'Next step',
         done: 'Done',
       };
       btnNext.textContent = labels[inflationStep];
@@ -424,12 +491,16 @@ function updateDebugActions(): void {
     btnNext.hidden = true;
     btnSkipPrune.hidden = true;
     btnSkipElevation.hidden = true;
+    btnSkipFan.hidden = true;
+    btnSkipResult.hidden = true;
     return;
   }
 
   if (isLoopCutActive()) {
     btnSkipPrune.hidden = true;
     btnSkipElevation.hidden = true;
+    btnSkipFan.hidden = true;
+    btnSkipResult.hidden = true;
     const phase = sceneView.getLoopCutPhase();
     btnDiscardCut.disabled = false;
     if (phase === 'projected') {
@@ -448,6 +519,8 @@ function updateDebugActions(): void {
 
   btnSkipPrune.hidden = true;
   btnSkipElevation.hidden = true;
+  btnSkipFan.hidden = true;
+  btnSkipResult.hidden = true;
   const pending = sceneView.hasPendingCut();
   btnDiscardCut.disabled = false;
   if (pending) {
@@ -479,6 +552,10 @@ function resetInflationFlow(): void {
   pipelineMeshes = null;
   pruneStepIndex = 0;
   elevationStepIndex = 0;
+  fanElevationStepIndex = 0;
+  quarterOvalStepIndex = 0;
+  internalFlatElevationStepIndex = 0;
+  internalQuarterOvalStepIndex = 0;
   polygonReady = false;
   enablePostInflationControls(false);
   editHistory.seedEmpty();
@@ -640,21 +717,333 @@ function showElevationStep(index: number): void {
 function showElevatedStep(): void {
   if (!pipelineMeshes) return;
   inflationStep = 'elevated';
+  fanElevationStepIndex = 0;
+  quarterOvalStepIndex = 0;
   sceneView.clearSecondaryMesh();
-  const elevatedFan: Mesh3D = {
-    vertices: pipelineMeshes.elevatedSpineVertices,
-    faces: pipelineMeshes.fan.faces,
-  };
-  sceneView.setMesh(elevatedFan, {
-    color: 0xe8e8e8,
+  // Fan mesh stays flat (z = 0) until fan-elevation steps begin; spine heights are overlay only.
+  sceneView.setMesh(pipelineMeshes.fan, {
+    color: DEBUG_MESH_BASE,
     wireColor: 0x4a4a48,
   });
   sceneView.setSpineOverlay(
     pipelineMeshes.elevatedSpineVertices,
     pipelineMeshes.spineSegments,
-    { showHeights: true, showVertexIds: true, onSurface: true }
+    { showHeights: true, showVertexIds: true, onSurface: false }
   );
-  setStatus('');
+  setStatus(
+    'Spine elevation complete — green terminal fans inflate in the next step.'
+  );
+  updateDebugActions();
+}
+
+function fanElevationStepStatus(step: FanElevationDebugStep, total: number): string {
+  const n = step.stepIndex + 1;
+  const [z0, z1] = step.spineHeights;
+  return `§5.2 inflation wedge ${n}/${total} (#${step.wedgeIndex}) — spine z [${z0.toFixed(1)}, ${z1.toFixed(1)}], boundary z=0`;
+}
+
+function showFanElevationStep(index: number): void {
+  if (!pipelineMeshes) return;
+  const steps = pipelineMeshes.fanElevationSteps;
+  if (index >= steps.length) {
+    showQuarterOvalStep(0);
+    return;
+  }
+
+  inflationStep = 'fanElevation';
+  fanElevationStepIndex = index;
+  quarterOvalStepIndex = 0;
+  const step = steps[index];
+
+  sceneView.clearSecondaryMesh();
+
+  const faceColors = step.faces.map((_, fi) =>
+    fi === step.activeFaceIndex ? DEBUG_MESH_ACTIVE : DEBUG_MESH_BASE
+  );
+  sceneView.setMesh(
+    { vertices: step.vertices, faces: step.faces },
+    { faceColors, wireColor: 0x4a4a48 }
+  );
+  sceneView.setSpineOverlay(
+    step.vertices,
+    pipelineMeshes.spineSegments,
+    { showHeights: true, showVertexIds: true, onSurface: false }
+  );
+  sceneView.setFanElevationDebugOverlay(step.vertices, step);
+  setStatus(fanElevationStepStatus(step, steps.length));
+  updateDebugActions();
+}
+
+function quarterOvalStepStatus(step: QuarterOvalDebugStep, total: number): string {
+  const n = step.stepIndex + 1;
+  const [z0, z1] = step.spineHeights;
+  const triCount = step.highlightFaceIndices.length;
+  return `§5.2 fan quarter oval ${n}/${total}: wedge ${step.wedgeIndex} — b=[${z0.toFixed(1)}, ${z1.toFixed(1)}], +${triCount} stitched triangles`;
+}
+
+function internalFlatElevationStepStatus(
+  step: FanElevationDebugStep,
+  total: number
+): string {
+  const n = step.stepIndex + 1;
+  const [z0, z1] = step.spineHeights;
+  return `§5.2 internal triangle ${n}/${total} (#${step.wedgeIndex}) — spine z [${z0.toFixed(1)}, ${z1.toFixed(1)}], flat`;
+}
+
+function internalQuarterOvalStepStatus(step: QuarterOvalDebugStep, total: number): string {
+  const n = step.stepIndex + 1;
+  const [z0, z1] = step.spineHeights;
+  const triCount = step.highlightFaceIndices.length;
+  return `§5.2 internal quarter oval ${n}/${total} (#${step.wedgeIndex}) — b=[${z0.toFixed(1)}, ${z1.toFixed(1)}], +${triCount} stitched triangles`;
+}
+
+function advanceAfterQuarterOvals(): void {
+  showCompleteTopStep();
+}
+
+function skipFanConstruction(): void {
+  if (!pipelineMeshes) return;
+  if (pipelineMeshes.internalFlatElevationSteps.length > 0) {
+    showInternalFlatElevationStep(0);
+  } else {
+    advanceAfterQuarterOvals();
+  }
+}
+
+function fanQuarterOvalFinalStep(
+  pipeline: TeddyPipelineMeshes
+): QuarterOvalDebugStep | undefined {
+  const steps = pipeline.quarterOvalSteps;
+  return steps.length > 0 ? steps[steps.length - 1] : undefined;
+}
+
+/** Completed fan quarter-oval mesh kept visible under internal construction steps. */
+function setFanQuarterOvalBaseMesh(pipeline: TeddyPipelineMeshes): boolean {
+  const fanFinal = fanQuarterOvalFinalStep(pipeline);
+  if (!fanFinal || fanFinal.faces.length === 0) return false;
+  sceneView.setMesh(
+    { vertices: fanFinal.vertices, faces: fanFinal.faces },
+    {
+      faceColors: fanFinal.faces.map(() => DEBUG_MESH_QUARTER_OVAL),
+      wireColor: 0x4a4a48,
+      opacity: 0.62,
+    }
+  );
+  return true;
+}
+
+/** Flat elevated fan wedges from the fan-elevation phase (shown under quarter-oval steps). */
+function allFanElevationFaces(pipeline: TeddyPipelineMeshes): [number, number, number][] {
+  const fanSteps = pipeline.fanElevationSteps;
+  if (fanSteps.length === 0) return [];
+  return fanSteps[fanSteps.length - 1].faces.map(
+    (f) => [...f] as [number, number, number]
+  );
+}
+
+/** Flat internal chord wedges from the internal-elevation phase (shown under internal quarter ovals). */
+function allInternalFlatElevationFaces(
+  pipeline: TeddyPipelineMeshes
+): [number, number, number][] {
+  const steps = pipeline.internalFlatElevationSteps;
+  if (steps.length === 0) return [];
+  return steps[steps.length - 1].faces.map(
+    (f) => [...f] as [number, number, number]
+  );
+}
+
+function showQuarterOvalStep(index: number): void {
+  if (!pipelineMeshes) return;
+  const steps = pipelineMeshes.quarterOvalSteps;
+  if (index >= steps.length) {
+    if (pipelineMeshes.internalFlatElevationSteps.length > 0) {
+      showInternalFlatElevationStep(0);
+    } else {
+      advanceAfterQuarterOvals();
+    }
+    return;
+  }
+
+  inflationStep = 'quarterOval';
+  quarterOvalStepIndex = index;
+  internalFlatElevationStepIndex = 0;
+  const step = steps[index];
+
+  const fanFaces = allFanElevationFaces(pipelineMeshes);
+  const highlight = new Set(step.highlightFaceIndices);
+  const faceColors = step.faces.map((_, fi) =>
+    highlight.has(fi) ? DEBUG_MESH_QUARTER_OVAL : DEBUG_MESH_BASE
+  );
+
+  // Base: flat elevated fan wedges. Overlay: quarter-oval stitches (renderOrder above base).
+  if (fanFaces.length > 0) {
+    sceneView.setMesh(
+      { vertices: step.vertices, faces: fanFaces },
+      {
+        color: FAN_TERMINAL_COLOR,
+        wireColor: 0x2d5c2d,
+        opacity: 0.68,
+      }
+    );
+    sceneView.setSecondaryMesh(
+      { vertices: step.vertices, faces: step.faces },
+      { faceColors, wireColor: 0x4a4a48 }
+    );
+  } else {
+    sceneView.clearSecondaryMesh();
+    sceneView.setMesh(
+      { vertices: step.vertices, faces: step.faces },
+      { faceColors, wireColor: 0x4a4a48 }
+    );
+  }
+  sceneView.setSpineOverlay(
+    step.vertices,
+    pipelineMeshes.spineSegments,
+    { showHeights: true, showVertexIds: true, onSurface: false }
+  );
+  sceneView.setQuarterOvalDebugOverlay(step.vertices, step);
+  setStatus(quarterOvalStepStatus(step, steps.length));
+  updateDebugActions();
+}
+
+function showInternalFlatElevationStep(index: number): void {
+  if (!pipelineMeshes) return;
+  const steps = pipelineMeshes.internalFlatElevationSteps;
+  if (index >= steps.length) {
+    if (pipelineMeshes.internalQuarterOvalSteps.length > 0) {
+      showInternalQuarterOvalStep(0);
+    } else {
+      advanceAfterQuarterOvals();
+    }
+    return;
+  }
+
+  inflationStep = 'internalFlatElevation';
+  internalFlatElevationStepIndex = index;
+  internalQuarterOvalStepIndex = 0;
+  const step = steps[index];
+
+  sceneView.clearSecondaryMesh();
+
+  const faceColors = step.faces.map((_, fi) =>
+    fi === step.activeFaceIndex ? DEBUG_MESH_ACTIVE : DEBUG_INTERNAL_FLAT
+  );
+
+  if (setFanQuarterOvalBaseMesh(pipelineMeshes)) {
+    sceneView.setSecondaryMesh(
+      { vertices: step.vertices, faces: step.faces },
+      { faceColors, wireColor: 0x4a4a48 }
+    );
+  } else {
+    sceneView.setMesh(
+      { vertices: step.vertices, faces: step.faces },
+      { faceColors, wireColor: 0x4a4a48 }
+    );
+  }
+
+  sceneView.setSpineOverlay(
+    step.vertices,
+    pipelineMeshes.spineSegments,
+    { showHeights: true, showVertexIds: true, onSurface: false }
+  );
+  sceneView.setFanElevationDebugOverlay(step.vertices, step);
+  setStatus(internalFlatElevationStepStatus(step, steps.length));
+  updateDebugActions();
+}
+
+function showInternalQuarterOvalStep(index: number): void {
+  if (!pipelineMeshes) return;
+  const steps = pipelineMeshes.internalQuarterOvalSteps;
+  if (index >= steps.length) {
+    advanceAfterQuarterOvals();
+    return;
+  }
+
+  inflationStep = 'internalQuarterOval';
+  internalQuarterOvalStepIndex = index;
+  const step = steps[index];
+
+  const internalFlatFaces = allInternalFlatElevationFaces(pipelineMeshes);
+  const highlight = new Set(step.highlightFaceIndices);
+  const combinedFaces = [
+    ...internalFlatFaces,
+    ...step.faces.map((f) => [...f] as [number, number, number]),
+  ];
+  const combinedFaceColors = [
+    ...internalFlatFaces.map(() => DEBUG_INTERNAL_FLAT),
+    ...step.faces.map((_, fi) =>
+      highlight.has(fi) ? DEBUG_INTERNAL_QUARTER_OVAL : DEBUG_MESH_BASE
+    ),
+  ];
+
+  const hasFanBase = setFanQuarterOvalBaseMesh(pipelineMeshes);
+  if (hasFanBase && combinedFaces.length > 0) {
+    sceneView.setSecondaryMesh(
+      { vertices: step.vertices, faces: combinedFaces },
+      { faceColors: combinedFaceColors, wireColor: 0x4a4a48 }
+    );
+  } else if (combinedFaces.length > 0) {
+    sceneView.clearSecondaryMesh();
+    sceneView.setMesh(
+      { vertices: step.vertices, faces: combinedFaces },
+      { faceColors: combinedFaceColors, wireColor: 0x4a4a48 }
+    );
+  } else if (!hasFanBase) {
+    sceneView.clearSecondaryMesh();
+    sceneView.setMesh(
+      { vertices: step.vertices, faces: step.faces },
+      {
+        faceColors: step.faces.map((_, fi) =>
+          highlight.has(fi) ? DEBUG_INTERNAL_QUARTER_OVAL : DEBUG_MESH_BASE
+        ),
+        wireColor: 0x4a4a48,
+      }
+    );
+  } else {
+    sceneView.clearSecondaryMesh();
+  }
+
+  sceneView.setSpineOverlay(
+    step.vertices,
+    pipelineMeshes.spineSegments,
+    { showHeights: true, showVertexIds: true, onSurface: false }
+  );
+  sceneView.setQuarterOvalDebugOverlay(step.vertices, step);
+  setStatus(internalQuarterOvalStepStatus(step, steps.length));
+  updateDebugActions();
+}
+
+function showCompleteTopStep(): void {
+  if (!pipelineMeshes) return;
+  inflationStep = 'completeTop';
+  sceneView.clearSecondaryMesh();
+  sceneView.setMesh(pipelineMeshes.inflatedTop, {
+    color: INFLATED_COLOR,
+    flatShading: true,
+  });
+  sceneView.setSpineOverlay(
+    pipelineMeshes.inflatedTop.vertices,
+    pipelineMeshes.spineSegments,
+    { showHeights: true, showVertexIds: true, onSurface: false }
+  );
+  setStatus(
+    `§5.2 complete top surface (${pipelineMeshes.inflatedTop.faces.length} triangles) — next: mirrored solid (paper §5.1)`
+  );
+  updateDebugActions();
+}
+
+function showMirroredSolidStep(): void {
+  if (!pipelineMeshes) return;
+  inflationStep = 'mirroredSolid';
+  sceneView.clearSpineOverlay();
+  sceneView.clearSecondaryMesh();
+  sceneView.setMesh(pipelineMeshes.inflated, {
+    color: INFLATED_COLOR,
+    flatShading: true,
+  });
+  setStatus(
+    `§5.1 mirrored solid (${pipelineMeshes.inflated.faces.length} triangles, top + bottom)`
+  );
   updateDebugActions();
 }
 
@@ -722,6 +1111,24 @@ btnSkipElevation.addEventListener('click', () => {
   showElevatedStep();
 });
 
+btnSkipFan.addEventListener('click', () => {
+  if (!pipelineMeshes || !isDebugMode()) return;
+  if (
+    inflationStep !== 'elevated' &&
+    inflationStep !== 'fanElevation' &&
+    inflationStep !== 'quarterOval'
+  ) {
+    return;
+  }
+  skipFanConstruction();
+});
+
+btnSkipResult.addEventListener('click', () => {
+  if (!pipelineMeshes || !isDebugMode()) return;
+  if (!inflationPipelineActive()) return;
+  showInflatedStep();
+});
+
 btnNext.addEventListener('click', () => {
   if (isDebugMode() && !inflationPipelineActive() && isCutDebugActive()) {
     advanceCutDebugStep();
@@ -753,6 +1160,30 @@ btnNext.addEventListener('click', () => {
       showElevationStep(elevationStepIndex + 1);
       break;
     case 'elevated':
+      if ((pipelineMeshes.fanElevationSteps.length ?? 0) > 0) {
+        showFanElevationStep(0);
+      } else if ((pipelineMeshes.quarterOvalSteps.length ?? 0) > 0) {
+        showQuarterOvalStep(0);
+      } else {
+        advanceAfterQuarterOvals();
+      }
+      break;
+    case 'fanElevation':
+      showFanElevationStep(fanElevationStepIndex + 1);
+      break;
+    case 'quarterOval':
+      showQuarterOvalStep(quarterOvalStepIndex + 1);
+      break;
+    case 'internalFlatElevation':
+      showInternalFlatElevationStep(internalFlatElevationStepIndex + 1);
+      break;
+    case 'internalQuarterOval':
+      showInternalQuarterOvalStep(internalQuarterOvalStepIndex + 1);
+      break;
+    case 'completeTop':
+      showMirroredSolidStep();
+      break;
+    case 'mirroredSolid':
       showInflatedStep();
       break;
     default:

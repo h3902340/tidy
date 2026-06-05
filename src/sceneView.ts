@@ -17,7 +17,13 @@ import {
   type ExtrusionBase,
 } from './extrude';
 import { CLOSE_TOLERANCE, closeStroke } from './stroke';
-import { createSketchMaterials, PAPER_COLOR, type SketchMaterials } from './sketchShader';
+import { createDoubleSidedPhongMaterial } from './doubleSidedPhong';
+import {
+  createSketchMaterials,
+  LIGHT_VIEW_DIR,
+  PAPER_COLOR,
+  type SketchMaterials,
+} from './sketchShader';
 import { SurfacePainter } from './surfacePaint';
 import {
   pointInSemicircle,
@@ -25,7 +31,12 @@ import {
   type Vec2,
   type Vec3,
 } from './math';
-import type { SpineElevationDebugStep, TerminalPruneDebugStep } from './zeyapInflation';
+import type {
+  FanElevationDebugStep,
+  QuarterOvalDebugStep,
+  SpineElevationDebugStep,
+  TerminalPruneDebugStep,
+} from './zeyapInflation';
 import { SPINE_ELEVATION_FACTOR } from './zeyapInflation';
 
 export type DisplayMode = 'solid' | 'wireframe' | 'both';
@@ -99,8 +110,6 @@ export interface MeshDisplayOptions {
 
 const DEFAULT_MESH_COLOR = 0xffffff;
 const DEFAULT_WIRE_COLOR = 0x2d4a63;
-/** Render both sides so occasional inverted inflation triangles stay visible. */
-const MESH_MATERIAL_SIDE = THREE.DoubleSide;
 const SPINE_LINE_COLOR = 0x000000;
 /** World-space radius for spine tube meshes. Thin, so midpoint dots stay legible. */
 const SPINE_TUBE_RADIUS = 0.4;
@@ -126,6 +135,14 @@ const ELEVATION_LABEL_OUTWARD = 9;
 const ELEVATION_LABEL_STAGGER = 13;
 /** Point on each spoke where the leader line attaches (0 = spine, 1 = target). */
 const ELEVATION_EDGE_ANCHOR_T = 0.78;
+
+const FAN_ELEVATION_SPINE_COLOR = 0x0077b6;
+const FAN_ELEVATION_BOUNDARY_COLOR = 0x2a9d8f;
+const QUARTER_OVAL_SPOKE_COLOR = 0xe85d04;
+const QUARTER_OVAL_ARC_COLOR = 0xf4a261;
+const QUARTER_OVAL_BOUNDARY_COLOR = 0x2a9d8f;
+const QUARTER_OVAL_LINE_RADIUS = 0.3;
+const QUARTER_OVAL_DOT_RADIUS = 1.1;
 /** Fig. 14 semicircle sweep during terminal-prune debug stepping. */
 const PRUNE_SEMICIRCLE_COLOR = 0xd62828;
 const PRUNE_SEMICIRCLE_LIFT_Z = 0.6;
@@ -208,6 +225,10 @@ export class SceneView {
   private loopCutMeshBeforeCut: Mesh3D | null = null;
   private sketchMode = false;
   private sketchMaterials: SketchMaterials | null = null;
+  /** Key light — repositioned each frame to stay fixed relative to the camera. */
+  private keyLight: THREE.DirectionalLight;
+  private readonly keyLightOffset = new THREE.Vector3();
+  private readonly keyLightScratch = new THREE.Vector3();
   private outlineMesh: THREE.Mesh | null = null;
   /** Texture painter for the current main mesh (built for paint-capable, non-preview meshes). */
   private painter: SurfacePainter | null = null;
@@ -285,11 +306,13 @@ export class SceneView {
     });
 
     // Bright, fairly even lighting so a white surface actually reads white (with gentle form
-    // shading) and painted colours stay close to the picked colour.
+    // shading) and painted colours stay close to the picked colour. The key light follows the
+    // camera (same view-space direction as the sketch shader) so lit/shadow sides change as you orbit.
     const ambient = new THREE.AmbientLight(0xffffff, 0.85);
-    const dir = new THREE.DirectionalLight(0xffffff, 0.45);
-    dir.position.set(120, 200, 180);
-    this.scene.add(ambient, dir);
+    this.keyLight = new THREE.DirectionalLight(0xffffff, 0.45);
+    this.keyLightOffset.copy(LIGHT_VIEW_DIR).negate().normalize().multiplyScalar(200);
+    this.scene.add(ambient, this.keyLight);
+    this.scene.add(this.keyLight.target);
 
     const grid = new THREE.GridHelper(400, 20, 0xccc8c0, 0xe8e4dc);
     grid.rotation.x = Math.PI / 2;
@@ -1403,10 +1426,20 @@ export class SceneView {
     }
   }
 
+  /** Keep the Phong key light in the same view-space direction as the sketch stipple shader. */
+  private updateCameraRelativeLighting(): void {
+    this.keyLightScratch
+      .copy(this.keyLightOffset)
+      .applyQuaternion(this.camera.quaternion);
+    this.keyLight.position.copy(this.camera.position).add(this.keyLightScratch);
+    this.keyLight.target.position.copy(this.controls.target);
+  }
+
   private animate = (): void => {
     requestAnimationFrame(this.animate);
     if (!this.container.classList.contains('hidden')) {
       this.controls.update();
+      this.updateCameraRelativeLighting();
       if (this.sketchMode && this.sketchMaterials) {
         this.sketchMaterials.update(this.camera, this.renderer);
       }
@@ -2015,6 +2048,152 @@ export class SceneView {
     }
   }
 
+  /** Active fan-wedge spokes; call after `setSpineOverlay` (does not clear spine). */
+  setFanElevationDebugOverlay(
+    vertices: Vec3[],
+    step: FanElevationDebugStep
+  ): void {
+    const overlayOrder = 2;
+    const up = new THREE.Vector3(0, 1, 0);
+    const dir = new THREE.Vector3();
+    const lineMaterial = new THREE.MeshBasicMaterial({
+      color: FAN_ELEVATION_SPINE_COLOR,
+      depthTest: true,
+      depthWrite: false,
+    });
+
+    const addLine = (a: Vec3, b: Vec3, color = FAN_ELEVATION_SPINE_COLOR): void => {
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const dz = b.z - a.z;
+      const len = Math.hypot(dx, dy, dz);
+      if (len < 1e-6) return;
+      const material =
+        color === FAN_ELEVATION_SPINE_COLOR
+          ? lineMaterial
+          : new THREE.MeshBasicMaterial({
+              color,
+              depthTest: true,
+              depthWrite: false,
+            });
+      const geometry = new THREE.CylinderGeometry(
+        ELEVATION_LINE_RADIUS,
+        ELEVATION_LINE_RADIUS,
+        len,
+        6,
+        1,
+        false
+      );
+      const tube = new THREE.Mesh(geometry, material);
+      tube.position.set((a.x + b.x) / 2, (a.y + b.y) / 2, (a.z + b.z) / 2);
+      dir.set(dx / len, dy / len, dz / len);
+      tube.quaternion.setFromUnitVectors(up, dir);
+      tube.renderOrder = overlayOrder;
+      this.spineLinesGroup.add(tube);
+    };
+
+    const addDot = (v: Vec3, color: number, radius: number, label?: string): void => {
+      const material = new THREE.MeshBasicMaterial({
+        color,
+        depthTest: true,
+        depthWrite: false,
+      });
+      const dot = new THREE.Mesh(new THREE.SphereGeometry(radius, 10, 8), material);
+      dot.position.set(v.x, v.y, v.z);
+      dot.renderOrder = overlayOrder + 1;
+      this.spineLinesGroup.add(dot);
+      if (label) {
+        const sprite = this.makeTextSprite(label, 7);
+        sprite.position.set(v.x, -v.y + 8, v.z + 4);
+        sprite.renderOrder = SPINE_LABEL_RENDER_ORDER;
+        this.spineLabelGroup.add(sprite);
+      }
+    };
+
+    const spineIds = new Set<number>();
+    for (const [spineId] of step.spineEdges) spineIds.add(spineId);
+
+    for (const [spineId, exteriorId] of step.spineEdges) {
+      const spine = vertices[spineId];
+      const exterior = vertices[exteriorId];
+      const boundary = { x: exterior.x, y: exterior.y, z: 0 };
+      addLine(spine, boundary, FAN_ELEVATION_SPINE_COLOR);
+      addDot(spine, FAN_ELEVATION_SPINE_COLOR, ELEVATION_ACTIVE_SPINE_RADIUS, `z=${spine.z.toFixed(1)}`);
+      addDot(boundary, FAN_ELEVATION_BOUNDARY_COLOR, ELEVATION_EXTERIOR_RADIUS);
+    }
+
+    for (const vid of step.vertIds) {
+      if (spineIds.has(vid)) continue;
+      const v = vertices[vid];
+      addDot({ x: v.x, y: v.y, z: 0 }, FAN_ELEVATION_BOUNDARY_COLOR, ELEVATION_EXTERIOR_RADIUS * 0.85);
+    }
+  }
+
+  /** Quarter-oval spokes and arc control points for one fan wedge (paper §5.2). */
+  /** Quarter-oval spokes for one wedge; call after `setSpineOverlay` (does not clear spine). */
+  setQuarterOvalDebugOverlay(
+    vertices: Vec3[],
+    step: QuarterOvalDebugStep
+  ): void {
+    const overlayOrder = 2;
+    const up = new THREE.Vector3(0, 1, 0);
+    const dir = new THREE.Vector3();
+
+    const addLine = (a: Vec3, b: Vec3, color: number, radius = QUARTER_OVAL_LINE_RADIUS): void => {
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const dz = b.z - a.z;
+      const len = Math.hypot(dx, dy, dz);
+      if (len < 1e-6) return;
+      const material = new THREE.MeshBasicMaterial({
+        color,
+        depthTest: true,
+        depthWrite: false,
+      });
+      const geometry = new THREE.CylinderGeometry(radius, radius, len, 6, 1, false);
+      const tube = new THREE.Mesh(geometry, material);
+      tube.position.set((a.x + b.x) / 2, (a.y + b.y) / 2, (a.z + b.z) / 2);
+      dir.set(dx / len, dy / len, dz / len);
+      tube.quaternion.setFromUnitVectors(up, dir);
+      tube.renderOrder = overlayOrder;
+      this.spineLinesGroup.add(tube);
+    };
+
+    const addDot = (v: Vec3, color: number): void => {
+      const material = new THREE.MeshBasicMaterial({
+        color,
+        depthTest: true,
+        depthWrite: false,
+      });
+      const dot = new THREE.Mesh(
+        new THREE.SphereGeometry(QUARTER_OVAL_DOT_RADIUS, 10, 8),
+        material
+      );
+      dot.position.set(v.x, v.y, v.z);
+      dot.renderOrder = overlayOrder + 1;
+      this.spineLinesGroup.add(dot);
+    };
+
+    for (const spoke of step.spokes) {
+      for (let i = 0; i < spoke.length - 1; i++) {
+        const a = vertices[spoke[i]];
+        const b = vertices[spoke[i + 1]];
+        const color = i === 0 || i === 3 ? QUARTER_OVAL_SPOKE_COLOR : QUARTER_OVAL_ARC_COLOR;
+        addLine(a, b, color);
+      }
+      for (let i = 0; i < spoke.length; i++) {
+        const v = vertices[spoke[i]];
+        const color =
+          i === 0
+            ? FAN_ELEVATION_SPINE_COLOR
+            : i === spoke.length - 1
+              ? QUARTER_OVAL_BOUNDARY_COLOR
+              : QUARTER_OVAL_ARC_COLOR;
+        addDot(v, color);
+      }
+    }
+  }
+
   clearSecondaryMesh(): void {
     if (this.secondaryMeshObject) {
       this.scene.remove(this.secondaryMeshObject);
@@ -2038,10 +2217,9 @@ export class SceneView {
     const built = this.buildMeshGeometry(mesh, options);
     const opacity = options.opacity ?? 1;
 
-    const material = new THREE.MeshPhongMaterial({
+    const material = createDoubleSidedPhongMaterial({
       color: built.useFaceColors ? 0xffffff : (options.color ?? DEFAULT_MESH_COLOR),
       vertexColors: built.useFaceColors,
-      side: MESH_MATERIAL_SIDE,
       flatShading: built.useFaceColors,
       transparent: opacity < 1,
       opacity,
@@ -2166,10 +2344,9 @@ export class SceneView {
     if (useFaceColors) {
       const built = this.buildMeshGeometry(mesh, options);
       geometry = built.geometry;
-      material = new THREE.MeshPhongMaterial({
+      material = createDoubleSidedPhongMaterial({
         color: 0xffffff,
         vertexColors: true,
-        side: MESH_MATERIAL_SIDE,
         flatShading: true,
         shininess: 30,
         polygonOffset: true,

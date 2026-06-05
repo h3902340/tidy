@@ -20,6 +20,7 @@
  * brush queries are in render/world space (x, -y, z) to match camera raycasts.
  */
 import * as THREE from 'three';
+import { applyDoubleSidedLightingFix } from './doubleSidedPhong';
 import type { Mesh3D } from './teddyPipeline';
 
 const MAX_ATLAS_PX = 2048; // keep getImageData()/putImageData() per stroke affordable
@@ -222,6 +223,7 @@ export class SurfacePainter {
       polygonOffsetFactor: 1,
       polygonOffsetUnits: 1,
     });
+    applyDoubleSidedLightingFix(this.material);
   }
 
   paintStroke(points: THREE.Vector3[], radii: number[], colorHex: number): void {

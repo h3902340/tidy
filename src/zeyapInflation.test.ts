@@ -2,6 +2,10 @@ import { describe, expect, it } from 'vitest';
 import { constrainedDelaunay } from './cdt';
 import {
   applySpineElevation,
+  buildFanElevationDebugSteps,
+  buildInternalFlatElevationDebugSteps,
+  buildInternalQuarterOvalDebugSteps,
+  buildQuarterOvalDebugSteps,
   buildSpineElevationDebugSteps,
   buildTerminalPruneDebugSteps,
   cdtToZeyapTriangles,
@@ -150,7 +154,7 @@ describe('terminal fan pruning', () => {
     void topLeftVid;
   });
 
-  it('open junction triangle: centroid splits into interior wedges', () => {
+  it('open junction triangle: hub splits into interior wedges along each edge', () => {
     const polygon = normalizePolygon(unitSquare);
     const { triangles } = constrainedDelaunay(polygon);
     const jCount = triangles.filter((t) => t.type === 'J').length;
@@ -160,15 +164,8 @@ describe('terminal fan pruning', () => {
     const verts = polygon.map((p) => vec3(p.x, p.y, 0));
     const { wedges } = pruneToWedges(zeyap, [...verts]);
 
-    const jTriId = zeyap.findIndex((t) => t.type === 'J');
-    const jVerts = new Set(zeyap[jTriId].vertIds);
-    const centroidWedges = wedges.filter(
-      (w) =>
-        !w.fromTerminalPrune &&
-        w.vertIds.filter((v) => jVerts.has(v)).length >= 2
-    );
-
-    expect(centroidWedges.length).toBeGreaterThanOrEqual(1);
+    const interiorWedges = wedges.filter((w) => !w.fromTerminalPrune);
+    expect(interiorWedges.length).toBeGreaterThanOrEqual(1);
   });
 
   it('terminal prune debug steps include semicircle advance and fan frames', () => {
@@ -329,6 +326,106 @@ describe('terminal fan pruning', () => {
     }
   });
 
+  it('circle: every sleeve/junction CDT triangle has wedge coverage', () => {
+    const segments = 64;
+    const r = 100;
+    const ring: { x: number; y: number }[] = [];
+    for (let i = 0; i <= segments; i++) {
+      const t = (i / segments) * Math.PI * 2;
+      ring.push({ x: Math.cos(t) * r, y: Math.sin(t) * r });
+    }
+    const polygon = normalizePolygon(ring);
+    const { triangles } = constrainedDelaunay(polygon);
+    const zeyap = cdtToZeyapTriangles(triangles);
+    const verts = polygon.map((p) => vec3(p.x, p.y, 0));
+    const { wedges } = pruneToWedges(zeyap, verts);
+
+    for (let ti = 0; ti < zeyap.length; ti++) {
+      const tri = zeyap[ti];
+      if (tri.type !== 'S' && tri.type !== 'J') continue;
+      const tv = new Set(tri.vertIds);
+      const hit = wedges.some(
+        (w) => w.vertIds.filter((v) => tv.has(v)).length >= 2
+      );
+      expect(hit, `missing wedges for ${tri.type} triangle ${ti}`).toBe(true);
+    }
+  });
+
+  it('circle: chordal axis segments are edges in the sleeve wedge mesh', () => {
+    const segments = 64;
+    const r = 100;
+    const ring: { x: number; y: number }[] = [];
+    for (let i = 0; i <= segments; i++) {
+      const t = (i / segments) * Math.PI * 2;
+      ring.push({ x: Math.cos(t) * r, y: Math.sin(t) * r });
+    }
+    const polygon = normalizePolygon(ring);
+    const { triangles } = constrainedDelaunay(polygon);
+    const zeyap = cdtToZeyapTriangles(triangles);
+    const verts = polygon.map((p) => vec3(p.x, p.y, 0));
+    const { wedges, axisSegments } = pruneToWedges(zeyap, verts);
+    const bc = polygon.length;
+
+    const meshEdge = (a: number, b: number) =>
+      a < b ? `${a}_${b}` : `${b}_${a}`;
+    const meshEdges = new Set<string>();
+    for (const w of wedges) {
+      const [a, b, c] = w.vertIds;
+      meshEdges.add(meshEdge(a, b));
+      meshEdges.add(meshEdge(b, c));
+      meshEdges.add(meshEdge(a, c));
+    }
+
+    let covered = 0;
+    for (const [a, b] of axisSegments) {
+      if (a < bc || b < bc) continue;
+      if (meshEdges.has(meshEdge(a, b))) covered++;
+    }
+    expect(covered).toBeGreaterThan(0);
+    expect(covered / axisSegments.length).toBeGreaterThan(0.4);
+  });
+
+  it('circle: interior sleeve wedges inflate without flat troughs', () => {
+    const segments = 64;
+    const r = 100;
+    const ring: { x: number; y: number }[] = [];
+    for (let i = 0; i <= segments; i++) {
+      const t = (i / segments) * Math.PI * 2;
+      ring.push({ x: Math.cos(t) * r, y: Math.sin(t) * r });
+    }
+    const polygon = normalizePolygon(ring);
+    const { meshes } = buildTeddyPipeline(polygon);
+    expect(meshes).not.toBeNull();
+
+    const verts = meshes!.elevatedSpineVertices;
+    const faces = meshes!.fan.faces;
+    let subdivElevated = 0;
+    let subdivFlat = 0;
+    for (const [a, b, c] of faces) {
+      const maxZ = Math.max(verts[a].z, verts[b].z, verts[c].z);
+      const allBoundary =
+        a < polygon.length && b < polygon.length && c < polygon.length;
+      if (allBoundary) continue;
+      if (maxZ > 0.5) subdivElevated++;
+      else subdivFlat++;
+    }
+    expect(subdivElevated).toBeGreaterThan(subdivFlat);
+
+    const inf = meshes!.inflated;
+    const topCount = inf.vertices.length / 2;
+    let infElevated = 0;
+    for (const [a, b, c] of inf.faces) {
+      if (a >= topCount || b >= topCount || c >= topCount) continue;
+      const maxZ = Math.max(
+        inf.vertices[a].z,
+        inf.vertices[b].z,
+        inf.vertices[c].z
+      );
+      if (maxZ > 0.5) infElevated++;
+    }
+    expect(infElevated).toBeGreaterThan(meshes!.fan.faces.length);
+  });
+
   it('circle: interior-edge mid on axis uses nearest boundary neighbors, not propagate', () => {
     const segments = 64;
     const r = 100;
@@ -341,9 +438,14 @@ describe('terminal fan pruning', () => {
     const { meshes } = buildTeddyPipeline(polygon);
     expect(meshes).not.toBeNull();
 
-    const step = meshes!.spineElevationSteps.find((s) => s.spineId === 152);
+    const step = meshes!.spineElevationSteps.find(
+      (s) =>
+        s.kind === 'direct' &&
+        s.exteriorIds.length === 2 &&
+        s.exteriorIds.includes(3) &&
+        s.exteriorIds.includes(71)
+    );
     expect(step).toBeDefined();
-    expect(step!.kind).toBe('direct');
     expect(step!.exteriorIds).toEqual([3, 71]);
     expect(step!.neighborSpineIds).toEqual([]);
   });
@@ -412,6 +514,114 @@ describe('terminal fan pruning', () => {
     for (const step of result.meshes!.spineElevationSteps) {
       expect(spineNodes.has(step.spineId)).toBe(true);
     }
+  });
+
+  it('buildTeddyPipeline exposes fan elevation and quarter-oval debug steps', () => {
+    const result = buildTeddyPipeline(normalizePolygon(unitSquare));
+    expect(result.meshes).not.toBeNull();
+
+    const { fanElevationSteps, quarterOvalSteps, fan } = result.meshes!;
+    expect(fanElevationSteps.length).toBeGreaterThan(0);
+    expect(fanElevationSteps.length).toBeLessThanOrEqual(fan.faces.length);
+    expect(quarterOvalSteps.length).toBe(fanElevationSteps.length);
+
+    for (let i = 0; i < fanElevationSteps.length; i++) {
+      expect(fanElevationSteps[i].faces.length).toBe(i + 1);
+      expect(fanElevationSteps[i].activeFaceIndex).toBe(i);
+    }
+
+    for (let i = 0; i < quarterOvalSteps.length; i++) {
+      expect(quarterOvalSteps[i].faces.length).toBeGreaterThanOrEqual(i + 1);
+      expect(quarterOvalSteps[i].highlightFaceIndices.length).toBeGreaterThan(0);
+    }
+
+    const lastOval = quarterOvalSteps[quarterOvalSteps.length - 1];
+    expect(lastOval.faces.length).toBeGreaterThan(fanElevationSteps.length);
+  });
+
+  it('circle: spine branch corners get adjacent chord wedges without diagonals', () => {
+    const segments = 64;
+    const r = 100;
+    const ring: { x: number; y: number }[] = [];
+    for (let i = 0; i <= segments; i++) {
+      const t = (i / segments) * Math.PI * 2;
+      ring.push({ x: Math.cos(t) * r, y: Math.sin(t) * r });
+    }
+    const polygon = normalizePolygon(ring);
+    const { triangles } = constrainedDelaunay(polygon);
+    const zeyap = cdtToZeyapTriangles(triangles);
+    const verts = polygon.map((p) => vec3(p.x, p.y, 0));
+    const { wedges, axisSegments } = pruneToWedges(zeyap, verts);
+    const bc = polygon.length;
+
+    const hasChord = (a: number, b: number, corner: number) =>
+      wedges.some((w) => {
+        const sp = w.vertIds.filter((v) => v >= bc).sort((x, y) => x - y);
+        const bd = w.vertIds.filter((v) => v < bc);
+        return (
+          !w.fromTerminalPrune &&
+          sp.length === 2 &&
+          bd.length === 1 &&
+          sp[0] === Math.min(a, b) &&
+          sp[1] === Math.max(a, b) &&
+          bd[0] === corner
+        );
+      });
+
+    const axisEdge = (a: number, b: number) =>
+      axisSegments.some(([u, v]) => (u === a && v === b) || (u === b && v === a));
+
+    expect(hasChord(91, 92, 71)).toBe(true);
+    expect(hasChord(94, 95, 71)).toBe(true);
+    expect(hasChord(91, 92, 8)).toBe(true);
+    expect(hasChord(94, 95, 29)).toBe(true);
+    expect(hasChord(93, 94, 29)).toBe(false);
+
+    const chordWedges = wedges.filter((w) => {
+      const sp = w.vertIds.filter((v) => v >= bc);
+      const bd = w.vertIds.filter((v) => v < bc);
+      return !w.fromTerminalPrune && sp.length === 2 && bd.length === 1;
+    });
+    expect(chordWedges.length).toBe(48);
+    for (const w of chordWedges) {
+      const [a, b] = w.vertIds.filter((v) => v >= bc);
+      expect(axisEdge(a!, b!)).toBe(true);
+    }
+  });
+
+  it('circle: inflation uses quarter ovals for terminal and internal chords', () => {
+    const segments = 64;
+    const r = 100;
+    const ring: { x: number; y: number }[] = [];
+    for (let i = 0; i <= segments; i++) {
+      const t = (i / segments) * Math.PI * 2;
+      ring.push({ x: Math.cos(t) * r, y: Math.sin(t) * r });
+    }
+    const polygon = normalizePolygon(ring);
+    const { meshes } = buildTeddyPipeline(polygon);
+    expect(meshes).not.toBeNull();
+
+    const {
+      fan,
+      fanElevationSteps,
+      quarterOvalSteps,
+      internalFlatElevationSteps,
+      internalQuarterOvalSteps,
+      terminalFans,
+    } = meshes!;
+    expect(fanElevationSteps.length).toBe(terminalFans.faces.length);
+    expect(quarterOvalSteps.length).toBe(terminalFans.faces.length);
+    expect(internalFlatElevationSteps.length).toBe(48);
+    expect(internalQuarterOvalSteps.length).toBe(48);
+    expect(fanElevationSteps.length).toBeLessThan(fan.faces.length);
+    for (const step of internalQuarterOvalSteps) {
+      expect(step.highlightFaceIndices.length).toBeGreaterThan(0);
+      expect(step.spokes.length).toBe(2);
+    }
+    const { inflatedTop, inflated } = meshes!;
+    expect(inflatedTop.faces.length).toBeGreaterThan(fan.faces.length);
+    expect(inflated.faces.length).toBeGreaterThan(inflatedTop.faces.length);
+    expect(inflated.faces.length).toBe(inflatedTop.faces.length * 2);
   });
 
   it('buildTeddyPipeline resampled square: terminal fans cover all T triangles', () => {

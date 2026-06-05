@@ -152,6 +152,110 @@ function addSpineNeighbor(
   }
 }
 
+/**
+ * Fig. 13f / 15: triangulate an interior edge from an inbound spine vertex to its endpoints.
+ * The inbound–mid edge becomes a spine edge in the wedge mesh for quarter-oval sewing.
+ */
+function addInteriorEdgeWedges(
+  inboundSpine: number,
+  e0: number,
+  e1: number,
+  resolveMid: (a: number, b: number) => number,
+  prunedTriangles: PrunedWedge[],
+  interiorVerts: Map<number, Map<number, number[]>>
+): number {
+  const midIdx = resolveMid(e0, e1);
+  if (inboundSpine === midIdx) return midIdx;
+
+  prunedTriangles.push({
+    vertIds: [inboundSpine, midIdx, e0],
+    spineEdges: [
+      [inboundSpine, e0],
+      [midIdx, e0],
+    ],
+    fromTerminalPrune: false,
+  });
+  addSpineNeighbor(interiorVerts, inboundSpine, e0);
+  addSpineNeighbor(interiorVerts, midIdx, e0);
+
+  prunedTriangles.push({
+    vertIds: [inboundSpine, midIdx, e1],
+    spineEdges: [
+      [inboundSpine, e1],
+      [midIdx, e1],
+    ],
+    fromTerminalPrune: false,
+  });
+  addSpineNeighbor(interiorVerts, inboundSpine, e1);
+  addSpineNeighbor(interiorVerts, midIdx, e1);
+
+  return midIdx;
+}
+
+/** J triangle: mid-to-mid chords along the spine perimeter become wedge edges. */
+function addJunctionMidChordWedges(
+  triangle: ZeyapTriangle,
+  resolveMid: (a: number, b: number) => number,
+  prunedTriangles: PrunedWedge[],
+  interiorVerts: Map<number, Map<number, number[]>>,
+  hasAxisEdgeFn: (a: number, b: number) => boolean
+): void {
+  const edges = triangle.interiorEdges;
+  if (edges.length < 2) return;
+
+  const mids = edges.map(([a, b]) => resolveMid(a, b));
+
+  const pushChord = (m0: number, m1: number, shared: number): void => {
+    if (m0 === m1 || !hasAxisEdgeFn(m0, m1)) return;
+    prunedTriangles.push({
+      vertIds: [m0, m1, shared],
+      spineEdges: [
+        [m0, shared],
+        [m1, shared],
+      ],
+      fromTerminalPrune: false,
+    });
+    addSpineNeighbor(interiorVerts, m0, shared);
+    addSpineNeighbor(interiorVerts, m1, shared);
+  };
+
+  if (edges.length === 2) {
+    const [e0, e1] = edges;
+    const shared = e0.find((v) => e1.includes(v));
+    if (shared !== undefined) {
+      pushChord(mids[0]!, mids[1]!, shared);
+    }
+    return;
+  }
+
+  for (let i = 0; i < edges.length; i++) {
+    const edgeSet = new Set(edges[i]);
+    const shared = triangle.vertIds.find((v) => !edgeSet.has(v));
+    if (shared === undefined) continue;
+    pushChord(mids[i]!, mids[(i + 1) % mids.length]!, shared);
+  }
+}
+
+/** Sleeve triangle cap: fan from inbound spine across the sole external edge. */
+function addSleeveCapWedge(
+  inboundSpine: number,
+  externalEdge: [number, number],
+  prunedTriangles: PrunedWedge[],
+  interiorVerts: Map<number, Map<number, number[]>>
+): void {
+  const [e0, e1] = externalEdge;
+  prunedTriangles.push({
+    vertIds: [inboundSpine, e0, e1],
+    spineEdges: [
+      [inboundSpine, e0],
+      [inboundSpine, e1],
+    ],
+    fromTerminalPrune: false,
+  });
+  addSpineNeighbor(interiorVerts, inboundSpine, e0);
+  addSpineNeighbor(interiorVerts, inboundSpine, e1);
+}
+
 function collectChordalAxisNodeIds(
   axisSegments: [number, number][],
   boundaryVertexCount: number
@@ -162,6 +266,197 @@ function collectChordalAxisNodeIds(
     if (b >= boundaryVertexCount) spineNodes.add(b);
   }
   return spineNodes;
+}
+
+/** Chordal-axis nodes plus terminal-prune fan tips (targets for §5.2 quarter ovals). */
+function collectInflationSpineNodeIds(
+  wedges: PrunedWedge[],
+  axisSegments: [number, number][],
+  boundaryVertexCount: number
+): Set<number> {
+  const nodes = collectChordalAxisNodeIds(axisSegments, boundaryVertexCount);
+  for (const wedge of wedges) {
+    if (!wedge.fromTerminalPrune) continue;
+    const tip = wedge.vertIds.find((v) => v >= boundaryVertexCount);
+    if (tip !== undefined) nodes.add(tip);
+  }
+  return nodes;
+}
+
+/**
+ * One interior vertex fanning across a boundary edge (two corners) — paper §5.2
+ * quarter-oval topology.
+ */
+function isSingleSpineBoundaryWedge(
+  wedge: PrunedWedge,
+  boundaryVertexCount: number
+): boolean {
+  const boundaryVerts = wedge.vertIds.filter((v) => v < boundaryVertexCount);
+  const spineVerts = wedge.vertIds.filter((v) => v >= boundaryVertexCount);
+  if (boundaryVerts.length !== 2 || spineVerts.length !== 1) return false;
+  const spine = spineVerts[0]!;
+  return wedge.spineEdges.every(([s]) => s === spine);
+}
+
+/**
+ * Fig. 13f centroid hub wedge (off-axis Steiner hub + two corners). Used only for
+ * 2D fan triangulation — not inflated in §5.2.
+ */
+function isFig13fHubWedge(
+  wedge: PrunedWedge,
+  inflationSpineNodes: Set<number>,
+  boundaryVertexCount: number
+): boolean {
+  if (wedge.fromTerminalPrune) return false;
+  if (!isSingleSpineBoundaryWedge(wedge, boundaryVertexCount)) return false;
+  const spine = wedge.vertIds.find((v) => v >= boundaryVertexCount)!;
+  return !inflationSpineNodes.has(spine);
+}
+
+/**
+ * Paper §5.2 quarter ovals — terminal fans and axis sleeve caps only.
+ */
+function isQuarterOvalInflationWedge(
+  wedge: PrunedWedge,
+  inflationSpineNodes: Set<number>,
+  boundaryVertexCount: number
+): boolean {
+  if (wedge.fromTerminalPrune) return true;
+  if (!isSingleSpineBoundaryWedge(wedge, boundaryVertexCount)) return false;
+  const spine = wedge.vertIds.find((v) => v >= boundaryVertexCount)!;
+  return inflationSpineNodes.has(spine);
+}
+
+/**
+ * Sleeve/junction chord wedges (two axis-adjacent spine nodes + one boundary corner).
+ * Long chords between non-adjacent spine mids are redundant with their neighbor chords.
+ */
+function isInternalFlatElevationWedge(
+  wedge: PrunedWedge,
+  inflationSpineNodes: Set<number>,
+  boundaryVertexCount: number,
+  axisSegments: [number, number][]
+): boolean {
+  if (isQuarterOvalInflationWedge(wedge, inflationSpineNodes, boundaryVertexCount)) {
+    return false;
+  }
+  if (isFig13fHubWedge(wedge, inflationSpineNodes, boundaryVertexCount)) {
+    return false;
+  }
+  const spineVerts = wedge.vertIds.filter((v) => v >= boundaryVertexCount);
+  const boundaryVerts = wedge.vertIds.filter((v) => v < boundaryVertexCount);
+  if (spineVerts.length !== 2 || boundaryVerts.length !== 1) return false;
+  return hasAxisEdge(spineVerts[0]!, spineVerts[1]!, axisSegments);
+}
+
+/** Drop boundary chord wedges whose spine endpoints are not neighbors on the chordal axis. */
+function pruneRedundantBoundaryChordWedges(
+  wedges: PrunedWedge[],
+  axisSegments: [number, number][],
+  boundaryVertexCount: number
+): void {
+  let write = 0;
+  for (let read = 0; read < wedges.length; read++) {
+    const wedge = wedges[read];
+    const spineVerts = wedge.vertIds.filter((v) => v >= boundaryVertexCount);
+    const boundaryVerts = wedge.vertIds.filter((v) => v < boundaryVertexCount);
+    if (
+      !wedge.fromTerminalPrune &&
+      spineVerts.length === 2 &&
+      boundaryVerts.length === 1 &&
+      !hasAxisEdge(spineVerts[0]!, spineVerts[1]!, axisSegments)
+    ) {
+      continue;
+    }
+    wedges[write++] = wedge;
+  }
+  wedges.length = write;
+}
+
+function boundaryChordKey(
+  s0: number,
+  s1: number,
+  boundaryCorner: number
+): string {
+  const a = s0 < s1 ? s0 : s1;
+  const b = s0 < s1 ? s1 : s0;
+  return `${a}_${b}_${boundaryCorner}`;
+}
+
+function collectSpineBoundaryMeshEdges(
+  wedges: PrunedWedge[],
+  boundaryVertexCount: number
+): Map<number, Set<number>> {
+  const spineToBoundary = new Map<number, Set<number>>();
+  const note = (spineId: number, boundaryId: number) => {
+    if (boundaryId >= boundaryVertexCount || spineId < boundaryVertexCount) return;
+    if (!spineToBoundary.has(spineId)) {
+      spineToBoundary.set(spineId, new Set());
+    }
+    spineToBoundary.get(spineId)!.add(boundaryId);
+  };
+
+  for (const wedge of wedges) {
+    const [a, b, c] = wedge.vertIds;
+    note(a, b);
+    note(a, c);
+    note(b, a);
+    note(b, c);
+    note(c, a);
+    note(c, b);
+  }
+  return spineToBoundary;
+}
+
+/**
+ * At spine branch points, junction mid-chords only cover mids that share one triangle.
+ * Fill axis-adjacent spine pairs that both spoke to the same boundary corner in the wedge
+ * mesh but never received a chord wedge (the true source of interior gaps).
+ */
+function fillMissingAdjacentBoundaryChordWedges(
+  wedges: PrunedWedge[],
+  axisSegments: [number, number][],
+  boundaryVertexCount: number
+): void {
+  const existing = new Set<string>();
+  for (const wedge of wedges) {
+    const spineVerts = wedge.vertIds.filter((v) => v >= boundaryVertexCount);
+    const boundaryVerts = wedge.vertIds.filter((v) => v < boundaryVertexCount);
+    if (spineVerts.length === 2 && boundaryVerts.length === 1) {
+      existing.add(
+        boundaryChordKey(spineVerts[0]!, spineVerts[1]!, boundaryVerts[0]!)
+      );
+    }
+  }
+
+  const spineToBoundary = collectSpineBoundaryMeshEdges(
+    wedges,
+    boundaryVertexCount
+  );
+
+  for (const [s0, s1] of axisSegments) {
+    if (s0 < boundaryVertexCount || s1 < boundaryVertexCount) continue;
+    const a = s0 < s1 ? s0 : s1;
+    const b = s0 < s1 ? s1 : s0;
+    const b0 = spineToBoundary.get(a);
+    const b1 = spineToBoundary.get(b);
+    if (!b0 || !b1) continue;
+
+    for (const corner of b0) {
+      if (!b1.has(corner)) continue;
+      const key = boundaryChordKey(a, b, corner);
+      if (existing.has(key)) continue;
+      existing.add(key);
+      wedges.push({
+        vertIds: [a, b, corner],
+        spineEdges: [
+          [a, corner],
+          [b, corner],
+        ],
+        fromTerminalPrune: false,
+      });
+    }
+  }
 }
 
 /**
@@ -289,9 +584,9 @@ function edgeInList(
 }
 
 /**
- * Fig. 13f: split each sleeve / junction triangle from its center to the three
- * vertices. Skip a region only when a terminal fan has invaded across that edge
- * (the interior edge was removed during pruning).
+ * Fig. 13f: complete each sleeve/junction triangle from its centroid to edge vertices.
+ * Runs after the sleeve walk so spine-edge wedges and hub wedges together fill the
+ * mesh between the chordal axis and the boundary (paper fig. 13f).
  */
 function subdivideInteriorTrianglesAtCenters(
   triangles: ZeyapTriangle[],
@@ -724,6 +1019,15 @@ function axisEdgeKey(a: number, b: number): string {
   return a < b ? `${a}_${b}` : `${b}_${a}`;
 }
 
+function hasAxisEdge(
+  a: number,
+  b: number,
+  axisSegments: [number, number][]
+): boolean {
+  const key = axisEdgeKey(a, b);
+  return axisSegments.some(([u, v]) => axisEdgeKey(u, v) === key);
+}
+
 const SPINE_VERTEX_COINCIDENT_EPS = 1e-3;
 
 function sameVertexPosition(a: Vec3, b: Vec3, eps = SPINE_VERTEX_COINCIDENT_EPS): boolean {
@@ -872,8 +1176,23 @@ function repairFanStopAxis(
   spineEndpointsId: number[],
   spineEndpointsTriangleId: number[],
   resolveMid: (a: number, b: number) => number,
-  verts: Vec3[]
+  verts: Vec3[],
+  prunedTriangles: PrunedWedge[],
+  interiorVerts: Map<number, Map<number, number[]>>
 ): void {
+  const hasMeshEdge = (a: number, b: number): boolean => {
+    const key = a < b ? `${a}_${b}` : `${b}_${a}`;
+    for (const w of prunedTriangles) {
+      const [u, v, x] = w.vertIds;
+      const edges = [
+        u < v ? `${u}_${v}` : `${v}_${u}`,
+        v < x ? `${v}_${x}` : `${x}_${v}`,
+        u < x ? `${u}_${x}` : `${x}_${u}`,
+      ];
+      if (edges.includes(key)) return true;
+    }
+    return false;
+  };
   const seen = new Set<string>();
 
   for (let i = 0; i < spineEndpointsId.length; i++) {
@@ -900,7 +1219,21 @@ function repairFanStopAxis(
     }
 
     if (tri.type === 'J') {
-      for (const mid of mids) addAxis(tip, mid);
+      for (let e = 0; e < stopEdges.length; e++) {
+        const mid = mids[e]!;
+        addAxis(tip, mid);
+        if (!hasMeshEdge(tip, mid)) {
+          const [a, b] = stopEdges[e]!;
+          addInteriorEdgeWedges(
+            tip,
+            a,
+            b,
+            resolveMid,
+            prunedTriangles,
+            interiorVerts
+          );
+        }
+      }
     } else if (tri.type === 'S' || tri.type === 'T') {
       for (let e = 0; e < stopEdges.length; e++) {
         const [a, b] = stopEdges[e];
@@ -927,9 +1260,19 @@ export function pruneToWedges(
   wedges: PrunedWedge[];
   interiorVerts: Map<number, Map<number, number[]>>;
   axisSegments: [number, number][];
+  subdivisionHubByTri: Map<number, number>;
+  junctionHubByTri: Map<number, number>;
+  interiorEdgeMid: Map<string, number>;
 } {
   if (triangles.length < 2) {
-    return { wedges: [], interiorVerts: new Map(), axisSegments: [] };
+    return {
+      wedges: [],
+      interiorVerts: new Map(),
+      axisSegments: [],
+      subdivisionHubByTri: new Map(),
+      junctionHubByTri: new Map(),
+      interiorEdgeMid: new Map(),
+    };
   }
 
   for (const tri of triangles) {
@@ -952,6 +1295,8 @@ export function pruneToWedges(
   const spineEndpointsTriangleId: number[] = [];
   const spineVertexIds = new Set<number>();
   const axisSegments: [number, number][] = [];
+  const hasAxisEdgeLocal = (a: number, b: number) =>
+    hasAxisEdge(a, b, axisSegments);
   const addAxis = (a: number, b: number) => {
     if (a === b) return;
     if (a < boundaryVertexCount || b < boundaryVertexCount) return;
@@ -989,13 +1334,38 @@ export function pruneToWedges(
     return midIdx;
   };
 
-  /** Sleeve (S): link the two interior-edge midpoints. */
+  /** Sleeve (S): link interior-edge midpoints on the axis and in the wedge mesh. */
   const connectSleeveAxisMids = (triangle: ZeyapTriangle) => {
-    const mids = triangle.interiorEdges.map(([a, b]) =>
-      getOrCreateInteriorEdgeMid(a, b)
-    );
+    const edges = triangle.interiorEdges;
+    const mids = edges.map(([a, b]) => getOrCreateInteriorEdgeMid(a, b));
     for (let j = 0; j < mids.length; j++) {
       addAxis(mids[j], mids[(j + 1) % mids.length]);
+    }
+
+    if (edges.length === 2) {
+      const [e0, e1] = edges;
+      const shared =
+        e0[0] === e1[0] || e0[0] === e1[1]
+          ? e0[0]
+          : e0[1] === e1[0] || e0[1] === e1[1]
+            ? e0[1]
+            : null;
+      if (
+        shared !== null &&
+        mids[0] !== mids[1] &&
+        hasAxisEdgeLocal(mids[0]!, mids[1]!)
+      ) {
+        prunedTriangles.push({
+          vertIds: [mids[0], mids[1], shared],
+          spineEdges: [
+            [mids[0], shared],
+            [mids[1], shared],
+          ],
+          fromTerminalPrune: false,
+        });
+        addSpineNeighbor(interiorVerts, mids[0], shared);
+        addSpineNeighbor(interiorVerts, mids[1], shared);
+      }
     }
   };
 
@@ -1163,16 +1533,7 @@ export function pruneToWedges(
     tri.interiorEdges.map((e) => [...e] as [number, number])
   );
 
-  subdivideInteriorTrianglesAtCenters(
-    triangles,
-    verts,
-    originalInteriorEdges,
-    prunedTriangles,
-    subdivisionHubByTri,
-    postPruneInteriorEdges
-  );
-
-  // --- Sleeve / junction chordal axis (fig. 13e): grow from fan tips through S and J ---
+  // --- Sleeve / junction chordal axis (fig. 13e–f): grow from fan tips through S and J ---
   for (let i = 0; i < spineEndpointsId.length; i++) {
     const startTriId = spineEndpointsTriangleId[i];
 
@@ -1216,7 +1577,14 @@ export function pruneToWedges(
       let sleeveInboundAxis = false;
 
       for (const e of triangle.interiorEdges) {
-        const midIdx = getOrCreateInteriorEdgeMid(e[0], e[1]);
+        const midIdx = addInteriorEdgeWedges(
+          startVertId,
+          e[0],
+          e[1],
+          getOrCreateInteriorEdgeMid,
+          prunedTriangles,
+          interiorVerts
+        );
         const shouldAddInboundAxis =
           startVertId !== midIdx &&
           (triangle.type === 'T' ||
@@ -1248,11 +1616,25 @@ export function pruneToWedges(
         }
       }
 
-      const isFanStopTriangle = spineEndpointsTriangleId.includes(triangleId);
-      if (triangle.type === 'S' && !isFanStopTriangle) {
+      if (triangle.type === 'S') {
         connectSleeveAxisMids(triangle);
+        if (triangle.externalEdges.length > 0) {
+          addSleeveCapWedge(
+            startVertId,
+            triangle.externalEdges[0],
+            prunedTriangles,
+            interiorVerts
+          );
+        }
       } else if (triangle.type === 'J') {
         connectJunctionAxis(triangleId, triangle, startVertId);
+        addJunctionMidChordWedges(
+          triangle,
+          getOrCreateInteriorEdgeMid,
+          prunedTriangles,
+          interiorVerts,
+          hasAxisEdgeLocal
+        );
       }
     }
   }
@@ -1266,7 +1648,9 @@ export function pruneToWedges(
     spineEndpointsId,
     spineEndpointsTriangleId,
     getOrCreateInteriorEdgeMid,
-    verts
+    verts,
+    prunedTriangles,
+    interiorVerts
   );
 
   // Open junctions never reached by a sleeve walk (interior J hubs).
@@ -1274,9 +1658,39 @@ export function pruneToWedges(
     const triangle = triangles[i];
     if (triangle.type !== 'J' || sleeveProcessed[i]) continue;
 
+    const hubIdx = getJunctionHub(i, triangle);
     connectJunctionAxis(i, triangle);
+    for (const e of triangle.interiorEdges) {
+      addInteriorEdgeWedges(
+        hubIdx,
+        e[0],
+        e[1],
+        getOrCreateInteriorEdgeMid,
+        prunedTriangles,
+        interiorVerts
+      );
+    }
+    addJunctionMidChordWedges(
+      triangle,
+      getOrCreateInteriorEdgeMid,
+      prunedTriangles,
+      interiorVerts,
+      hasAxisEdgeLocal
+    );
+    sleeveProcessed[i] = true;
     triangleDeleted[i] = true;
   }
+
+  subdivideInteriorTrianglesAtCenters(
+    triangles,
+    verts,
+    originalInteriorEdges,
+    prunedTriangles,
+    subdivisionHubByTri,
+    postPruneInteriorEdges
+  );
+
+  dedupeWedges(prunedTriangles);
 
   const chordalGraph =
     axisSegments.length > 0
@@ -1324,6 +1738,14 @@ export function pruneToWedges(
     spineVertexIds
   );
 
+  pruneRedundantBoundaryChordWedges(prunedTriangles, chordal, boundaryVertexCount);
+  fillMissingAdjacentBoundaryChordWedges(
+    prunedTriangles,
+    chordal,
+    boundaryVertexCount
+  );
+  dedupeWedges(prunedTriangles);
+
   return {
     wedges: prunedTriangles,
     // Fig. 13f is complete — elevation neighbors come from the subdivided wedge mesh only.
@@ -1339,7 +1761,74 @@ export function pruneToWedges(
     // each terminal fan's apex. The fan's radial spokes (tip -> boundary) belong
     // to the fan drawing (fig. 13d), not the spine, so they are NOT included here.
     axisSegments: chordal,
+    subdivisionHubByTri,
+    junctionHubByTri,
+    interiorEdgeMid,
   };
+}
+
+/**
+ * Fig. 13f Steiner hubs subdivide sleeve/junction triangles but are not chordal-axis nodes.
+ * Inherit elevation from elevated axis nodes in the same triangle so quarter-oval inflation
+ * (fig. 15) lifts the interior mesh, not only terminal fans.
+ */
+export function elevateSubdivisionHubHeights(
+  verts: Vec3[],
+  subdivisionHubByTri: Map<number, number>,
+  junctionHubByTri: Map<number, number>,
+  interiorEdgeMid: Map<string, number>,
+  triangles: ZeyapTriangle[],
+  boundaryVertexCount: number,
+  axisSegments: [number, number][]
+): void {
+  const triVerts = (tri: ZeyapTriangle) => new Set(tri.vertIds);
+
+  for (let triId = 0; triId < triangles.length; triId++) {
+    const tri = triangles[triId];
+    if (tri.type !== 'S' && tri.type !== 'J') continue;
+
+    const subdivHub = subdivisionHubByTri.get(triId);
+    if (subdivHub === undefined) continue;
+
+    const corners = triVerts(tri);
+    const zs: number[] = [];
+    const jHub = junctionHubByTri.get(triId);
+    if (
+      jHub !== undefined &&
+      jHub >= boundaryVertexCount &&
+      verts[jHub].z > 1e-6
+    ) {
+      zs.push(verts[jHub].z);
+    }
+
+    for (const [key, mid] of interiorEdgeMid) {
+      const sep = key.indexOf('_');
+      const e0 = Number(key.slice(0, sep));
+      const e1 = Number(key.slice(sep + 1));
+      if (!corners.has(e0) || !corners.has(e1)) continue;
+      if (verts[mid].z > 1e-6) zs.push(verts[mid].z);
+    }
+
+    if (zs.length > 0) {
+      verts[subdivHub].z = zs.reduce((sum, z) => sum + z, 0) / zs.length;
+      continue;
+    }
+
+    let bestDist = Infinity;
+    let bestZ = 0;
+    const hubPos = verts[subdivHub];
+    for (const [a, b] of axisSegments) {
+      for (const id of [a, b]) {
+        if (id < boundaryVertexCount || verts[id].z <= 1e-6) continue;
+        const d = dist3(hubPos, verts[id]);
+        if (d < bestDist) {
+          bestDist = d;
+          bestZ = verts[id].z;
+        }
+      }
+    }
+    if (bestZ > 0) verts[subdivHub].z = bestZ;
+  }
 }
 
 function minDistToBoundary(
@@ -1748,10 +2237,28 @@ export function wedgesToElevatedFanFaces(
   interiorVerts: Map<number, Map<number, number[]>>,
   verts: Vec3[],
   axisSegments: [number, number][],
-  boundaryVertexCount: number
+  boundaryVertexCount: number,
+  hubMeta?: {
+    subdivisionHubByTri: Map<number, number>;
+    junctionHubByTri: Map<number, number>;
+    interiorEdgeMid: Map<string, number>;
+    triangles: ZeyapTriangle[];
+    axisSegments: [number, number][];
+  }
 ): [number, number, number][] {
   applySpineElevation(interiorVerts, verts);
   propagateSpineElevationAlongAxis(verts, axisSegments, boundaryVertexCount);
+  if (hubMeta) {
+    elevateSubdivisionHubHeights(
+      verts,
+      hubMeta.subdivisionHubByTri,
+      hubMeta.junctionHubByTri,
+      hubMeta.interiorEdgeMid,
+      hubMeta.triangles,
+      boundaryVertexCount,
+      hubMeta.axisSegments
+    );
+  }
   return wedgesToFanFaces(wedges);
 }
 
@@ -1794,6 +2301,335 @@ export function collectSpineSegments(
   return collectChordalAxisSegments(wedges, boundaryVertexCount);
 }
 
+/** Five vertex indices along one spine–boundary spoke (paper quarter oval). */
+export type QuarterOvalSpoke = [number, number, number, number, number];
+
+function cloneInteriorVerts(
+  src: Map<number, Map<number, number[]>>
+): Map<number, Map<number, number[]>> {
+  const out = new Map<number, Map<number, number[]>>();
+  for (const [spineId, row] of src) {
+    const newRow = new Map<number, number[]>();
+    for (const [extId, pts] of row) {
+      newRow.set(extId, [...pts]);
+    }
+    out.set(spineId, newRow);
+  }
+  return out;
+}
+
+/**
+ * Subdivide one fan wedge with quarter-oval spokes (paper §5.2) and stitch the
+ * two arcs with eight triangles.
+ */
+function inflateWedgeQuarterOval(
+  wedge: PrunedWedge,
+  verts: Vec3[],
+  interiorVerts: Map<number, Map<number, number[]>>
+): {
+  spokes: [QuarterOvalSpoke, QuarterOvalSpoke];
+  triangles: [number, number, number][];
+} {
+  const p: [number, number, number, number, number][] = [
+    [0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0],
+  ];
+
+  for (let j = 0; j < 2; j++) {
+    const [spineId, exteriorId] = wedge.spineEdges[j];
+    const cache = interiorVerts.get(spineId)?.get(exteriorId);
+    p[j][0] = spineId;
+    p[j][4] = exteriorId;
+
+    if (cache && cache.length > 0) {
+      p[j][1] = cache[0];
+      p[j][2] = cache[1];
+      p[j][3] = cache[2];
+    } else {
+      const b = verts[spineId].z;
+
+      const mid = edgeCenter(verts[p[j][0]], verts[p[j][4]]);
+      mid.z = b * (Math.sqrt(3) / 2);
+      verts.push(mid);
+      p[j][2] = verts.length - 1;
+
+      const nearSpine = edgeCenter(verts[p[j][0]], verts[p[j][2]]);
+      nearSpine.z = b * (Math.sqrt(15) / 4);
+      verts.push(nearSpine);
+      p[j][1] = verts.length - 1;
+
+      const nearExterior = edgeCenter(verts[p[j][2]], verts[p[j][4]]);
+      nearExterior.z = b * (Math.sqrt(7) / 4);
+      verts.push(nearExterior);
+      p[j][3] = verts.length - 1;
+
+      if (!interiorVerts.has(spineId)) {
+        interiorVerts.set(spineId, new Map());
+      }
+      interiorVerts.get(spineId)!.set(exteriorId, [p[j][1], p[j][2], p[j][3]]);
+    }
+  }
+
+  const triangles: [number, number, number][] = [];
+  for (let j = 0; j < 4; j++) {
+    if (p[0][j] !== p[1][j]) {
+      triangles.push([p[0][j], p[1][j], p[1][j + 1]]);
+    }
+    if (p[0][j + 1] !== p[1][j + 1]) {
+      triangles.push([p[0][j], p[1][j + 1], p[0][j + 1]]);
+    }
+  }
+
+  return { spokes: [p[0], p[1]], triangles };
+}
+
+/** One debug frame: flat fan wedge with spine corners at their elevated z. */
+export interface FanElevationDebugStep {
+  stepIndex: number;
+  wedgeIndex: number;
+  vertIds: [number, number, number];
+  spineEdges: [[number, number], [number, number]];
+  /** z of each spine endpoint used by this wedge. */
+  spineHeights: [number, number];
+  vertices: Vec3[];
+  /** Flat elevated triangles revealed through this step (one wedge per step). */
+  faces: [number, number, number][];
+  /** Index in `faces` of the triangle added this step. */
+  activeFaceIndex: number;
+}
+
+/** One debug frame: quarter-oval spokes and stitched triangles for one fan wedge. */
+export interface QuarterOvalDebugStep {
+  stepIndex: number;
+  wedgeIndex: number;
+  vertIds: [number, number, number];
+  spokes: [QuarterOvalSpoke, QuarterOvalSpoke];
+  /** z at each spine endpoint before subdividing this wedge. */
+  spineHeights: [number, number];
+  vertices: Vec3[];
+  /** Quarter-oval triangles revealed through this step. */
+  faces: [number, number, number][];
+  /** Face indices added when processing this wedge. */
+  highlightFaceIndices: number[];
+}
+
+/**
+ * Build per-wedge frames for elevating flat fan triangles (spine corners lifted,
+ * boundary still at z = 0) before quarter-oval subdivision.
+ */
+export function buildFanElevationDebugSteps(
+  wedges: PrunedWedge[],
+  elevatedVerts: Vec3[],
+  axisSegments: [number, number][],
+  boundaryVertexCount: number
+): FanElevationDebugStep[] {
+  const vertices = elevatedVerts.map((v) => vec3(v.x, v.y, v.z));
+  const inflationSpineNodes = collectInflationSpineNodeIds(
+    wedges,
+    axisSegments,
+    boundaryVertexCount
+  );
+  const steps: FanElevationDebugStep[] = [];
+  const accumulatedFaces: [number, number, number][] = [];
+
+  let stepIndex = 0;
+  for (let wedgeIndex = 0; wedgeIndex < wedges.length; wedgeIndex++) {
+    const wedge = wedges[wedgeIndex];
+    if (!isQuarterOvalInflationWedge(wedge, inflationSpineNodes, boundaryVertexCount)) {
+      continue;
+    }
+
+    const [s0, s1] = wedge.spineEdges.map(([spineId]) => spineId) as [number, number];
+    accumulatedFaces.push([...wedge.vertIds] as [number, number, number]);
+
+    steps.push({
+      stepIndex: stepIndex++,
+      wedgeIndex,
+      vertIds: [...wedge.vertIds] as [number, number, number],
+      spineEdges: wedge.spineEdges,
+      spineHeights: [vertices[s0].z, vertices[s1].z],
+      vertices,
+      faces: accumulatedFaces.map((f) => [...f] as [number, number, number]),
+      activeFaceIndex: accumulatedFaces.length - 1,
+    });
+  }
+
+  return steps;
+}
+
+/**
+ * Build per-wedge frames for quarter-oval creation and stitching (paper §5.2).
+ */
+export function buildQuarterOvalDebugSteps(
+  wedges: PrunedWedge[],
+  elevatedVerts: Vec3[],
+  interiorVerts: Map<number, Map<number, number[]>>,
+  axisSegments: [number, number][],
+  boundaryVertexCount: number
+): QuarterOvalDebugStep[] {
+  const verts = elevatedVerts.map((v) => vec3(v.x, v.y, v.z));
+  const interiorCopy = cloneInteriorVerts(interiorVerts);
+  const inflationSpineNodes = collectInflationSpineNodeIds(
+    wedges,
+    axisSegments,
+    boundaryVertexCount
+  );
+  const steps: QuarterOvalDebugStep[] = [];
+  const accumulatedFaces: [number, number, number][] = [];
+
+  let stepIndex = 0;
+  for (let wedgeIndex = 0; wedgeIndex < wedges.length; wedgeIndex++) {
+    const wedge = wedges[wedgeIndex];
+    if (!isQuarterOvalInflationWedge(wedge, inflationSpineNodes, boundaryVertexCount)) {
+      continue;
+    }
+
+    const [s0, s1] = wedge.spineEdges.map(([spineId]) => spineId) as [number, number];
+    const spineHeights: [number, number] = [verts[s0].z, verts[s1].z];
+
+    const { spokes, triangles } = inflateWedgeQuarterOval(
+      wedge,
+      verts,
+      interiorCopy
+    );
+
+    const highlightFaceIndices: number[] = [];
+    for (const tri of triangles) {
+      highlightFaceIndices.push(accumulatedFaces.length);
+      accumulatedFaces.push(tri);
+    }
+
+    steps.push({
+      stepIndex: stepIndex++,
+      wedgeIndex,
+      vertIds: [...wedge.vertIds] as [number, number, number],
+      spokes,
+      spineHeights,
+      vertices: verts.map((v) => vec3(v.x, v.y, v.z)),
+      faces: accumulatedFaces.map((f) => [...f] as [number, number, number]),
+      highlightFaceIndices,
+    });
+  }
+
+  return steps;
+}
+
+/**
+ * Build per-wedge frames for quarter-oval subdivision of internal chord wedges
+ * (two axis-adjacent spine nodes + one boundary corner), mirroring fan §5.2.
+ */
+export function buildInternalQuarterOvalDebugSteps(
+  wedges: PrunedWedge[],
+  elevatedVerts: Vec3[],
+  interiorVerts: Map<number, Map<number, number[]>>,
+  axisSegments: [number, number][],
+  boundaryVertexCount: number
+): QuarterOvalDebugStep[] {
+  const verts = elevatedVerts.map((v) => vec3(v.x, v.y, v.z));
+  const interiorCopy = cloneInteriorVerts(interiorVerts);
+  const inflationSpineNodes = collectInflationSpineNodeIds(
+    wedges,
+    axisSegments,
+    boundaryVertexCount
+  );
+  const steps: QuarterOvalDebugStep[] = [];
+  const accumulatedFaces: [number, number, number][] = [];
+
+  let stepIndex = 0;
+  for (let wedgeIndex = 0; wedgeIndex < wedges.length; wedgeIndex++) {
+    const wedge = wedges[wedgeIndex];
+    if (
+      !isInternalFlatElevationWedge(
+        wedge,
+        inflationSpineNodes,
+        boundaryVertexCount,
+        axisSegments
+      )
+    ) {
+      continue;
+    }
+
+    const [s0, s1] = wedge.spineEdges.map(([spineId]) => spineId) as [number, number];
+    const spineHeights: [number, number] = [verts[s0].z, verts[s1].z];
+
+    const { spokes, triangles } = inflateWedgeQuarterOval(
+      wedge,
+      verts,
+      interiorCopy
+    );
+
+    const highlightFaceIndices: number[] = [];
+    for (const tri of triangles) {
+      highlightFaceIndices.push(accumulatedFaces.length);
+      accumulatedFaces.push(tri);
+    }
+
+    steps.push({
+      stepIndex: stepIndex++,
+      wedgeIndex,
+      vertIds: [...wedge.vertIds] as [number, number, number],
+      spokes,
+      spineHeights,
+      vertices: verts.map((v) => vec3(v.x, v.y, v.z)),
+      faces: accumulatedFaces.map((f) => [...f] as [number, number, number]),
+      highlightFaceIndices,
+    });
+  }
+
+  return steps;
+}
+
+/**
+ * Build per-wedge frames for flat elevation of internal chord wedges (two spine
+ * nodes + one boundary corner) before quarter-oval subdivision.
+ */
+export function buildInternalFlatElevationDebugSteps(
+  wedges: PrunedWedge[],
+  elevatedVerts: Vec3[],
+  axisSegments: [number, number][],
+  boundaryVertexCount: number
+): FanElevationDebugStep[] {
+  const vertices = elevatedVerts.map((v) => vec3(v.x, v.y, v.z));
+  const inflationSpineNodes = collectInflationSpineNodeIds(
+    wedges,
+    axisSegments,
+    boundaryVertexCount
+  );
+  const steps: FanElevationDebugStep[] = [];
+  const accumulatedFaces: [number, number, number][] = [];
+  let stepIndex = 0;
+
+  for (let wedgeIndex = 0; wedgeIndex < wedges.length; wedgeIndex++) {
+    const wedge = wedges[wedgeIndex];
+    if (
+      !isInternalFlatElevationWedge(
+        wedge,
+        inflationSpineNodes,
+        boundaryVertexCount,
+        axisSegments
+      )
+    ) {
+      continue;
+    }
+
+    const [s0, s1] = wedge.spineEdges.map(([spineId]) => spineId) as [number, number];
+    accumulatedFaces.push([...wedge.vertIds] as [number, number, number]);
+
+    steps.push({
+      stepIndex: stepIndex++,
+      wedgeIndex,
+      vertIds: [...wedge.vertIds] as [number, number, number],
+      spineEdges: wedge.spineEdges,
+      spineHeights: [vertices[s0].z, vertices[s1].z],
+      vertices,
+      faces: accumulatedFaces.map((f) => [...f] as [number, number, number]),
+      activeFaceIndex: accumulatedFaces.length - 1,
+    });
+  }
+
+  return steps;
+}
+
 function elevateVertices(
   wedges: PrunedWedge[],
   interiorVerts: Map<number, Map<number, number[]>>,
@@ -1804,60 +2640,53 @@ function elevateVertices(
   applySpineElevation(interiorVerts, verts);
   propagateSpineElevationAlongAxis(verts, axisSegments, boundaryVertexCount);
 
+  const inflationSpineNodes = collectInflationSpineNodeIds(
+    wedges,
+    axisSegments,
+    boundaryVertexCount
+  );
   const divTriangles: [number, number, number][] = [];
 
   for (const wedge of wedges) {
-    const p: [number, number, number, number, number][] = [
-      [0, 0, 0, 0, 0],
-      [0, 0, 0, 0, 0],
-    ];
-
-    for (let j = 0; j < 2; j++) {
-      const [spineId, exteriorId] = wedge.spineEdges[j];
-      const cache = interiorVerts.get(spineId)?.get(exteriorId);
-      p[j][0] = spineId;
-      p[j][4] = exteriorId;
-
-      if (cache && cache.length > 0) {
-        p[j][1] = cache[0];
-        p[j][2] = cache[1];
-        p[j][3] = cache[2];
-      } else {
-        const b = verts[spineId].z;
-
-        const mid = edgeCenter(verts[p[j][0]], verts[p[j][4]]);
-        mid.z = b * (Math.sqrt(3) / 2);
-        verts.push(mid);
-        p[j][2] = verts.length - 1;
-
-        const nearSpine = edgeCenter(verts[p[j][0]], verts[p[j][2]]);
-        nearSpine.z = b * (Math.sqrt(15) / 4);
-        verts.push(nearSpine);
-        p[j][1] = verts.length - 1;
-
-        const nearExterior = edgeCenter(verts[p[j][2]], verts[p[j][4]]);
-        nearExterior.z = b * (Math.sqrt(7) / 4);
-        verts.push(nearExterior);
-        p[j][3] = verts.length - 1;
-
-        if (!interiorVerts.has(spineId)) {
-          interiorVerts.set(spineId, new Map());
-        }
-        interiorVerts.get(spineId)!.set(exteriorId, [p[j][1], p[j][2], p[j][3]]);
-      }
+    if (isFig13fHubWedge(wedge, inflationSpineNodes, boundaryVertexCount)) {
+      continue;
     }
-
-    for (let j = 0; j < 4; j++) {
-      if (p[0][j] !== p[1][j]) {
-        divTriangles.push([p[0][j], p[1][j], p[1][j + 1]]);
-      }
-      if (p[0][j + 1] !== p[1][j + 1]) {
-        divTriangles.push([p[0][j], p[1][j + 1], p[0][j + 1]]);
-      }
+    if (isQuarterOvalInflationWedge(wedge, inflationSpineNodes, boundaryVertexCount)) {
+      const { triangles } = inflateWedgeQuarterOval(wedge, verts, interiorVerts);
+      divTriangles.push(...triangles);
+    } else if (
+      isInternalFlatElevationWedge(
+        wedge,
+        inflationSpineNodes,
+        boundaryVertexCount,
+        axisSegments
+      )
+    ) {
+      const { triangles } = inflateWedgeQuarterOval(wedge, verts, interiorVerts);
+      divTriangles.push(...triangles);
+    } else {
+      divTriangles.push([...wedge.vertIds] as [number, number, number]);
     }
   }
 
   return divTriangles;
+}
+
+/** Top inflated surface (quarter ovals, paper §5.2) before mirroring the back face. */
+export function buildInflatedTopFaces(
+  wedges: PrunedWedge[],
+  interiorVerts: Map<number, Map<number, number[]>>,
+  verts: Vec3[],
+  axisSegments: [number, number][],
+  boundaryVertexCount: number
+): [number, number, number][] {
+  return elevateVertices(
+    wedges,
+    interiorVerts,
+    verts,
+    axisSegments,
+    boundaryVertexCount
+  );
 }
 
 /** Closed solid via mirrored back face (zeyap drawBackface). */

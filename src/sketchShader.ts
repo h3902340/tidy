@@ -6,7 +6,8 @@
  *
  * The stipple is computed in screen space so the dot size stays constant as the camera orbits
  * (like ink on paper rather than a texture glued to the surface). Lighting is evaluated in view
- * space using THREE's `normalMatrix`, so the mesh's (1, -1, 1) render flip is handled correctly.
+ * space; face normals come from screen-space derivatives so double-sided / inverted inflation
+ * triangles shade the same as correctly wound ones.
  */
 import * as THREE from 'three';
 
@@ -16,7 +17,8 @@ import * as THREE from 'three';
  * stationary object the lit and shaded sides sweep across the surface, so you see it lit from
  * different directions. (A world-fixed light would keep the same faces shaded while orbiting.)
  */
-const LIGHT_VIEW_DIR = new THREE.Vector3(-0.4, 0.5, 0.78).normalize();
+/** View-space direction toward the key light (shared with solid Phong shading). */
+export const LIGHT_VIEW_DIR = new THREE.Vector3(-0.4, 0.5, 0.78).normalize();
 
 export interface SketchMaterials {
   fill: THREE.ShaderMaterial;
@@ -26,16 +28,20 @@ export interface SketchMaterials {
 }
 
 const fillVertex = /* glsl */ `
-  varying vec3 vViewNormal;
+  varying vec3 vViewPos;
   varying vec2 vUv;
   void main() {
-    vViewNormal = normalize(normalMatrix * normal);
+    vec4 mvPos = modelViewMatrix * vec4(position, 1.0);
+    vViewPos = mvPos.xyz;
     vUv = uv;
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    gl_Position = projectionMatrix * mvPos;
   }
 `;
 
 const fillFragment = /* glsl */ `
+  #ifdef GL_OES_standard_derivatives
+    #extension GL_OES_standard_derivatives : enable
+  #endif
   precision highp float;
 
   uniform vec3 uPaper;        // fallback fill colour (lit paper)
@@ -47,7 +53,7 @@ const fillFragment = /* glsl */ `
   uniform sampler2D uColorMap; // baked surface colour (painted texture)
   uniform float uHasColorMap;  // 1 when uColorMap is the surface texture
 
-  varying vec3 vViewNormal;
+  varying vec3 vViewPos;
   varying vec2 vUv;
 
   float hash(vec2 p) {
@@ -66,8 +72,9 @@ const fillFragment = /* glsl */ `
   }
 
   void main() {
-    vec3 N = normalize(vViewNormal);
-    if (!gl_FrontFacing) N = -N;             // mesh is rendered double-sided
+    // Per-triangle view normal (robust on inverted / double-sided inflation faces).
+    vec3 N = normalize(cross(dFdx(vViewPos), dFdy(vViewPos)));
+    if (!gl_FrontFacing) N = -N;
 
     float diff = max(dot(N, normalize(uLightDir)), 0.0);
     float light = clamp(uAmbient + (1.0 - uAmbient) * diff, 0.0, 1.0);
