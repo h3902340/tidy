@@ -60,7 +60,6 @@ describe('terminal fan pruning', () => {
 
     expect(terminalFans.length).toBe(4);
 
-    const { axisSegments } = pruneToWedges(zeyap, [...verts]);
     const boundaryCount = unitSquare.length;
     const tips = new Set<number>();
     for (const f of terminalFans) {
@@ -68,16 +67,8 @@ describe('terminal fan pruning', () => {
         if (v >= boundaryCount) tips.add(v);
       }
     }
-    const axisAdj = new Map<number, number[]>();
-    for (const [a, b] of axisSegments) {
-      if (!axisAdj.has(a)) axisAdj.set(a, []);
-      if (!axisAdj.has(b)) axisAdj.set(b, []);
-      axisAdj.get(a)!.push(b);
-      axisAdj.get(b)!.push(a);
-    }
-    for (const tip of tips) {
-      expect((axisAdj.get(tip)?.length ?? 0) > 0).toBe(true);
-    }
+    // Coincident fan tips at the square center merge to one spine vertex.
+    expect(tips.size).toBe(1);
     // Four corner boundary verts each touch a terminal fan.
     for (let i = 0; i < 4; i++) {
       expect(terminalFans.some((f) => fanTouchesCorner(f, i))).toBe(true);
@@ -253,6 +244,11 @@ describe('terminal fan pruning', () => {
       if (a >= boundaryCount) spineNodes.add(a);
       if (b >= boundaryCount) spineNodes.add(b);
     }
+    for (const wedge of wedges) {
+      if (!wedge.fromTerminalPrune) continue;
+      const tip = wedge.vertIds.find((v) => v >= boundaryCount);
+      if (tip !== undefined) spineNodes.add(tip);
+    }
 
     for (const spineId of interiorVerts.keys()) {
       expect(spineNodes.has(spineId)).toBe(true);
@@ -300,6 +296,58 @@ describe('terminal fan pruning', () => {
     }
   });
 
+  it('circle: no duplicate spine vertices at the same position', () => {
+    const segments = 64;
+    const r = 100;
+    const ring: { x: number; y: number }[] = [];
+    for (let i = 0; i <= segments; i++) {
+      const t = (i / segments) * Math.PI * 2;
+      ring.push({ x: Math.cos(t) * r, y: Math.sin(t) * r });
+    }
+    const polygon = normalizePolygon(ring);
+    const { meshes } = buildTeddyPipeline(polygon);
+    expect(meshes).not.toBeNull();
+
+    const verts = meshes!.fan.vertices;
+    const spineIds = new Set<number>();
+    for (const [a, b] of meshes!.spineSegments) {
+      spineIds.add(a);
+      spineIds.add(b);
+    }
+
+    const byPos = new Map<string, number[]>();
+    for (const id of spineIds) {
+      if (id < polygon.length) continue;
+      const v = verts[id];
+      const key = `${v.x.toFixed(2)},${v.y.toFixed(2)},${v.z.toFixed(2)}`;
+      if (!byPos.has(key)) byPos.set(key, []);
+      byPos.get(key)!.push(id);
+    }
+
+    for (const ids of byPos.values()) {
+      expect(ids.length).toBe(1);
+    }
+  });
+
+  it('circle: interior-edge mid on axis uses nearest boundary neighbors, not propagate', () => {
+    const segments = 64;
+    const r = 100;
+    const ring: { x: number; y: number }[] = [];
+    for (let i = 0; i <= segments; i++) {
+      const t = (i / segments) * Math.PI * 2;
+      ring.push({ x: Math.cos(t) * r, y: Math.sin(t) * r });
+    }
+    const polygon = normalizePolygon(ring);
+    const { meshes } = buildTeddyPipeline(polygon);
+    expect(meshes).not.toBeNull();
+
+    const step = meshes!.spineElevationSteps.find((s) => s.spineId === 152);
+    expect(step).toBeDefined();
+    expect(step!.kind).toBe('direct');
+    expect(step!.exteriorIds).toEqual([3, 71]);
+    expect(step!.neighborSpineIds).toEqual([]);
+  });
+
   it('circle: junction fan tip connects to interior edge mids, not mid-to-mid chord', () => {
     const segments = 64;
     const r = 100;
@@ -312,14 +360,44 @@ describe('terminal fan pruning', () => {
     const { meshes } = buildTeddyPipeline(polygon);
     expect(meshes).not.toBeNull();
 
+    const bc = polygon.length;
     const segs = meshes!.spineSegments;
     const has = (a: number, b: number) =>
       segs.some(([u, v]) => (u === a && v === b) || (u === b && v === a));
 
-    // v80 = fan tip at J triangle centroid; v156/v157 = interior-edge mids.
-    expect(has(80, 156)).toBe(true);
-    expect(has(80, 157)).toBe(true);
-    expect(has(157, 156)).toBe(false);
+    const tips = new Set<number>();
+    for (const f of meshes!.terminalFans.faces) {
+      for (const v of f) {
+        if (v >= bc) tips.add(v);
+      }
+    }
+    const adj = new Map<number, number[]>();
+    for (const [a, b] of segs) {
+      if (!adj.has(a)) adj.set(a, []);
+      if (!adj.has(b)) adj.set(b, []);
+      adj.get(a)!.push(b);
+      adj.get(b)!.push(a);
+    }
+
+    let junctionTip: number | null = null;
+    let interiorNeighbors: number[] = [];
+    for (const tip of tips) {
+      const n = (adj.get(tip) ?? []).filter((x) => x >= bc);
+      if (n.length >= 2) {
+        junctionTip = tip;
+        interiorNeighbors = n;
+        break;
+      }
+    }
+    expect(junctionTip).not.toBeNull();
+    for (const n of interiorNeighbors) {
+      expect(has(junctionTip!, n)).toBe(true);
+    }
+    for (let i = 0; i < interiorNeighbors.length; i++) {
+      for (let j = i + 1; j < interiorNeighbors.length; j++) {
+        expect(has(interiorNeighbors[i], interiorNeighbors[j])).toBe(false);
+      }
+    }
   });
 
   it('buildTeddyPipeline spine elevation steps only use chordal-axis nodes', () => {

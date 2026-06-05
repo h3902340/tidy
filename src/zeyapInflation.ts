@@ -170,13 +170,23 @@ function collectChordalAxisNodeIds(
  *
  * Wedge `spineEdges` pair subdivision hubs with interior mids as well as boundary verts;
  * those hubs are Steiner points in the fan mesh, not spine nodes, and must be excluded.
+ *
+ * Interior-edge midpoints on the chordal axis (fig. 13e/14) are not Steiner points in the
+ * fig. 13f hub wedges. Use the boundary endpoints of the interior edge they bisect; if none
+ * are boundary, fall back to boundary vertices wedge-connected to an adjacent axis node.
  */
 export function buildElevationNeighborsFromWedges(
   wedges: PrunedWedge[],
   axisSegments: [number, number][],
-  boundaryVertexCount: number
+  boundaryVertexCount: number,
+  verts: Vec3[],
+  interiorEdgeMid: Map<string, number>,
+  extraSpineNodes: Iterable<number> = []
 ): Map<number, Map<number, number[]>> {
   const spineNodes = collectChordalAxisNodeIds(axisSegments, boundaryVertexCount);
+  for (const id of extraSpineNodes) {
+    if (id >= boundaryVertexCount) spineNodes.add(id);
+  }
   const adj = new Map<number, Set<number>>();
 
   const link = (u: number, v: number): void => {
@@ -201,6 +211,49 @@ export function buildElevationNeighborsFromWedges(
       addSpineNeighbor(interiorVerts, spineId, neighbor);
     }
   }
+
+  for (const [edgeKey, midId] of interiorEdgeMid) {
+    if (!spineNodes.has(midId)) continue;
+    if ((interiorVerts.get(midId)?.size ?? 0) > 0) continue;
+
+    const sep = edgeKey.indexOf('_');
+    const e0 = Number(edgeKey.slice(0, sep));
+    const e1 = Number(edgeKey.slice(sep + 1));
+    for (const endpoint of [e0, e1]) {
+      if (endpoint < boundaryVertexCount) {
+        addSpineNeighbor(interiorVerts, midId, endpoint);
+      }
+    }
+  }
+
+  if (axisSegments.length === 0) return interiorVerts;
+
+  const axisAdj = new Map<number, number[]>();
+  for (const [a, b] of axisSegments) {
+    (axisAdj.get(a) ?? axisAdj.set(a, []).get(a)!).push(b);
+    (axisAdj.get(b) ?? axisAdj.set(b, []).get(b)!).push(a);
+  }
+
+  for (const spineId of spineNodes) {
+    if ((interiorVerts.get(spineId)?.size ?? 0) > 0) continue;
+
+    const boundaryPool = new Set<number>();
+    for (const axisNbr of axisAdj.get(spineId) ?? []) {
+      for (const n of adj.get(axisNbr) ?? []) {
+        if (n < boundaryVertexCount) boundaryPool.add(n);
+      }
+    }
+    if (boundaryPool.size === 0) continue;
+
+    const ranked = [...boundaryPool].sort(
+      (a, b) =>
+        dist3(verts[a], verts[spineId]) - dist3(verts[b], verts[spineId])
+    );
+    for (const exteriorId of ranked.slice(0, 2)) {
+      addSpineNeighbor(interiorVerts, spineId, exteriorId);
+    }
+  }
+
   return interiorVerts;
 }
 
@@ -298,7 +351,8 @@ function ensureTerminalFansAtCorners(
   prunedTriangles: PrunedWedge[],
   interiorVerts: Map<number, Map<number, number[]>>,
   spineEndpointsId: number[],
-  spineEndpointsTriangleId: number[]
+  spineEndpointsTriangleId: number[],
+  spineVertexIds: Set<number>
 ): void {
   for (let i = 0; i < triangles.length; i++) {
     const tri = triangles[i];
@@ -309,10 +363,16 @@ function ensureTerminalFansAtCorners(
     if (terminalFanCoversCorner(prunedTriangles, corner)) continue;
 
     const interiorEdge = tri.interiorEdges[0];
-    const spineIdx = verts.length;
-    verts.push(edgeCenter(verts[interiorEdge[0]], verts[interiorEdge[1]]));
-    spineEndpointsId.push(spineIdx);
-    spineEndpointsTriangleId.push(i);
+    const tipPos = edgeCenter(verts[interiorEdge[0]], verts[interiorEdge[1]]);
+    let spineIdx = findCoincidentSpineVertex(verts, tipPos, spineVertexIds);
+    const isNewTip = spineIdx === null;
+    if (isNewTip) {
+      spineIdx = verts.length;
+      verts.push(tipPos);
+      spineEndpointsId.push(spineIdx);
+      spineEndpointsTriangleId.push(i);
+      spineVertexIds.add(spineIdx);
+    }
 
     for (const ext of tri.externalEdges) {
       prunedTriangles.push({
@@ -664,6 +724,130 @@ function axisEdgeKey(a: number, b: number): string {
   return a < b ? `${a}_${b}` : `${b}_${a}`;
 }
 
+const SPINE_VERTEX_COINCIDENT_EPS = 1e-3;
+
+function sameVertexPosition(a: Vec3, b: Vec3, eps = SPINE_VERTEX_COINCIDENT_EPS): boolean {
+  return (
+    Math.abs(a.x - b.x) < eps &&
+    Math.abs(a.y - b.y) < eps &&
+    Math.abs(a.z - b.z) < eps
+  );
+}
+
+/** First spine vertex index at `pos` (fan tips + interior-edge mids only). */
+function findCoincidentSpineVertex(
+  verts: Vec3[],
+  pos: Vec3,
+  spineVertexIds: Set<number>
+): number | null {
+  for (const id of spineVertexIds) {
+    if (sameVertexPosition(verts[id], pos)) return id;
+  }
+  return null;
+}
+
+function resolveVertexRemap(id: number, remap: Map<number, number>): number {
+  let current = id;
+  const seen = new Set<number>();
+  while (remap.has(current) && remap.get(current) !== current) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    current = remap.get(current)!;
+  }
+  return current;
+}
+
+function buildCoincidentSpineRemap(
+  verts: Vec3[],
+  spineVertexIds: Set<number>
+): Map<number, number> {
+  const ids = [...spineVertexIds].sort((a, b) => a - b);
+  const remap = new Map<number, number>();
+  for (const id of ids) remap.set(id, id);
+
+  for (const id of ids) {
+    const v = verts[id];
+    for (const c of ids) {
+      if (c >= id) break;
+      if (sameVertexPosition(verts[c], v)) {
+        remap.set(id, resolveVertexRemap(c, remap));
+        break;
+      }
+    }
+  }
+  return remap;
+}
+
+function dedupeWedges(wedges: PrunedWedge[]): void {
+  const seen = new Set<string>();
+  const unique: PrunedWedge[] = [];
+  for (const wedge of wedges) {
+    const sorted = [...wedge.vertIds].sort((a, b) => a - b).join('_');
+    const key = `${sorted}:${wedge.fromTerminalPrune ? 1 : 0}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(wedge);
+  }
+  wedges.length = 0;
+  wedges.push(...unique);
+}
+
+/**
+ * Multiple terminal fans can intrude the same triangle and create spine vertices at
+ * the same location. Merge them to the earliest index and remap wedges + axis.
+ */
+function deduplicateCoincidentSpineVertices(
+  verts: Vec3[],
+  boundaryVertexCount: number,
+  wedges: PrunedWedge[],
+  axisSegments: [number, number][],
+  spineEndpointsId: number[],
+  spineVertexIds: Set<number>
+): void {
+  const remap = buildCoincidentSpineRemap(verts, spineVertexIds);
+  const hasMerge = [...remap].some(([id, canonical]) => id !== canonical);
+  if (!hasMerge) return;
+
+  const resolve = (id: number) => {
+    if (id < boundaryVertexCount) return id;
+    return remap.has(id) ? resolveVertexRemap(id, remap) : id;
+  };
+
+  for (const wedge of wedges) {
+    wedge.vertIds = wedge.vertIds.map(resolve) as [number, number, number];
+    wedge.spineEdges = wedge.spineEdges.map(
+      ([a, b]) => [resolve(a), resolve(b)] as [number, number]
+    );
+  }
+
+  const segSeen = new Set<string>();
+  const mergedSegs: [number, number][] = [];
+  for (const [a, b] of axisSegments) {
+    const ra = resolve(a);
+    const rb = resolve(b);
+    if (ra === rb) continue;
+    const key = axisEdgeKey(ra, rb);
+    if (segSeen.has(key)) continue;
+    segSeen.add(key);
+    mergedSegs.push([ra, rb]);
+  }
+  axisSegments.length = 0;
+  axisSegments.push(...mergedSegs);
+
+  const uniqueTips: number[] = [];
+  const tipSeen = new Set<number>();
+  for (const tip of spineEndpointsId) {
+    const canonical = resolve(tip);
+    if (tipSeen.has(canonical)) continue;
+    tipSeen.add(canonical);
+    uniqueTips.push(canonical);
+  }
+  spineEndpointsId.length = 0;
+  spineEndpointsId.push(...uniqueTips);
+
+  dedupeWedges(wedges);
+}
+
 function fanTipOnInteriorEdge(
   tip: number,
   e0: number,
@@ -766,6 +950,7 @@ export function pruneToWedges(
   const interiorVerts = new Map<number, Map<number, number[]>>();
   const spineEndpointsId: number[] = [];
   const spineEndpointsTriangleId: number[] = [];
+  const spineVertexIds = new Set<number>();
   const axisSegments: [number, number][] = [];
   const addAxis = (a: number, b: number) => {
     if (a === b) return;
@@ -792,9 +977,15 @@ export function pruneToWedges(
     const existing = interiorEdgeMid.get(k);
     if (existing !== undefined) return existing;
     const mid = edgeCenter(verts[e0], verts[e1]);
+    const atPos = findCoincidentSpineVertex(verts, mid, spineVertexIds);
+    if (atPos !== null) {
+      interiorEdgeMid.set(k, atPos);
+      return atPos;
+    }
     const midIdx = verts.length;
     verts.push(mid);
     interiorEdgeMid.set(k, midIdx);
+    spineVertexIds.add(midIdx);
     return midIdx;
   };
 
@@ -931,8 +1122,16 @@ export function pruneToWedges(
       if (!interiorEdge) break;
     }
 
-    const spineIdx = verts.length;
-    verts.push(semicircleCenter);
+    let spineIdx = findCoincidentSpineVertex(
+      verts,
+      semicircleCenter,
+      spineVertexIds
+    );
+    if (spineIdx === null) {
+      spineIdx = verts.length;
+      verts.push(semicircleCenter);
+      spineVertexIds.add(spineIdx);
+    }
     spineEndpointsId.push(spineIdx);
     spineEndpointsTriangleId.push(triangleId);
 
@@ -956,7 +1155,8 @@ export function pruneToWedges(
     prunedTriangles,
     interiorVerts,
     spineEndpointsId,
-    spineEndpointsTriangleId
+    spineEndpointsTriangleId,
+    spineVertexIds
   );
 
   const postPruneInteriorEdges = triangles.map((tri) =>
@@ -1115,13 +1315,25 @@ export function pruneToWedges(
   const chordal =
     branchedSpine.length > 0 ? branchedSpine : trimmedAtFans;
 
+  deduplicateCoincidentSpineVertices(
+    verts,
+    boundaryVertexCount,
+    prunedTriangles,
+    chordal,
+    spineEndpointsId,
+    spineVertexIds
+  );
+
   return {
     wedges: prunedTriangles,
     // Fig. 13f is complete — elevation neighbors come from the subdivided wedge mesh only.
     interiorVerts: buildElevationNeighborsFromWedges(
       prunedTriangles,
       chordal,
-      boundaryVertexCount
+      boundaryVertexCount,
+      verts,
+      interiorEdgeMid,
+      spineEndpointsId
     ),
     // Paper fig. 13e: the spine is the chordal tree whose leaves land exactly on
     // each terminal fan's apex. The fan's radial spokes (tip -> boundary) belong
