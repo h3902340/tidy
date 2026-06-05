@@ -224,10 +224,6 @@ export class SurfacePainter {
     });
   }
 
-  /**
-   * Paint a stroke (render-world points) into the atlas with a round, soft-edged brush. `radii`
-   * gives the per-point world radius (so the painted band keeps a constant on-screen thickness).
-   */
   paintStroke(points: THREE.Vector3[], radii: number[], colorHex: number): void {
     if (points.length === 0) return;
     // The atlas canvas holds sRGB bytes (the texture decodes sRGB on sampling), so write the hex's
@@ -355,6 +351,17 @@ export class SurfacePainter {
         }
       }
     }
+  }
+
+  exportTextureImageData(): ImageData {
+    return this.ctx.getImageData(0, 0, this.atlasPx, this.atlasPx);
+  }
+
+  importTextureImageData(data: ImageData): boolean {
+    if (data.width !== this.atlasPx || data.height !== this.atlasPx) return false;
+    this.ctx.putImageData(data, 0, 0);
+    this.texture.needsUpdate = true;
+    return true;
   }
 
   dispose(): void {

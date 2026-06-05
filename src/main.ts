@@ -1,4 +1,5 @@
 import './style.css';
+import { EditHistory, cloneImageData, cloneMesh, type EditSnapshot } from './editHistory';
 import { computeTeddyCut, type TeddyCutResult } from './meshCut';
 import { SceneView, type DisplayMode, type InteractionMode } from './sceneView';
 import { buildTeddyPipelineFromStroke } from './teddy';
@@ -12,27 +13,34 @@ import type { Vec2 } from './math';
 
 const sceneEl = document.querySelector<HTMLElement>('#scene-view')!;
 const hintEl = document.querySelector<HTMLElement>('#canvas-hint')!;
+const navHelpEl = document.querySelector<HTMLElement>('#nav-help')!;
 const statusEl = document.querySelector<HTMLElement>('#status')!;
 const stepEl = document.querySelector<HTMLElement>('#inflation-step')!;
+const editToolsEl = document.querySelector<HTMLElement>('#edit-tools')!;
+const debugPanelEl = document.querySelector<HTMLElement>('#debug-panel')!;
+const debugModeEl = document.querySelector<HTMLInputElement>('#debug-mode')!;
 const btnClear = document.querySelector<HTMLButtonElement>('#btn-clear')!;
 const btnCircle = document.querySelector<HTMLButtonElement>('#btn-circle')!;
+const btnOval = document.querySelector<HTMLButtonElement>('#btn-oval')!;
 const btnSquare = document.querySelector<HTMLButtonElement>('#btn-square')!;
+const btnTriangle = document.querySelector<HTMLButtonElement>('#btn-triangle')!;
+const btnStar = document.querySelector<HTMLButtonElement>('#btn-star')!;
 const btnNext = document.querySelector<HTMLButtonElement>('#btn-next-step')!;
 const displayModeEl = document.querySelector<HTMLSelectElement>('#display-mode')!;
-const paintModeEl = document.querySelector<HTMLInputElement>('#paint-mode')!;
-const cutModeEl = document.querySelector<HTMLInputElement>('#cut-mode')!;
-const extrudeModeEl = document.querySelector<HTMLInputElement>('#extrude-mode')!;
 const sketchModeEl = document.querySelector<HTMLInputElement>('#sketch-mode')!;
 const paintPaletteEl = document.querySelector<HTMLDivElement>('#paint-palette')!;
 const paintColorEl = document.querySelector<HTMLInputElement>('#paint-color')!;
 const swatchEls = Array.from(paintPaletteEl.querySelectorAll<HTMLButtonElement>('.swatch'));
 const paintBrushEl = document.querySelector<HTMLInputElement>('#paint-brush')!;
 const paintBrushValueEl = document.querySelector<HTMLSpanElement>('#paint-brush-value')!;
-const btnApplyCut = document.querySelector<HTMLButtonElement>('#btn-apply-cut')!;
-const btnFillCut = document.querySelector<HTMLButtonElement>('#btn-fill-cut')!;
 const btnDiscardCut = document.querySelector<HTMLButtonElement>('#btn-discard-cut')!;
+const btnUndo = document.querySelector<HTMLButtonElement>('#btn-undo')!;
+const btnRedo = document.querySelector<HTMLButtonElement>('#btn-redo')!;
 const btnConfirmExtrude =
   document.querySelector<HTMLButtonElement>('#btn-confirm-extrude')!;
+const toolTabEls = Array.from(
+  document.querySelectorAll<HTMLButtonElement>('.tool-tab[data-mode]')
+);
 
 let stagedCutResult: TeddyCutResult | null = null;
 
@@ -59,8 +67,15 @@ let pipelineMeshes: TeddyPipelineMeshes | null = null;
 const INFLATED_COLOR = 0xffffff;
 const CUT_TRIM_COLOR = 0x8fa8c4;
 
+const editHistory = new EditHistory();
+let restoringHistory = false;
+
 const sceneView = new SceneView(sceneEl);
 sceneView.setInteractionMode('silhouette');
+
+function isDebugMode(): boolean {
+  return debugModeEl.checked;
+}
 
 function setStatus(message: string, type: 'ok' | 'error' | '' = ''): void {
   statusEl.textContent = message;
@@ -68,6 +83,10 @@ function setStatus(message: string, type: 'ok' | 'error' | '' = ''): void {
 }
 
 function setStepLabel(step: InflationStep): void {
+  if (!isDebugMode()) {
+    stepEl.textContent = '';
+    return;
+  }
   const labels: Record<InflationStep, string> = {
     idle: '',
     classified: `Step 1 of ${STEP_COUNT} — T / S / J triangles`,
@@ -79,13 +98,172 @@ function setStepLabel(step: InflationStep): void {
   stepEl.textContent = labels[step];
 }
 
+function syncToolTabs(mode: InteractionMode): void {
+  const mapped =
+    mode === 'paint'
+      ? 'paint'
+      : mode === 'cut'
+        ? 'cut'
+        : mode === 'extrude'
+          ? 'extrude'
+          : 'orbit';
+  for (const tab of toolTabEls) {
+    tab.classList.toggle('is-active', tab.dataset.mode === mapped);
+  }
+}
+
 function setInteractionMode(mode: InteractionMode): void {
   sceneView.setInteractionMode(mode);
-  paintModeEl.checked = mode === 'paint';
-  cutModeEl.checked = mode === 'cut';
-  extrudeModeEl.checked = mode === 'extrude';
+  syncToolTabs(mode);
   paintPaletteEl.hidden = mode !== 'paint';
-  if (mode !== 'extrude') btnConfirmExtrude.disabled = true;
+  updateExtrudeConfirmButton();
+}
+
+function navItem(action: string, control: string): string {
+  return `<span class="nav-help-item"><kbd>${control}</kbd> ${action}</span>`;
+}
+
+function navSep(): string {
+  return '<span class="nav-help-sep" aria-hidden="true">·</span>';
+}
+
+function updateNavHelp(): void {
+  const mode = sceneView.getInteractionMode();
+
+  if (mode === 'paint') {
+    navHelpEl.innerHTML = [
+      navItem('paint', 'Left-drag'),
+      navSep(),
+      navItem('rotate', 'Right-drag'),
+      navSep(),
+      navItem('zoom', 'Scroll'),
+      navSep(),
+      navItem('pan', 'Middle-drag'),
+    ].join('');
+    return;
+  }
+
+  if (mode === 'silhouette') {
+    navHelpEl.innerHTML = navItem('draw shape', 'Left-drag');
+    return;
+  }
+
+  if (mode === 'cut') {
+    if (sceneView.hasPendingCut() || sceneView.getLoopCutPhase() !== 'idle') {
+      navHelpEl.innerHTML = [
+        navItem('rotate', 'Drag'),
+        navSep(),
+        navItem('zoom', 'Scroll'),
+        navSep(),
+        navItem('pan', 'Right-drag'),
+      ].join('');
+      return;
+    }
+    navHelpEl.innerHTML = [
+      navItem('draw cut', 'Left-drag'),
+      navSep(),
+      navItem('rotate', 'Right-drag'),
+      navSep(),
+      navItem('zoom', 'Scroll'),
+      navSep(),
+      navItem('pan', 'Middle-drag'),
+    ].join('');
+    return;
+  }
+
+  if (mode === 'extrude') {
+    if (sceneView.getExtrudePhase() === 'orient') {
+      navHelpEl.innerHTML = [
+        navItem('rotate', 'Drag'),
+        navSep(),
+        navItem('zoom', 'Scroll'),
+        navSep(),
+        navItem('pan', 'Right-drag'),
+      ].join('');
+      return;
+    }
+    navHelpEl.innerHTML = navItem('draw on surface', 'Left-drag');
+    return;
+  }
+
+  navHelpEl.innerHTML = [
+    navItem('rotate', 'Drag'),
+    navSep(),
+    navItem('zoom', 'Scroll'),
+    navSep(),
+    navItem('pan', 'Right-drag'),
+  ].join('');
+}
+
+function updateExtrudeConfirmButton(): void {
+  const show =
+    sceneView.getInteractionMode() === 'extrude' &&
+    sceneView.getExtrudePhase() === 'orient';
+  btnConfirmExtrude.hidden = !show;
+  updateNavHelp();
+}
+
+function updateDebugPanelVisibility(): void {
+  debugPanelEl.hidden = !isDebugMode();
+  setStepLabel(inflationStep);
+}
+
+function captureEditSnapshot(): EditSnapshot | null {
+  const mesh = sceneView.getCurrentMesh();
+  if (!mesh) return null;
+  const paint = sceneView.capturePaintTexture();
+  return {
+    mesh: cloneMesh(mesh),
+    paint: paint ? cloneImageData(paint) : undefined,
+  };
+}
+
+function updateHistoryButtons(): void {
+  btnUndo.disabled = !editHistory.canUndo();
+  btnRedo.disabled = !editHistory.canRedo();
+}
+
+function finalizeAfterHistoryRestore(): void {
+  polygonReady = true;
+  inflationStep = 'done';
+  pipelineMeshes = null;
+  clearStagedCut();
+  btnNext.disabled = true;
+  setStepLabel('done');
+  enablePostInflationControls(true);
+  setInteractionMode('orbit');
+  updateCutActionButtons();
+  updateExtrudeConfirmButton();
+  updateHistoryButtons();
+  updateHint();
+}
+
+function commitEditHistory(): void {
+  if (restoringHistory) return;
+  const snapshot = captureEditSnapshot();
+  if (!snapshot) return;
+  editHistory.push(snapshot);
+  updateHistoryButtons();
+}
+
+function performUndo(): void {
+  if (!editHistory.canUndo()) return;
+  const snapshot = editHistory.undo();
+  if (!snapshot) return;
+  restoringHistory = true;
+  sceneView.applyEditSnapshot(snapshot.mesh, snapshot.paint);
+  restoringHistory = false;
+  finalizeAfterHistoryRestore();
+}
+
+function performRedo(): void {
+  if (!editHistory.canRedo()) return;
+  const snapshot = editHistory.redo();
+  if (!snapshot) return;
+  restoringHistory = true;
+  sceneView.applyEditSnapshot(snapshot.mesh, snapshot.paint);
+  restoringHistory = false;
+  finalizeAfterHistoryRestore();
 }
 
 function applyPaintColor(hex: string): void {
@@ -117,55 +295,66 @@ function classifiedFaceColors(types: TriangleType[]): number[] {
 }
 
 function updateHint(): void {
-  if (inflationStep === 'classified') {
+  if (isDebugMode()) {
+    if (inflationStep === 'classified') {
+      hintEl.textContent =
+        'Debug — yellow T, white S, pink J. Press Next step to continue.';
+      return;
+    }
+    if (inflationStep === 'fan') {
+      hintEl.textContent = 'Debug — green terminal fans on the CDT mesh.';
+      return;
+    }
+    if (inflationStep === 'spine') {
+      hintEl.textContent = 'Debug — spine overlaid on the fan mesh.';
+      return;
+    }
+    if (inflationStep === 'elevated') {
+      hintEl.textContent = 'Debug — elevated spine with height labels.';
+      return;
+    }
+  }
+
+  if (!polygonReady && inflationStep === 'idle') {
+    hintEl.textContent = 'Draw a closed loop on the plane, or pick a preset shape';
+    return;
+  }
+
+  const mode = sceneView.getInteractionMode();
+  if (mode === 'paint') {
+    hintEl.textContent = 'Paint on the surface — pick a color and brush size above';
+    return;
+  }
+  if (mode === 'cut') {
     hintEl.textContent =
-      'Yellow T = terminal, white S = sleeve, pink J = junction (paper fig. b) — continue';
+      'Draw across the shape to cut through, or draw a closed loop on the surface to remove a patch';
     return;
   }
-  if (inflationStep === 'fan') {
-    hintEl.textContent =
-      'Green = terminal fan triangles (fig. d) on T/S/J CDT — continue to spine';
-    return;
-  }
-  if (inflationStep === 'spine') {
-    hintEl.textContent =
-      'Fig. 13f fan mesh — black spine should lie on the surface; green = terminal fans';
-    return;
-  }
-  if (inflationStep === 'elevated') {
-    hintEl.textContent =
-      'Elevated fan mesh — spine dots sit on raised surface vertices; labels show height (z)';
-    return;
-  }
-  if (!polygonReady) {
-    hintEl.textContent = 'Draw one closed loop on the 3D plane';
-    return;
-  }
-  if (paintModeEl.checked) {
-    hintEl.textContent = 'Paint on surface (red)';
-    return;
-  }
-  if (cutModeEl.checked) {
-    hintEl.textContent =
-      'Cut: open stroke across the object = cut through; closed loop on the surface = loop cut.';
-    return;
-  }
-  if (extrudeModeEl.checked) {
-    hintEl.textContent =
-      'Closed loop on surface → rotate → Confirm orientation → stroke across the loop.';
+  if (mode === 'extrude') {
+    const phase = sceneView.getExtrudePhase();
+    if (phase === 'orient') {
+      hintEl.textContent =
+        'Rotate to set the extrusion direction, then press Confirm orientation (top right)';
+      return;
+    }
+    if (phase === 'curve') {
+      hintEl.textContent = 'Draw the extruding stroke across the red loop';
+      return;
+    }
+    hintEl.textContent = 'Draw a closed loop on the surface to define the extrusion base';
     return;
   }
   hintEl.textContent = 'Drag to rotate · scroll to zoom · right-drag to pan';
 }
 
 function enablePostInflationControls(enabled: boolean): void {
+  editToolsEl.hidden = !enabled;
   displayModeEl.disabled = !enabled;
-  paintModeEl.disabled = !enabled;
-  cutModeEl.disabled = !enabled;
-  extrudeModeEl.disabled = !enabled;
   sketchModeEl.disabled = !enabled;
+  btnUndo.disabled = !enabled || !editHistory.canUndo();
+  btnRedo.disabled = !enabled || !editHistory.canRedo();
   if (!enabled) {
-    btnConfirmExtrude.disabled = true;
+    updateExtrudeConfirmButton();
     updateCutActionButtons();
   }
 }
@@ -174,20 +363,78 @@ function isLoopCutActive(): boolean {
   return sceneView.getLoopCutPhase() !== 'idle';
 }
 
+function inflationPipelineActive(): boolean {
+  return inflationStep !== 'idle' && inflationStep !== 'done';
+}
+
+function isCutDebugActive(): boolean {
+  return isLoopCutActive() || sceneView.hasPendingCut() || stagedCutResult !== null;
+}
+
 function updateCutActionButtons(): void {
-  if (isLoopCutActive()) {
-    // Loop cut reuses the same buttons across its three stages.
-    const phase = sceneView.getLoopCutPhase();
-    btnApplyCut.disabled = phase !== 'projected';
-    btnFillCut.disabled = phase !== 'cut';
-    btnDiscardCut.disabled = phase === 'idle';
+  if (!isDebugMode()) {
+    btnDiscardCut.disabled = true;
+    if (inflationStep === 'done') {
+      btnNext.disabled = true;
+      btnNext.textContent = 'Done';
+    }
     return;
   }
+
+  if (inflationPipelineActive()) {
+    btnDiscardCut.disabled = true;
+    return;
+  }
+
+  if (isLoopCutActive()) {
+    const phase = sceneView.getLoopCutPhase();
+    btnDiscardCut.disabled = phase === 'idle';
+    if (phase === 'projected') {
+      btnNext.disabled = false;
+      btnNext.textContent = 'Next: Remove triangles';
+    } else if (phase === 'cut') {
+      btnNext.disabled = false;
+      btnNext.textContent = 'Next: Fill hole';
+    } else {
+      btnNext.disabled = true;
+      btnNext.textContent = 'Done';
+    }
+    return;
+  }
+
   const pending = sceneView.hasPendingCut();
   const staged = stagedCutResult !== null;
-  btnApplyCut.disabled = !pending || staged;
-  btnFillCut.disabled = !staged;
   btnDiscardCut.disabled = !pending && !staged;
+
+  if (pending && !staged) {
+    btnNext.disabled = false;
+    btnNext.textContent = 'Next: Remove triangles';
+  } else if (staged) {
+    btnNext.disabled = false;
+    btnNext.textContent = 'Next: Fill hole';
+  } else {
+    btnNext.disabled = true;
+    btnNext.textContent = 'Done';
+  }
+}
+
+function advanceCutDebugStep(): void {
+  if (isLoopCutActive()) {
+    const phase = sceneView.getLoopCutPhase();
+    if (phase === 'projected') {
+      sceneView.applyLoopCut();
+    } else if (phase === 'cut') {
+      sceneView.fillLoopCut();
+    }
+    return;
+  }
+  if (stagedCutResult) {
+    applyFillCutHole();
+    return;
+  }
+  if (sceneView.hasPendingCut()) {
+    applyPendingCutRemoval();
+  }
 }
 
 function clearStagedCut(): void {
@@ -203,6 +450,8 @@ function resetInflationFlow(): void {
   btnNext.textContent = 'Next step';
   setStepLabel('idle');
   enablePostInflationControls(false);
+  editHistory.clear();
+  updateHistoryButtons();
 }
 
 function showClassifiedStep(): void {
@@ -220,7 +469,7 @@ function showClassifiedStep(): void {
   setInteractionMode('orbit');
   const counts = countTriangleTypes(pipelineMeshes.classifiedFaceTypes);
   setStatus(
-    `Step 1 — ${pipelineMeshes.classified.faces.length} CDT triangles: ${counts.T} terminal (T), ${counts.S} sleeve (S), ${counts.J} junction (J).`,
+    `Step 1 — ${pipelineMeshes.classified.faces.length} CDT triangles: ${counts.T} T, ${counts.S} S, ${counts.J} J.`,
     'ok'
   );
   updateHint();
@@ -242,7 +491,7 @@ function showFanStep(): void {
   btnNext.textContent = 'Next: show spine';
   setStepLabel('fan');
   setStatus(
-    `Step 2 — ${pipelineMeshes.terminalFans.faces.length} terminal fan triangles (green) on ${pipelineMeshes.classified.faces.length} CDT triangles.`,
+    `Step 2 — ${pipelineMeshes.terminalFans.faces.length} terminal fan triangles (green).`,
     'ok'
   );
   updateHint();
@@ -251,7 +500,6 @@ function showFanStep(): void {
 function showSpineStep(): void {
   if (!pipelineMeshes) return;
   inflationStep = 'spine';
-  // Fig. 13f fan mesh — spine vertices share this mesh at z = 0.
   sceneView.setMesh(pipelineMeshes.fan, {
     color: 0xe8e8e8,
     wireColor: 0x4a4a48,
@@ -269,7 +517,7 @@ function showSpineStep(): void {
   btnNext.textContent = 'Next: elevate spine';
   setStepLabel('spine');
   setStatus(
-    `Step 3 — fig. 13f fan mesh with spine overlaid (${pipelineMeshes.spineSegments.length} segments). Black dots should sit on the surface.`,
+    `Step 3 — fan mesh with spine (${pipelineMeshes.spineSegments.length} segments).`,
     'ok'
   );
   updateHint();
@@ -279,7 +527,6 @@ function showElevatedStep(): void {
   if (!pipelineMeshes) return;
   inflationStep = 'elevated';
   sceneView.clearSecondaryMesh();
-  // Same fan topology with spine heights applied to spine nodes (paper §5.1).
   const elevatedFan: Mesh3D = {
     vertices: pipelineMeshes.elevatedSpineVertices,
     faces: pipelineMeshes.fan.faces,
@@ -295,10 +542,7 @@ function showElevatedStep(): void {
   );
   btnNext.textContent = 'Next: full inflation';
   setStepLabel('elevated');
-  setStatus(
-    `Step 4 — elevated fan mesh (${elevatedFan.faces.length} triangles) with spine on the surface. Height labels show spine z; orbit to inspect fit.`,
-    'ok'
-  );
+  setStatus(`Step 4 — elevated fan mesh with spine heights.`, 'ok');
   updateHint();
 }
 
@@ -307,6 +551,7 @@ function showInflatedStep(): void {
   inflationStep = 'done';
   polygonReady = true;
   sceneView.clearSpineOverlay();
+  sceneView.clearSecondaryMesh();
   sceneView.setMesh(pipelineMeshes.inflated, {
     color: INFLATED_COLOR,
     flatShading: true,
@@ -317,10 +562,13 @@ function showInflatedStep(): void {
   enablePostInflationControls(true);
   setInteractionMode('orbit');
   setStatus(
-    `Step 5 — ${pipelineMeshes.inflated.faces.length} triangles with quarter-oval spokes, rim, and corrected normals.`,
+    isDebugMode()
+      ? `Step 5 — ${pipelineMeshes.inflated.faces.length} triangles inflated.`
+      : 'Shape inflated. Drag to rotate, or pick a tool to edit.',
     'ok'
   );
   updateHint();
+  commitEditHistory();
 }
 
 function countTriangleTypes(types: TriangleType[]): {
@@ -341,7 +589,7 @@ function countTriangleTypes(types: TriangleType[]): {
 
 function startPipeline(ring: Vec2[]): void {
   resetInflationFlow();
-  setStatus('Building pipeline…');
+  setStatus('Building your shape…');
   const { meshes, error } = buildTeddyPipelineFromStroke(ring);
 
   if (error || !meshes) {
@@ -351,7 +599,23 @@ function startPipeline(ring: Vec2[]): void {
   }
 
   pipelineMeshes = meshes;
-  showClassifiedStep();
+  if (isDebugMode()) {
+    showClassifiedStep();
+  } else {
+    showInflatedStep();
+  }
+}
+
+function autoCompleteLoopCut(): void {
+  const phase = sceneView.getLoopCutPhase();
+  if (phase === 'projected') {
+    sceneView.applyLoopCut();
+    if (sceneView.getLoopCutPhase() === 'cut') {
+      sceneView.fillLoopCut();
+    }
+  } else if (phase === 'cut') {
+    sceneView.fillLoopCut();
+  }
 }
 
 sceneView.setOnSilhouetteComplete((closed) => {
@@ -359,6 +623,10 @@ sceneView.setOnSilhouetteComplete((closed) => {
 });
 
 btnNext.addEventListener('click', () => {
+  if (isDebugMode() && !inflationPipelineActive() && isCutDebugActive()) {
+    advanceCutDebugStep();
+    return;
+  }
   if (!pipelineMeshes) return;
   switch (inflationStep) {
     case 'classified':
@@ -378,12 +646,17 @@ btnNext.addEventListener('click', () => {
   }
 });
 
+sceneView.setOnPaintComplete(() => {
+  commitEditHistory();
+});
+
 sceneView.setOnExtrudeStatus((message, type) => {
   setStatus(message, type);
 });
 
 sceneView.setOnExtrudeLoopReady(() => {
-  btnConfirmExtrude.disabled = false;
+  updateExtrudeConfirmButton();
+  updateHint();
 });
 
 sceneView.setOnExtrudeComplete((mesh) => {
@@ -392,23 +665,28 @@ sceneView.setOnExtrudeComplete((mesh) => {
   inflationStep = 'done';
   pipelineMeshes = null;
   btnNext.disabled = true;
-  btnConfirmExtrude.disabled = true;
+  updateExtrudeConfirmButton();
   setStepLabel('done');
   enablePostInflationControls(true);
   setInteractionMode('orbit');
-  setStatus(
-    `Extrusion complete — swept mesh now has ${mesh.faces.length} triangles. Drag to rotate.`,
-    'ok'
-  );
+  setStatus('Extrusion complete. Drag to rotate or pick another tool.', 'ok');
   updateHint();
+  commitEditHistory();
 });
 
 sceneView.setOnLoopCutStatus((message, type) => {
-  setStatus(message, type);
+  if (isDebugMode() || type === 'error') {
+    setStatus(message, type);
+  }
 });
 
 sceneView.setOnLoopCutPhaseChange(() => {
-  updateCutActionButtons();
+  if (isDebugMode()) {
+    updateCutActionButtons();
+  } else {
+    autoCompleteLoopCut();
+  }
+  updateNavHelp();
 });
 
 sceneView.setOnLoopCutComplete((mesh) => {
@@ -421,7 +699,9 @@ sceneView.setOnLoopCutComplete((mesh) => {
   enablePostInflationControls(true);
   setInteractionMode('orbit');
   updateCutActionButtons();
+  setStatus('Cut complete. Drag to rotate or pick another tool.', 'ok');
   updateHint();
+  commitEditHistory();
 });
 
 sceneView.setOnCutRejected((message) => {
@@ -430,14 +710,20 @@ sceneView.setOnCutRejected((message) => {
 
 sceneView.setOnCutPendingChange(() => {
   updateCutActionButtons();
+  updateNavHelp();
 });
 
-sceneView.setOnCutPreview((payload) => {
-  updateCutActionButtons();
-  setStatus(
-    `Cut projected — cyan = front (${payload.frontPath.length} pts), magenta = back (${payload.backPath.length} pts). Orbit to inspect, then Remove triangles.`,
-    'ok'
-  );
+sceneView.setOnCutPreview(() => {
+  if (isDebugMode()) {
+    updateCutActionButtons();
+    const payload = sceneView.getPendingCut();
+    setStatus(
+      `Cut projected — cyan front (${payload?.frontPath.length ?? 0} pts), magenta back (${payload?.backPath.length ?? 0} pts). Press Next: Remove triangles when ready.`,
+      'ok'
+    );
+    return;
+  }
+  applyCutImmediately();
 });
 
 function applyPendingCutRemoval(): void {
@@ -483,7 +769,7 @@ function applyPendingCutRemoval(): void {
 
   const kept = result.trimmed.faces.length;
   setStatus(
-    `Step 1 — removed ${totalFaces - kept} of ${totalFaces} triangles (open cut). Inspect, then Fill hole.`,
+    `Removed ${totalFaces - kept} of ${totalFaces} triangles. Press Next: Fill hole when ready.`,
     'ok'
   );
 }
@@ -503,29 +789,64 @@ function applyFillCutHole(): void {
   enablePostInflationControls(true);
   setInteractionMode('orbit');
 
-  const { capped, polygon } = stagedCutResult;
+  const { capped } = stagedCutResult;
   clearStagedCut();
   setStatus(
-    `Step 2 — hole filled (${capped.faces.length} triangles, ${capped.vertices.length} vertices). Top outline has ${polygon.length} points.`,
+    isDebugMode()
+      ? `Hole filled — ${capped.faces.length} triangles.`
+      : 'Cut complete. Drag to rotate or pick another tool.',
     'ok'
   );
+  updateHint();
+  commitEditHistory();
 }
 
-btnApplyCut.addEventListener('click', () => {
-  if (isLoopCutActive()) {
-    sceneView.applyLoopCut();
-    return;
-  }
-  applyPendingCutRemoval();
-});
+function applyCutImmediately(): void {
+  const pending = sceneView.getPendingCut();
+  if (!pending) return;
 
-btnFillCut.addEventListener('click', () => {
-  if (isLoopCutActive()) {
-    sceneView.fillLoopCut();
+  const mesh = sceneView.getCurrentMesh();
+  if (!mesh || mesh.vertices.length === 0) {
+    setStatus('No 3D object to cut.', 'error');
     return;
   }
-  applyFillCutHole();
-});
+
+  const result = computeTeddyCut(
+    mesh,
+    pending.screenStroke,
+    pending.camera,
+    sceneView.getOverlayElement(),
+    pending.validated,
+    sceneView.getMeshObject() ?? undefined,
+    {
+      frontPath: pending.frontPath,
+      backPath: pending.backPath,
+    }
+  );
+
+  sceneView.clearPendingCut();
+  sceneView.clearCutProjectionPreview();
+
+  if ('error' in result) {
+    clearStagedCut();
+    setStatus(result.error, 'error');
+    return;
+  }
+
+  sceneView.setMesh(result.capped, {
+    color: INFLATED_COLOR,
+    flatShading: true,
+  });
+  polygonReady = true;
+  inflationStep = 'done';
+  pipelineMeshes = null;
+  btnNext.disabled = true;
+  setStepLabel('done');
+  clearStagedCut();
+  setStatus('Cut complete. Drag to rotate or pick another tool.', 'ok');
+  updateHint();
+  commitEditHistory();
+}
 
 btnDiscardCut.addEventListener('click', () => {
   if (isLoopCutActive()) {
@@ -544,55 +865,24 @@ displayModeEl.addEventListener('change', () => {
 });
 sceneView.setDisplayMode(displayModeEl.value as DisplayMode);
 
-function anyEditModeActive(): boolean {
-  return paintModeEl.checked || cutModeEl.checked || extrudeModeEl.checked;
+for (const tab of toolTabEls) {
+  tab.addEventListener('click', () => {
+    if (!polygonReady) return;
+    const mode = tab.dataset.mode as 'orbit' | 'paint' | 'cut' | 'extrude';
+    setInteractionMode(mode);
+
+    if (mode === 'paint') {
+      setStatus('Paint mode — pick a color and draw on the surface.');
+    } else if (mode === 'cut') {
+      updateCutActionButtons();
+      setStatus('Cut mode — draw across the shape or a closed loop on the surface.');
+    } else if (mode === 'orbit') {
+      setStatus('');
+    }
+    updateExtrudeConfirmButton();
+    updateHint();
+  });
 }
-
-paintModeEl.addEventListener('change', () => {
-  if (!polygonReady) return;
-  if (paintModeEl.checked) {
-    cutModeEl.checked = false;
-    extrudeModeEl.checked = false;
-    setInteractionMode('paint');
-    setStatus('Paint mode: pick a color, then draw on the surface to bake it in.');
-  } else if (!anyEditModeActive()) {
-    setInteractionMode('orbit');
-    setStatus('Drag to rotate · scroll to zoom · right-drag to pan.');
-  }
-  updateHint();
-});
-
-cutModeEl.addEventListener('change', () => {
-  if (!polygonReady) return;
-  if (cutModeEl.checked) {
-    paintModeEl.checked = false;
-    extrudeModeEl.checked = false;
-    setInteractionMode('cut');
-    updateCutActionButtons();
-    setStatus(
-      'Cut: draw an open stroke across the object to cut through, or a closed loop on the surface to remove it.',
-    );
-  } else if (!anyEditModeActive()) {
-    setInteractionMode('orbit');
-    setStatus('Drag to rotate · scroll to zoom · right-drag to pan.');
-  }
-  updateCutActionButtons();
-  updateHint();
-});
-
-extrudeModeEl.addEventListener('change', () => {
-  if (!polygonReady) return;
-  if (extrudeModeEl.checked) {
-    paintModeEl.checked = false;
-    cutModeEl.checked = false;
-    btnConfirmExtrude.disabled = true;
-    setInteractionMode('extrude');
-  } else if (!anyEditModeActive()) {
-    setInteractionMode('orbit');
-    setStatus('Drag to rotate · scroll to zoom · right-drag to pan.');
-  }
-  updateHint();
-});
 
 sketchModeEl.addEventListener('change', () => {
   sceneView.setSketchMode(sketchModeEl.checked);
@@ -600,12 +890,88 @@ sketchModeEl.addEventListener('change', () => {
 
 btnConfirmExtrude.addEventListener('click', () => {
   if (sceneView.confirmExtrudeOrientation()) {
-    btnConfirmExtrude.disabled = true;
+    updateExtrudeConfirmButton();
+    updateHint();
   }
+});
+
+btnUndo.addEventListener('click', () => {
+  performUndo();
+});
+
+btnRedo.addEventListener('click', () => {
+  performRedo();
+});
+
+window.addEventListener('keydown', (e) => {
+  if (!(e.metaKey || e.ctrlKey)) return;
+  const target = e.target;
+  if (
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement ||
+    target instanceof HTMLSelectElement
+  ) {
+    return;
+  }
+  if (e.key === 'z' && !e.shiftKey) {
+    e.preventDefault();
+    performUndo();
+  } else if ((e.key === 'z' && e.shiftKey) || e.key === 'y') {
+    e.preventDefault();
+    performRedo();
+  }
+});
+
+debugModeEl.addEventListener('change', () => {
+  updateDebugPanelVisibility();
+  updateCutActionButtons();
+  updateHint();
 });
 
 /** World-space radius for preset shapes on z = 0 (independent of camera projection). */
 const PRESET_RADIUS = 100;
+const PRESET_OVAL_RX = 100;
+const PRESET_OVAL_RY = 60;
+const PRESET_STAR_OUTER = 100;
+const PRESET_STAR_INNER = 40;
+
+function buildCircleRing(radius: number, segments = 64): Vec2[] {
+  const ring: Vec2[] = [];
+  for (let i = 0; i <= segments; i++) {
+    const t = (i / segments) * Math.PI * 2;
+    ring.push({ x: Math.cos(t) * radius, y: Math.sin(t) * radius });
+  }
+  return ring;
+}
+
+function buildEllipseRing(rx: number, ry: number, segments = 64): Vec2[] {
+  const ring: Vec2[] = [];
+  for (let i = 0; i <= segments; i++) {
+    const t = (i / segments) * Math.PI * 2;
+    ring.push({ x: Math.cos(t) * rx, y: Math.sin(t) * ry });
+  }
+  return ring;
+}
+
+function buildStarRing(outerR: number, innerR: number, points = 5): Vec2[] {
+  const ring: Vec2[] = [];
+  const total = points * 2;
+  for (let i = 0; i <= total; i++) {
+    const t = (i / total) * Math.PI * 2 - Math.PI / 2;
+    const r = i % 2 === 0 ? outerR : innerR;
+    ring.push({ x: Math.cos(t) * r, y: Math.sin(t) * r });
+  }
+  return ring;
+}
+
+function buildTriangleRing(radius: number): Vec2[] {
+  const ring: Vec2[] = [];
+  for (let i = 0; i <= 3; i++) {
+    const t = -Math.PI / 2 + (i / 3) * Math.PI * 2;
+    ring.push({ x: Math.cos(t) * radius, y: Math.sin(t) * radius });
+  }
+  return ring;
+}
 
 function createPresetStroke(worldRing: Vec2[]): void {
   if (polygonReady || inflationStep !== 'idle') {
@@ -616,16 +982,11 @@ function createPresetStroke(worldRing: Vec2[]): void {
 }
 
 btnCircle.addEventListener('click', () => {
-  const segments = 64;
-  const ring: Vec2[] = [];
-  for (let i = 0; i <= segments; i++) {
-    const t = (i / segments) * Math.PI * 2;
-    ring.push({
-      x: Math.cos(t) * PRESET_RADIUS,
-      y: Math.sin(t) * PRESET_RADIUS,
-    });
-  }
-  createPresetStroke(ring);
+  createPresetStroke(buildCircleRing(PRESET_RADIUS));
+});
+
+btnOval.addEventListener('click', () => {
+  createPresetStroke(buildEllipseRing(PRESET_OVAL_RX, PRESET_OVAL_RY));
 });
 
 btnSquare.addEventListener('click', () => {
@@ -639,23 +1000,30 @@ btnSquare.addEventListener('click', () => {
   ]);
 });
 
+btnTriangle.addEventListener('click', () => {
+  createPresetStroke(buildTriangleRing(PRESET_RADIUS));
+});
+
+btnStar.addEventListener('click', () => {
+  createPresetStroke(buildStarRing(PRESET_STAR_OUTER, PRESET_STAR_INNER));
+});
+
 btnClear.addEventListener('click', () => {
   resetInflationFlow();
   clearStagedCut();
   sceneView.clear();
-  paintModeEl.checked = false;
-  cutModeEl.checked = false;
-  extrudeModeEl.checked = false;
   sketchModeEl.checked = false;
   sceneView.setSketchMode(false);
   paintPaletteEl.hidden = true;
-  btnConfirmExtrude.disabled = true;
-  setStatus('Cleared. Draw a new closed loop on the 3D plane.');
+  updateExtrudeConfirmButton();
+  syncToolTabs('silhouette');
+  setStatus('');
   updateHint();
 });
 
 resetInflationFlow();
-setStatus(
-  'Draw a closed loop, then use Next to step through T/S/J → fans → spine → elevated → full inflation.'
-);
+updateDebugPanelVisibility();
+updateExtrudeConfirmButton();
+updateNavHelp();
+updateHistoryButtons();
 updateHint();

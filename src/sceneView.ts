@@ -45,6 +45,7 @@ export type ExtrudeStatusHandler = (message: string, type: 'ok' | 'error') => vo
 export type ExtrudeMeshHandler = (mesh: Mesh3D) => void;
 export type SurfaceEditStatusHandler = (message: string, type: 'ok' | 'error') => void;
 export type SurfaceEditMeshHandler = (mesh: Mesh3D) => void;
+export type PaintCompleteHandler = () => void;
 
 const CUT_LINE_COLOR = 0xd35400;
 /** Base ring highlight while in extrusion mode (paper turns the surface line red). */
@@ -99,8 +100,8 @@ const SPINE_TUBE_RADIUS = 0.4;
 /** Colour and radius for the internal-edge midpoint dots drawn on the spine step. */
 const SPINE_DOT_COLOR = 0x000000;
 const SPINE_DOT_RADIUS = 1.0;
-/** Recompute cut silhouette only after the camera has been idle this long (ms). */
-const SILHOUETTE_IDLE_MS = 3000;
+/** Recompute cut silhouette after the camera has been idle this long (incl. damping). */
+const SILHOUETTE_IDLE_MS = 200;
 const DEFAULT_CAMERA_POSITION = new THREE.Vector3(0, -180, 220);
 const DEFAULT_ORBIT_TARGET = new THREE.Vector3(0, 0, 0);
 /**
@@ -133,7 +134,7 @@ export class SceneView {
   private wireframe: THREE.LineSegments | null = null;
   private secondaryMeshObject: THREE.Mesh | null = null;
   private secondaryWireframe: THREE.LineSegments | null = null;
-  private displayMode: DisplayMode = 'both';
+  private displayMode: DisplayMode = 'solid';
   private interactionMode: InteractionMode = 'silhouette';
   private surfaceLinesGroup: THREE.Group;
   private cutPreviewGroup: THREE.Group;
@@ -162,6 +163,7 @@ export class SceneView {
   private onLoopCutStatus: SurfaceEditStatusHandler | null = null;
   private onLoopCutComplete: SurfaceEditMeshHandler | null = null;
   private onLoopCutPhaseChange: (() => void) | null = null;
+  private onPaintComplete: PaintCompleteHandler | null = null;
   private loopCutPhase: LoopCutPhase = 'idle';
   private loopCutBase: ExtrusionBase | null = null;
   private loopCutMeshBeforeCut: Mesh3D | null = null;
@@ -225,6 +227,11 @@ export class SceneView {
     this.controls.minDistance = 50;
     this.controls.maxDistance = 800;
     this.controls.target.copy(DEFAULT_ORBIT_TARGET);
+    this.controls.addEventListener('start', () => {
+      if (this.interactionMode === 'cut') {
+        this.onCutCameraInteractionStart();
+      }
+    });
     this.controls.addEventListener('change', () => {
       if (this.interactionMode === 'cut') {
         this.scheduleCutSilhouetteRefreshOnCameraIdle();
@@ -282,6 +289,7 @@ export class SceneView {
 
     this.bindOverlayEvents();
     this.bindPaintEvents();
+    this.bindCutEvents();
     window.addEventListener('resize', () => this.onResize());
     this.resizeOverlay();
     this.animate();
@@ -348,6 +356,10 @@ export class SceneView {
     this.onLoopCutPhaseChange = handler;
   }
 
+  setOnPaintComplete(handler: PaintCompleteHandler | null): void {
+    this.onPaintComplete = handler;
+  }
+
   getLoopCutPhase(): LoopCutPhase {
     return this.loopCutPhase;
   }
@@ -370,6 +382,10 @@ export class SceneView {
     this.interactionMode = mode;
     if (mode !== 'extrude') this.resetExtrudeState();
     if (mode !== 'cut') this.resetLoopCutState();
+    if (mode !== 'cut') {
+      this.cutSilhouette = [];
+      this.cancelSilhouetteIdleRefresh();
+    }
     const overlayActive =
       mode === 'silhouette' ||
       mode === 'paint' ||
@@ -378,8 +394,11 @@ export class SceneView {
     if (!overlayActive) {
       this.painting = false;
       this.paintStroke = [];
-      this.cutSilhouette = [];
-      this.cancelSilhouetteIdleRefresh();
+      this.discardPendingCut();
+      this.clearOverlay();
+    } else if (mode === 'paint') {
+      this.painting = false;
+      this.paintStroke = [];
       this.discardPendingCut();
       this.clearOverlay();
     } else if (mode === 'cut') {
@@ -389,6 +408,8 @@ export class SceneView {
       this.paintStroke = [];
       this.discardPendingCut();
       this.resetLoopCutState();
+      clearOrbitControlsInertia(this.controls);
+      this.controls.update();
       this.scheduleCutSilhouetteRefreshImmediate();
     } else if (mode === 'extrude') {
       this.painting = false;
@@ -400,29 +421,32 @@ export class SceneView {
     this.syncPointerAndOrbitState();
   }
 
+  getInteractionMode(): InteractionMode {
+    return this.interactionMode;
+  }
+
   /** Overlay captures strokes; orbit uses the canvas during a cut review or extrusion re-orient. */
   private syncPointerAndOrbitState(): void {
     const cutMode = this.interactionMode === 'cut';
     const cutReviewing = cutMode && this.pendingCut !== null;
     const loopCutReviewing = cutMode && this.loopCutPhase !== 'idle';
-    // Drawing sub-state of cut mode: nothing staged yet, so the overlay captures the stroke.
     const cutDrawing = cutMode && this.pendingCut === null && this.loopCutPhase === 'idle';
     const extrudeDrawing =
       this.interactionMode === 'extrude' &&
       (this.extrudePhase === 'loop' || this.extrudePhase === 'curve');
     const extrudeOrbit =
       this.interactionMode === 'extrude' && this.extrudePhase === 'orient';
-    // Paint mode is excluded: painting happens on the WebGL canvas (left button) while the camera
-    // controls handle the other buttons, so the overlay must stay click-through.
+    const paintMode = this.interactionMode === 'paint';
+    const canvasDrawMode = paintMode || cutDrawing;
+    // Cut strokes use the WebGL canvas (like paint) so right/middle drag can orbit.
     const overlayActive =
-      this.interactionMode === 'silhouette' || cutDrawing || extrudeDrawing;
+      this.interactionMode === 'silhouette' || extrudeDrawing;
 
     this.overlayCanvas.classList.toggle('overlay-interactive', overlayActive);
 
-    const paintMode = this.interactionMode === 'paint';
-    this.renderer.domElement.classList.toggle('paint-cursor', paintMode);
-    if (paintMode) {
-      // Left is reserved for painting; orbit/pan move to the right/middle buttons (wheel = zoom).
+    this.renderer.domElement.classList.toggle('paint-cursor', canvasDrawMode);
+    if (canvasDrawMode) {
+      // Left is reserved for drawing; orbit/pan move to the right/middle buttons (wheel = zoom).
       this.controls.mouseButtons = {
         LEFT: null as unknown as THREE.MOUSE,
         MIDDLE: THREE.MOUSE.PAN,
@@ -437,7 +461,7 @@ export class SceneView {
     }
     this.controls.enabled =
       this.interactionMode === 'orbit' ||
-      paintMode ||
+      canvasDrawMode ||
       cutReviewing ||
       loopCutReviewing ||
       extrudeOrbit;
@@ -450,16 +474,16 @@ export class SceneView {
     }
   }
 
-  /** Hide stale silhouette while the camera moves; recompute after idle. */
-  private clearCutSilhouetteOverlay(): void {
+  /** Hide silhouette while the user orbits / zooms / pans. */
+  private onCutCameraInteractionStart(): void {
+    this.cancelSilhouetteIdleRefresh();
     if (this.cutSilhouette.length === 0) return;
     this.cutSilhouette = [];
     this.drawCutOverlay();
   }
 
-  /** Debounced: used while orbiting in cut mode (render pass is expensive). */
+  /** Refresh once camera movement (incl. post-release damping) has stopped. */
   private scheduleCutSilhouetteRefreshOnCameraIdle(): void {
-    this.clearCutSilhouetteOverlay();
     this.cancelSilhouetteIdleRefresh();
     this.silhouetteIdleTimer = setTimeout(() => {
       this.silhouetteIdleTimer = null;
@@ -487,6 +511,22 @@ export class SceneView {
 
   getCurrentMesh(): Mesh3D | null {
     return this.currentMeshData;
+  }
+
+  capturePaintTexture(): ImageData | null {
+    return this.painter?.exportTextureImageData() ?? null;
+  }
+
+  applyEditSnapshot(mesh: Mesh3D, paint?: ImageData): void {
+    this.clearSurfaceLines();
+    this.discardPendingCut();
+    this.resetLoopCutState();
+    this.resetExtrudeState();
+    this.setMesh(mesh, { color: DEFAULT_MESH_COLOR, flatShading: true });
+    if (paint && this.painter) {
+      this.painter.importTextureImageData(paint);
+      this.refreshSketchAppearance();
+    }
   }
 
   /** Rendered mesh (world transform includes y-flip). */
@@ -537,6 +577,7 @@ export class SceneView {
 
     this.overlayCanvas.addEventListener('pointerdown', (e) => {
       if (this.interactionMode === 'orbit') return;
+      if (this.interactionMode === 'cut') return;
       if (this.interactionMode !== 'silhouette' && !this.meshObject) return;
       if (
         this.interactionMode === 'extrude' &&
@@ -544,9 +585,6 @@ export class SceneView {
         this.extrudePhase !== 'curve'
       ) {
         return;
-      }
-      if (this.interactionMode === 'cut') {
-        this.discardPendingCut();
       }
       e.preventDefault();
       this.overlayCanvas.setPointerCapture(e.pointerId);
@@ -573,8 +611,6 @@ export class SceneView {
         this.finishSilhouetteStroke();
       } else if (this.interactionMode === 'paint') {
         this.finishPaintStroke();
-      } else if (this.interactionMode === 'cut') {
-        this.finishCutOrLoopStroke();
       } else if (this.interactionMode === 'extrude') {
         this.finishExtrudeStroke();
       }
@@ -624,6 +660,47 @@ export class SceneView {
     };
     el.addEventListener('pointerup', finishPaint);
     el.addEventListener('pointercancel', finishPaint);
+  }
+
+  /**
+   * Cut mode shares the canvas with the camera: left button draws the cut stroke on the WebGL
+   * canvas; right/middle buttons and wheel drive OrbitControls (rotate/pan/zoom).
+   */
+  private bindCutEvents(): void {
+    const el = this.renderer.domElement;
+    const getPos = (e: PointerEvent): Vec2 => {
+      const rect = el.getBoundingClientRect();
+      return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    };
+
+    el.addEventListener('pointerdown', (e) => {
+      if (this.interactionMode !== 'cut') return;
+      if (this.pendingCut !== null || this.loopCutPhase !== 'idle') return;
+      if (e.button !== 0) return;
+      if (!this.meshObject || !this.currentMeshData) return;
+      this.discardPendingCut();
+      this.painting = true;
+      this.paintStroke = [getPos(e)];
+      this.drawCutOverlay(this.paintStroke);
+    });
+
+    el.addEventListener('pointermove', (e) => {
+      if (this.interactionMode !== 'cut' || !this.painting) return;
+      const p = getPos(e);
+      const last = this.paintStroke[this.paintStroke.length - 1];
+      if (Math.hypot(p.x - last.x, p.y - last.y) > 2) {
+        this.paintStroke.push(p);
+        this.drawCutOverlay(this.paintStroke);
+      }
+    });
+
+    const finishCut = () => {
+      if (this.interactionMode !== 'cut' || !this.painting) return;
+      this.painting = false;
+      this.finishCutOrLoopStroke();
+    };
+    el.addEventListener('pointerup', finishCut);
+    el.addEventListener('pointercancel', finishCut);
   }
 
   private finishSilhouetteStroke(): void {
@@ -680,6 +757,8 @@ export class SceneView {
       return Math.max(0.5, this.brushPixels * 0.5 * k * dist);
     });
     this.painter.paintStroke(projected, radii, this.paintColor);
+    this.refreshSketchAppearance();
+    this.onPaintComplete?.();
   }
 
   /**
@@ -724,7 +803,7 @@ export class SceneView {
       closed,
       this.camera,
       this.meshObject,
-      this.overlayCanvas
+      this.renderer.domElement
     );
     if ('error' in validated) {
       this.onLoopCutStatus?.(validated.error, 'error');
@@ -734,7 +813,7 @@ export class SceneView {
     // Imprint immediately with the *draw-time* camera, so a later orbit can't desync the
     // screen-space loop from the mesh. The cut is only revealed in stage 2.
     const before = this.currentMeshData;
-    const base = imprintLoop(before, closed, this.camera, this.overlayCanvas);
+    const base = imprintLoop(before, closed, this.camera, this.renderer.domElement);
     if ('error' in base) {
       this.onLoopCutStatus?.(base.error, 'error');
       return;
@@ -825,6 +904,9 @@ export class SceneView {
     this.loopCutBase = null;
     this.loopCutMeshBeforeCut = null;
     this.clearExtrudeRing();
+    if (this.interactionMode === 'cut') {
+      this.scheduleCutSilhouetteRefreshImmediate();
+    }
   }
 
   /** Begin the extrusion gesture: await the closed base loop on the surface. */
@@ -983,7 +1065,9 @@ export class SceneView {
 
     this.refreshCutSilhouette();
     if (this.cutSilhouette.length < 3) {
-      this.onCutRejected?.('Could not compute object silhouette from the current view.');
+      this.onCutRejected?.(
+        'Could not compute object silhouette from the current view. Try rotating with right-drag.'
+      );
       this.drawCutOverlay();
       return;
     }
@@ -999,7 +1083,7 @@ export class SceneView {
       stroke,
       this.camera,
       this.meshObject,
-      this.overlayCanvas
+      this.renderer.domElement
     );
 
     if (front.length < 2 || back.length < 2) {
@@ -1032,7 +1116,6 @@ export class SceneView {
 
   /** Recompute screen silhouette for cut mode (call after camera / mesh changes). */
   refreshCutSilhouette(): void {
-    // Only show the silhouette guide while actively drawing a cut stroke (nothing staged yet).
     const drawing =
       this.interactionMode === 'cut' &&
       this.pendingCut === null &&
@@ -1043,8 +1126,10 @@ export class SceneView {
       return;
     }
 
-    const rect = this.overlayCanvas.getBoundingClientRect();
-    if (rect.width < 2 || rect.height < 2) {
+    // Match cut strokes and raycasts: size from the WebGL canvas, not the overlay.
+    const w = this.renderer.domElement.clientWidth;
+    const h = this.renderer.domElement.clientHeight;
+    if (w < 2 || h < 2) {
       this.scheduleCutSilhouetteRefreshImmediate();
       return;
     }
@@ -1060,8 +1145,8 @@ export class SceneView {
         this.renderer,
         this.meshObject,
         this.camera,
-        rect.width,
-        rect.height
+        w,
+        h
       );
     }
 
@@ -1125,7 +1210,12 @@ export class SceneView {
     this.pendingCut = null;
     this.clearCutProjectionPreview();
     this.syncPointerAndOrbitState();
-    if (hadPending) this.onCutPendingChange?.();
+    if (hadPending) {
+      this.onCutPendingChange?.();
+      if (this.interactionMode === 'cut') {
+        this.scheduleCutSilhouetteRefreshImmediate();
+      }
+    }
   }
 
   clearCutProjectionPreview(): void {
@@ -1553,9 +1643,6 @@ export class SceneView {
     }
 
     this.currentMeshData = mesh;
-    if (this.interactionMode === 'cut') {
-      this.scheduleCutSilhouetteRefreshImmediate();
-    }
 
     // Solid meshes (no per-face preview colours) become paint-capable: their geometry carries a
     // per-triangle texture atlas so strokes can be baked onto the surface. Preview meshes that use
@@ -1599,6 +1686,10 @@ export class SceneView {
 
     this.refreshSketchAppearance();
     this.applyDisplayMode();
+
+    if (this.interactionMode === 'cut') {
+      this.scheduleCutSilhouetteRefreshImmediate();
+    }
   }
 
   /** Toggle the hand-drawn "pencil sketch" rendering (stipple shading + silhouette outline). */

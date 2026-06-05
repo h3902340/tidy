@@ -4,84 +4,118 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tidy — Teddy Sketch to 3D</title>
+    <title>Tidy — Sketch to 3D</title>
   </head>
   <body>
     <div id="app">
       <header class="header">
-        <h1>Tidy</h1>
-        <p class="subtitle">
-          Draw a closed loop, then step through T/S/J → fans → spine → elevation → inflation
-          <span class="paper-ref">(Igarashi et al., SIGGRAPH 1999)</span>
-        </p>
+        <div class="header-text">
+          <h1>Tidy</h1>
+          <p class="subtitle">Draw a closed loop to inflate it into a 3D shape, then paint, cut, or extrude.</p>
+        </div>
+        <label class="debug-toggle">
+          <input type="checkbox" id="debug-mode" />
+          Debug mode
+        </label>
       </header>
+
       <main class="workspace">
         <section class="panel">
-          <div class="panel-head">
-            <h2>Canvas</h2>
-            <div class="view-controls">
-              <label class="display-mode-label" for="display-mode">Display</label>
-              <select id="display-mode" aria-label="Mesh display mode" disabled>
-                <option value="solid">Solid</option>
-                <option value="wireframe">Wireframe</option>
-                <option value="both" selected>Both</option>
-              </select>
-              <label class="paint-toggle">
-                <input type="checkbox" id="paint-mode" disabled />
-                Paint
-              </label>
-              <label class="paint-toggle">
-                <input type="checkbox" id="cut-mode" disabled />
-                Cut
-              </label>
-              <label class="paint-toggle">
-                <input type="checkbox" id="extrude-mode" disabled />
-                Extrude
-              </label>
-              <label class="paint-toggle">
-                <input type="checkbox" id="sketch-mode" disabled />
-                Sketch
-              </label>
+          <div class="toolbar">
+            <div class="toolbar-group">
+              <span class="toolbar-label">New shape</span>
+              <div class="btn-row preset-row">
+                <button id="btn-circle" type="button" class="icon-btn secondary" aria-label="Circle">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.75"/></svg>
+                </button>
+                <button id="btn-oval" type="button" class="icon-btn secondary" aria-label="Oval">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="12" rx="10" ry="6.5" fill="none" stroke="currentColor" stroke-width="1.75"/></svg>
+                </button>
+                <button id="btn-triangle" type="button" class="icon-btn secondary" aria-label="Triangle">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4.5 19.5 19.5H4.5Z" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round"/></svg>
+                </button>
+                <button id="btn-square" type="button" class="icon-btn secondary" aria-label="Square">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="1" fill="none" stroke="currentColor" stroke-width="1.75"/></svg>
+                </button>
+                <button id="btn-star" type="button" class="icon-btn secondary" aria-label="Star">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5 14.2 9.2 20.3 9.6 15.6 13.5 17.1 19.5 12 16.2 6.9 19.5 8.4 13.5 3.7 9.6 9.8 9.2Z" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round"/></svg>
+                </button>
+                <button id="btn-clear" type="button" class="secondary">Clear</button>
+              </div>
             </div>
-            <div class="paint-palette" id="paint-palette" hidden>
-              <span class="paint-palette-label">Color</span>
-              <button type="button" class="swatch" data-color="#d1495b" style="background:#d1495b" aria-label="Red"></button>
-              <button type="button" class="swatch" data-color="#f4a259" style="background:#f4a259" aria-label="Orange"></button>
-              <button type="button" class="swatch" data-color="#f4d35e" style="background:#f4d35e" aria-label="Yellow"></button>
-              <button type="button" class="swatch" data-color="#3a9d4e" style="background:#3a9d4e" aria-label="Green"></button>
-              <button type="button" class="swatch" data-color="#2a9d8f" style="background:#2a9d8f" aria-label="Teal"></button>
-              <button type="button" class="swatch" data-color="#2274a5" style="background:#2274a5" aria-label="Blue"></button>
-              <button type="button" class="swatch" data-color="#7b4fb5" style="background:#7b4fb5" aria-label="Purple"></button>
-              <button type="button" class="swatch" data-color="#3d3d3d" style="background:#3d3d3d" aria-label="Charcoal"></button>
-              <button type="button" class="swatch" data-color="#ffffff" style="background:#ffffff" aria-label="White"></button>
-              <input type="color" id="paint-color" value="#d1495b" aria-label="Custom paint color" />
-              <span class="paint-brush">
-                <label for="paint-brush">Brush</label>
-                <input type="range" id="paint-brush" min="2" max="60" step="1" value="16" aria-label="Brush thickness" />
-                <span class="brush-value" id="paint-brush-value">16</span>
-              </span>
+
+            <div class="toolbar-group" id="edit-tools" hidden>
+              <span class="toolbar-label">Tools</span>
+              <div class="btn-row">
+                <div class="tool-tabs" role="group" aria-label="Editing tools">
+                  <button type="button" class="tool-tab is-active" data-mode="orbit">View</button>
+                  <button type="button" class="tool-tab" data-mode="paint">Paint</button>
+                  <button type="button" class="tool-tab" data-mode="cut">Cut</button>
+                  <button type="button" class="tool-tab" data-mode="extrude">Extrude</button>
+                </div>
+                <button id="btn-undo" type="button" class="icon-btn secondary" aria-label="Undo" disabled>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 7H5v4" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 11c1.5-3 4.5-5 8-5 4.4 0 8 3.6 8 8s-3.6 8-8 8a8.1 8.1 0 0 1-5.2-1.9" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
+                <button id="btn-redo" type="button" class="icon-btn secondary" aria-label="Redo" disabled>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 7h4v4" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/><path d="M19 11c-1.5-3-4.5-5-8-5-4.4 0-8 3.6-8 8s3.6 8 8 8a8.1 8.1 0 0 0 5.2-1.9" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
+                <label class="inline-control display-control">
+                  Display
+                  <select id="display-mode" aria-label="Mesh display mode" disabled>
+                    <option value="solid" selected>Solid</option>
+                    <option value="wireframe">Wireframe</option>
+                    <option value="both">Both</option>
+                  </select>
+                </label>
+                <label class="inline-control">
+                  <input type="checkbox" id="sketch-mode" disabled />
+                  Sketch
+                </label>
+              </div>
+              <div class="paint-palette" id="paint-palette" hidden>
+                <span class="paint-palette-label">Color</span>
+                <button type="button" class="swatch" data-color="#d1495b" style="background:#d1495b" aria-label="Red"></button>
+                <button type="button" class="swatch" data-color="#f4a259" style="background:#f4a259" aria-label="Orange"></button>
+                <button type="button" class="swatch" data-color="#f4d35e" style="background:#f4d35e" aria-label="Yellow"></button>
+                <button type="button" class="swatch" data-color="#3a9d4e" style="background:#3a9d4e" aria-label="Green"></button>
+                <button type="button" class="swatch" data-color="#2a9d8f" style="background:#2a9d8f" aria-label="Teal"></button>
+                <button type="button" class="swatch" data-color="#2274a5" style="background:#2274a5" aria-label="Blue"></button>
+                <button type="button" class="swatch" data-color="#7b4fb5" style="background:#7b4fb5" aria-label="Purple"></button>
+                <button type="button" class="swatch" data-color="#3d3d3d" style="background:#3d3d3d" aria-label="Charcoal"></button>
+                <button type="button" class="swatch" data-color="#ffffff" style="background:#ffffff" aria-label="White"></button>
+                <input type="color" id="paint-color" value="#d1495b" aria-label="Custom paint color" />
+                <span class="paint-brush">
+                  <label for="paint-brush">Brush</label>
+                  <input type="range" id="paint-brush" min="2" max="60" step="1" value="16" aria-label="Brush thickness" />
+                  <span class="brush-value" id="paint-brush-value">16</span>
+                </span>
+              </div>
             </div>
-            <span class="inflation-step" id="inflation-step" aria-live="polite"></span>
-            <span class="hint" id="canvas-hint">Draw one closed loop on the 3D plane</span>
           </div>
+
           <div class="canvas-wrap">
-            <div id="scene-view" class="scene-view"></div>
-          </div>
-          <div class="actions">
-            <button id="btn-next-step" type="button" disabled>Next step</button>
-            <button id="btn-apply-cut" type="button" disabled>Remove triangles</button>
-            <button id="btn-fill-cut" type="button" disabled>Fill hole</button>
-            <button id="btn-discard-cut" type="button" class="secondary" disabled>
-              Discard cut
-            </button>
-            <button id="btn-confirm-extrude" type="button" disabled>
+            <button id="btn-confirm-extrude" type="button" class="extrude-confirm" hidden>
               Confirm orientation
             </button>
-            <button id="btn-circle" type="button" class="secondary">Create circle</button>
-            <button id="btn-square" type="button" class="secondary">Create square</button>
-            <button id="btn-clear" type="button" class="secondary">Clear</button>
+            <div id="scene-view" class="scene-view"></div>
           </div>
-          <p id="status" class="status" role="status"></p>
+
+          <div class="canvas-footer">
+            <div class="hint-bar">
+              <p id="canvas-hint" class="hint">Draw a closed loop on the plane, or pick a preset shape</p>
+              <p id="status" class="status" role="status"></p>
+            </div>
+            <div class="nav-help" id="nav-help" aria-label="Camera and drawing controls"></div>
+          </div>
+
+          <div class="debug-panel" id="debug-panel" hidden>
+            <span class="toolbar-label">Pipeline debug</span>
+            <span class="inflation-step" id="inflation-step" aria-live="polite"></span>
+            <div class="btn-row">
+              <button id="btn-next-step" type="button" disabled>Next step</button>
+              <button id="btn-discard-cut" type="button" class="secondary" disabled>Discard cut</button>
+            </div>
+          </div>
         </section>
       </main>
     </div>
