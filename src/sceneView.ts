@@ -25,7 +25,8 @@ import {
   type Vec2,
   type Vec3,
 } from './math';
-import type { TerminalPruneDebugStep } from './zeyapInflation';
+import type { SpineElevationDebugStep, TerminalPruneDebugStep } from './zeyapInflation';
+import { SPINE_ELEVATION_FACTOR } from './zeyapInflation';
 
 export type DisplayMode = 'solid' | 'wireframe' | 'both';
 export type InteractionMode =
@@ -106,6 +107,23 @@ const SPINE_TUBE_RADIUS = 0.4;
 /** Colour and radius for the internal-edge midpoint dots drawn on the spine step. */
 const SPINE_DOT_COLOR = 0x000000;
 const SPINE_DOT_RADIUS = 1.0;
+/** Spine elevation debug (paper §5.1). */
+const ELEVATION_LINE_COLOR = 0xe85d04;
+const ELEVATION_LINE_RADIUS = 0.35;
+const ELEVATION_ACTIVE_SPINE_COLOR = 0x0077b6;
+const ELEVATION_ACTIVE_SPINE_RADIUS = 1.6;
+const ELEVATION_EXTERIOR_COLOR = 0x2a9d8f;
+const ELEVATION_EXTERIOR_RADIUS = 1.3;
+const ELEVATION_NEIGHBOR_COLOR = 0x9b5de5;
+const ELEVATION_NEIGHBOR_RADIUS = 1.2;
+const ELEVATION_DIM_SPINE_COLOR = 0x666666;
+const ELEVATION_LEADER_COLOR = 0x555555;
+/** How far past the edge anchor billboards sit along the spoke. */
+const ELEVATION_LABEL_OUTWARD = 9;
+/** Perpendicular spacing between labels on adjacent spokes. */
+const ELEVATION_LABEL_STAGGER = 13;
+/** Point on each spoke where the leader line attaches (0 = spine, 1 = target). */
+const ELEVATION_EDGE_ANCHOR_T = 0.78;
 /** Fig. 14 semicircle sweep during terminal-prune debug stepping. */
 const PRUNE_SEMICIRCLE_COLOR = 0xd62828;
 const PRUNE_SEMICIRCLE_LIFT_Z = 0.6;
@@ -1525,8 +1543,11 @@ export class SceneView {
     while (this.spineLinesGroup.children.length > 0) {
       const child = this.spineLinesGroup.children[0];
       this.spineLinesGroup.remove(child);
-      if (child instanceof THREE.Mesh) {
+      if (child instanceof THREE.Mesh || child instanceof THREE.Line) {
         child.geometry.dispose();
+        if (child instanceof THREE.Line) {
+          (child.material as THREE.Material).dispose();
+        }
       }
     }
     this.spineTubeMaterial?.dispose();
@@ -1544,7 +1565,7 @@ export class SceneView {
   }
 
   /** Billboard text sprite (always faces the camera) for spine height labels. */
-  private makeTextSprite(text: string): THREE.Sprite {
+  private makeTextSprite(text: string, worldHeight = 9): THREE.Sprite {
     const pad = 8;
     const fontPx = 48;
     const canvas = document.createElement('canvas');
@@ -1572,9 +1593,141 @@ export class SceneView {
       transparent: true,
     });
     const sprite = new THREE.Sprite(material);
-    const worldHeight = 9;
     sprite.scale.set((worldHeight * canvas.width) / canvas.height, worldHeight, 1);
     return sprite;
+  }
+
+  private addElevationLeaderLine(a: Vec3, b: Vec3, order: number): void {
+    const geometry = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(a.x, a.y, a.z),
+      new THREE.Vector3(b.x, b.y, b.z),
+    ]);
+    const line = new THREE.Line(
+      geometry,
+      new THREE.LineBasicMaterial({
+        color: ELEVATION_LEADER_COLOR,
+        depthTest: true,
+        depthWrite: false,
+      })
+    );
+    line.renderOrder = order;
+    this.spineLinesGroup.add(line);
+  }
+
+  /**
+   * Place spoke labels on a fan with even perpendicular spacing; each label is offset past the
+   * edge end and connected to an anchor on the spoke via a thin leader line.
+   */
+  private layoutSpokeLabels(
+    origin: Vec3,
+    targets: Vec3[],
+    texts: string[]
+  ): { anchor: Vec3; labelPos: Vec3; text: string }[] {
+    const n = targets.length;
+    if (n === 0) return [];
+
+    const entries = targets.map((target, i) => {
+      const dx = target.x - origin.x;
+      const dy = target.y - origin.y;
+      const dz = target.z - origin.z;
+      const len = Math.hypot(dx, dy, dz);
+      const ux = len > 1e-6 ? dx / len : 1;
+      const uy = len > 1e-6 ? dy / len : 0;
+      const uz = len > 1e-6 ? dz / len : 0;
+      return {
+        target,
+        text: texts[i] ?? '',
+        angle: Math.atan2(dy, dx),
+        ux,
+        uy,
+        uz,
+        len,
+        px: -uy,
+        py: ux,
+      };
+    });
+    entries.sort((a, b) => a.angle - b.angle);
+
+    return entries.map((e, slot) => {
+      const stagger = (slot - (n - 1) / 2) * ELEVATION_LABEL_STAGGER;
+      const anchor = {
+        x: origin.x + e.ux * e.len * ELEVATION_EDGE_ANCHOR_T,
+        y: origin.y + e.uy * e.len * ELEVATION_EDGE_ANCHOR_T,
+        z: origin.z + e.uz * e.len * ELEVATION_EDGE_ANCHOR_T,
+      };
+      const pastTarget = e.len + ELEVATION_LABEL_OUTWARD;
+      const labelPos = {
+        x: origin.x + e.ux * pastTarget + e.px * stagger,
+        y: origin.y + e.uy * pastTarget + e.py * stagger,
+        z: origin.z + e.uz * pastTarget + 2.5 + Math.abs(stagger) * 0.08,
+      };
+      return { anchor, labelPos, text: e.text };
+    });
+  }
+
+  private addSpokeLabelCallouts(
+    origin: Vec3,
+    targets: Vec3[],
+    texts: string[],
+    order: number,
+    labelHeight = 7
+  ): void {
+    const layouts = this.layoutSpokeLabels(origin, targets, texts);
+    for (const { anchor, labelPos, text } of layouts) {
+      this.addElevationLeaderLine(anchor, labelPos, order);
+      const label = this.makeTextSprite(text, labelHeight);
+      label.position.set(labelPos.x, -labelPos.y, labelPos.z);
+      label.renderOrder = order + 1;
+      this.spineLabelGroup.add(label);
+    }
+  }
+
+  /** Summary labels beside the active spine node, stacked and offset away from the spoke fan. */
+  private addSpineSummaryLabels(
+    spine: Vec3,
+    lines: string[],
+    spokeAngles: number[],
+    order: number
+  ): void {
+    if (lines.length === 0) return;
+
+    let awayUx = 0;
+    let awayUy = -1;
+    if (spokeAngles.length > 0) {
+      let sx = 0;
+      let sy = 0;
+      for (const a of spokeAngles) {
+        sx += Math.cos(a);
+        sy += Math.sin(a);
+      }
+      const slen = Math.hypot(sx, sy);
+      if (slen > 1e-6) {
+        awayUx = -sx / slen;
+        awayUy = -sy / slen;
+      }
+    }
+    const sidePx = -awayUy;
+    const sidePy = awayUx;
+
+    const base = {
+      x: spine.x + awayUx * 14 + sidePx * 10,
+      y: spine.y + awayUy * 14 + sidePy * 10,
+      z: 6,
+    };
+    const lineGap = 11;
+
+    for (let i = 0; i < lines.length; i++) {
+      const labelPos = {
+        x: base.x + sidePx * i * 2,
+        y: base.y + sidePy * i * 2,
+        z: base.z + i * lineGap,
+      };
+      this.addElevationLeaderLine(spine, labelPos, order);
+      const label = this.makeTextSprite(lines[i]!, 7.5);
+      label.position.set(labelPos.x, -labelPos.y, labelPos.z);
+      label.renderOrder = order + 1;
+      this.spineLabelGroup.add(label);
+    }
   }
 
   /**
@@ -1663,6 +1816,193 @@ export class SceneView {
         }
       }
       dotGeometry.dispose();
+    }
+  }
+
+  /**
+   * Step-by-step spine elevation (paper §5.1): distance spokes to boundary verts with
+   * camera-facing billboards, plus a formula label at the active spine node.
+   */
+  setSpineElevationDebugOverlay(
+    baseVertices: Vec3[],
+    segments: [number, number][],
+    step: SpineElevationDebugStep,
+    priorSteps: SpineElevationDebugStep[]
+  ): void {
+    this.clearSpineOverlay();
+
+    const priorZ = new Map<number, number>();
+    for (const prev of priorSteps) {
+      priorZ.set(prev.spineId, prev.elevation);
+    }
+
+    const overlayOrder = 2;
+    const lineMaterial = new THREE.MeshBasicMaterial({
+      color: ELEVATION_LINE_COLOR,
+      depthTest: true,
+      depthWrite: false,
+    });
+    const up = new THREE.Vector3(0, 1, 0);
+    const dir = new THREE.Vector3();
+
+    const addLine = (a: Vec3, b: Vec3): void => {
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const dz = b.z - a.z;
+      const len = Math.hypot(dx, dy, dz);
+      if (len < 1e-6) return;
+      const geometry = new THREE.CylinderGeometry(
+        ELEVATION_LINE_RADIUS,
+        ELEVATION_LINE_RADIUS,
+        len,
+        6,
+        1,
+        false
+      );
+      const tube = new THREE.Mesh(geometry, lineMaterial);
+      tube.position.set((a.x + b.x) / 2, (a.y + b.y) / 2, (a.z + b.z) / 2);
+      dir.set(dx / len, dy / len, dz / len);
+      tube.quaternion.setFromUnitVectors(up, dir);
+      tube.renderOrder = overlayOrder;
+      this.spineLinesGroup.add(tube);
+    };
+
+    const addDot = (
+      v: Vec3,
+      color: number,
+      radius: number,
+      order = overlayOrder + 1
+    ): void => {
+      const material = new THREE.MeshBasicMaterial({
+        color,
+        depthTest: true,
+        depthWrite: false,
+      });
+      const dot = new THREE.Mesh(new THREE.SphereGeometry(radius, 10, 8), material);
+      dot.position.set(v.x, v.y, v.z);
+      dot.renderOrder = order;
+      this.spineLinesGroup.add(dot);
+    };
+
+    const spinePos = (id: number): Vec3 => {
+      const v = baseVertices[id];
+      const z = id === step.spineId ? 0 : (priorZ.get(id) ?? 0);
+      return { x: v.x, y: v.y, z };
+    };
+
+    // Dim chordal-axis segments; already-elevated nodes sit at their prior z.
+    this.spineTubeMaterial = new THREE.MeshBasicMaterial({
+      color: ELEVATION_DIM_SPINE_COLOR,
+      depthTest: true,
+      depthWrite: false,
+    });
+    for (const [a, b] of segments) {
+      const va = spinePos(a);
+      const vb = spinePos(b);
+      const dx = vb.x - va.x;
+      const dy = vb.y - va.y;
+      const dz = vb.z - va.z;
+      const len = Math.hypot(dx, dy, dz);
+      if (len < 1e-6) continue;
+      const geometry = new THREE.CylinderGeometry(
+        SPINE_TUBE_RADIUS * 0.7,
+        SPINE_TUBE_RADIUS * 0.7,
+        len,
+        8,
+        1,
+        false
+      );
+      const tube = new THREE.Mesh(geometry, this.spineTubeMaterial);
+      tube.position.set((va.x + vb.x) / 2, (va.y + vb.y) / 2, (va.z + vb.z) / 2);
+      dir.set(dx / len, dy / len, dz / len);
+      tube.quaternion.setFromUnitVectors(up, dir);
+      tube.renderOrder = overlayOrder;
+      this.spineLinesGroup.add(tube);
+    }
+
+    const activeSpine = baseVertices[step.spineId];
+
+    const spineGround = { x: activeSpine.x, y: activeSpine.y, z: 0 };
+    const calloutOrder = overlayOrder + 2;
+
+    if (step.kind === 'direct') {
+      const boundaries: Vec3[] = [];
+      const distanceTexts: string[] = [];
+      const spokeAngles: number[] = [];
+
+      for (let i = 0; i < step.exteriorIds.length; i++) {
+        const eid = step.exteriorIds[i];
+        const exterior = baseVertices[eid];
+        const boundary = { x: exterior.x, y: exterior.y, z: 0 };
+        addLine(spineGround, boundary);
+        addDot(boundary, ELEVATION_EXTERIOR_COLOR, ELEVATION_EXTERIOR_RADIUS);
+        boundaries.push(boundary);
+        distanceTexts.push(`d=${step.distances[i].toFixed(1)}`);
+        spokeAngles.push(
+          Math.atan2(boundary.y - spineGround.y, boundary.x - spineGround.x)
+        );
+      }
+
+      this.addSpokeLabelCallouts(
+        spineGround,
+        boundaries,
+        distanceTexts,
+        calloutOrder
+      );
+
+      addDot(spineGround, ELEVATION_ACTIVE_SPINE_COLOR, ELEVATION_ACTIVE_SPINE_RADIUS);
+
+      const avg = step.avgDistance ?? 0;
+      this.addSpineSummaryLabels(
+        spineGround,
+        [
+          `avg=${avg.toFixed(1)}`,
+          `${SPINE_ELEVATION_FACTOR}×${avg.toFixed(1)}=${step.elevation.toFixed(1)}`,
+        ],
+        spokeAngles,
+        overlayOrder + 3
+      );
+    } else {
+      const neighbors: Vec3[] = [];
+      const neighborTexts: string[] = [];
+      const spokeAngles: number[] = [];
+
+      for (let i = 0; i < step.neighborSpineIds.length; i++) {
+        const nid = step.neighborSpineIds[i];
+        const neighbor = baseVertices[nid];
+        const nz = step.neighborElevations[i];
+        const npos = { x: neighbor.x, y: neighbor.y, z: nz };
+        addLine(spineGround, npos);
+        addDot(npos, ELEVATION_NEIGHBOR_COLOR, ELEVATION_NEIGHBOR_RADIUS);
+        neighbors.push(npos);
+        neighborTexts.push(`z=${nz.toFixed(1)}`);
+        spokeAngles.push(
+          Math.atan2(npos.y - spineGround.y, npos.x - spineGround.x)
+        );
+      }
+
+      this.addSpokeLabelCallouts(
+        spineGround,
+        neighbors,
+        neighborTexts,
+        calloutOrder
+      );
+
+      addDot(spineGround, ELEVATION_ACTIVE_SPINE_COLOR, ELEVATION_ACTIVE_SPINE_RADIUS);
+
+      this.addSpineSummaryLabels(
+        spineGround,
+        ['avg neighbors', `z=${step.elevation.toFixed(1)}`],
+        spokeAngles,
+        overlayOrder + 3
+      );
+    }
+
+    // Prior elevated spine nodes (not the active one).
+    for (const [id, z] of priorZ) {
+      if (id === step.spineId) continue;
+      const v = baseVertices[id];
+      addDot({ x: v.x, y: v.y, z }, ELEVATION_NEIGHBOR_COLOR, SPINE_DOT_RADIUS * 0.9);
     }
   }
 

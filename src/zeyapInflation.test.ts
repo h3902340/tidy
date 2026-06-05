@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { constrainedDelaunay } from './cdt';
 import {
+  applySpineElevation,
+  buildSpineElevationDebugSteps,
   buildTerminalPruneDebugSteps,
   cdtToZeyapTriangles,
+  propagateSpineElevationAlongAxis,
   pruneToWedges,
   wedgesToFanFacesFiltered,
 } from './zeyapInflation';
@@ -236,6 +239,79 @@ describe('terminal fan pruning', () => {
       }
     }
     expect(components).toBe(1);
+  });
+
+  it('elevation neighbors only include chordal-axis spine nodes', () => {
+    const { triangles } = constrainedDelaunay(unitSquare);
+    const zeyap = cdtToZeyapTriangles(triangles);
+    const verts = unitSquare.map((p) => vec3(p.x, p.y, 0));
+    const { wedges, interiorVerts, axisSegments } = pruneToWedges(zeyap, verts);
+    const boundaryCount = unitSquare.length;
+
+    const spineNodes = new Set<number>();
+    for (const [a, b] of axisSegments) {
+      if (a >= boundaryCount) spineNodes.add(a);
+      if (b >= boundaryCount) spineNodes.add(b);
+    }
+
+    for (const spineId of interiorVerts.keys()) {
+      expect(spineNodes.has(spineId)).toBe(true);
+    }
+
+    for (const wedge of wedges) {
+      if (wedge.fromTerminalPrune) continue;
+      const hubId = wedge.vertIds[0];
+      if (!spineNodes.has(hubId)) {
+        expect(interiorVerts.has(hubId)).toBe(false);
+      }
+      for (const neighbor of interiorVerts.get(hubId)?.keys() ?? []) {
+        expect(neighbor).toBeLessThan(boundaryCount);
+      }
+    }
+  });
+
+  it('buildSpineElevationDebugSteps matches applySpineElevation + propagate', () => {
+    const { triangles } = constrainedDelaunay(unitSquare);
+    const zeyap = cdtToZeyapTriangles(triangles);
+    const verts = unitSquare.map((p) => vec3(p.x, p.y, 0));
+    const { interiorVerts, axisSegments } = pruneToWedges(zeyap, verts);
+
+    const steps = buildSpineElevationDebugSteps(
+      interiorVerts,
+      verts,
+      axisSegments,
+      unitSquare.length
+    );
+    expect(steps.length).toBeGreaterThan(0);
+    expect(steps.some((s) => s.kind === 'direct')).toBe(true);
+
+    const last = steps[steps.length - 1]!;
+    const expected = verts.map((v) => vec3(v.x, v.y, v.z));
+    applySpineElevation(interiorVerts, expected);
+    propagateSpineElevationAlongAxis(expected, axisSegments, unitSquare.length);
+
+    for (const step of steps) {
+      expect(step.verticesAfter[step.spineId].z).toBeCloseTo(step.elevation, 4);
+    }
+    for (let i = 0; i < expected.length; i++) {
+      if (expected[i].z > 1e-6) {
+        expect(last.verticesAfter[i].z).toBeCloseTo(expected[i].z, 4);
+      }
+    }
+  });
+
+  it('buildTeddyPipeline spine elevation steps only use chordal-axis nodes', () => {
+    const result = buildTeddyPipeline(normalizePolygon(unitSquare));
+    expect(result.meshes).not.toBeNull();
+
+    const spineNodes = new Set<number>();
+    for (const [a, b] of result.meshes!.spineSegments) {
+      spineNodes.add(a);
+      spineNodes.add(b);
+    }
+    for (const step of result.meshes!.spineElevationSteps) {
+      expect(spineNodes.has(step.spineId)).toBe(true);
+    }
   });
 
   it('buildTeddyPipeline resampled square: terminal fans cover all T triangles', () => {

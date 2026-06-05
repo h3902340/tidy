@@ -54,7 +54,8 @@ export interface InflatedMesh {
   faces: [number, number, number][];
 }
 
-const ELEVATION_FACTOR = 0.5;
+export const SPINE_ELEVATION_FACTOR = 0.5;
+const ELEVATION_FACTOR = SPINE_ELEVATION_FACTOR;
 
 function edgeCenter(v1: Vec3, v2: Vec3): Vec3 {
   return vec3((v1.x + v2.x) / 2, (v1.y + v2.y) / 2, (v1.z + v2.z) / 2);
@@ -151,18 +152,53 @@ function addSpineNeighbor(
   }
 }
 
+function collectChordalAxisNodeIds(
+  axisSegments: [number, number][],
+  boundaryVertexCount: number
+): Set<number> {
+  const spineNodes = new Set<number>();
+  for (const [a, b] of axisSegments) {
+    if (a >= boundaryVertexCount) spineNodes.add(a);
+    if (b >= boundaryVertexCount) spineNodes.add(b);
+  }
+  return spineNodes;
+}
+
 /**
- * After fig. 13f subdivision (wedge mesh between spine and boundary), each spine-to-boundary
- * spoke is a wedge spineEdge. Elevation uses only these direct connections — not neighbors
- * accumulated during the growth walk.
+ * After fig. 13f subdivision, paper §5.1 elevates chordal-axis spine nodes using the average
+ * distance to boundary vertices that share a mesh edge with the node.
+ *
+ * Wedge `spineEdges` pair subdivision hubs with interior mids as well as boundary verts;
+ * those hubs are Steiner points in the fan mesh, not spine nodes, and must be excluded.
  */
 export function buildElevationNeighborsFromWedges(
-  wedges: PrunedWedge[]
+  wedges: PrunedWedge[],
+  axisSegments: [number, number][],
+  boundaryVertexCount: number
 ): Map<number, Map<number, number[]>> {
-  const interiorVerts = new Map<number, Map<number, number[]>>();
+  const spineNodes = collectChordalAxisNodeIds(axisSegments, boundaryVertexCount);
+  const adj = new Map<number, Set<number>>();
+
+  const link = (u: number, v: number): void => {
+    if (u === v) return;
+    if (!adj.has(u)) adj.set(u, new Set());
+    if (!adj.has(v)) adj.set(v, new Set());
+    adj.get(u)!.add(v);
+    adj.get(v)!.add(u);
+  };
+
   for (const wedge of wedges) {
-    for (const [spineId, exteriorId] of wedge.spineEdges) {
-      addSpineNeighbor(interiorVerts, spineId, exteriorId);
+    const [a, b, c] = wedge.vertIds;
+    link(a, b);
+    link(b, c);
+    link(a, c);
+  }
+
+  const interiorVerts = new Map<number, Map<number, number[]>>();
+  for (const spineId of spineNodes) {
+    for (const neighbor of adj.get(spineId) ?? []) {
+      if (neighbor >= boundaryVertexCount) continue;
+      addSpineNeighbor(interiorVerts, spineId, neighbor);
     }
   }
   return interiorVerts;
@@ -968,7 +1004,11 @@ export function pruneToWedges(
   return {
     wedges: prunedTriangles,
     // Fig. 13f is complete — elevation neighbors come from the subdivided wedge mesh only.
-    interiorVerts: buildElevationNeighborsFromWedges(prunedTriangles),
+    interiorVerts: buildElevationNeighborsFromWedges(
+      prunedTriangles,
+      chordal,
+      boundaryVertexCount
+    ),
     // Paper fig. 13e: the spine is the chordal tree whose leaves land exactly on
     // each terminal fan's apex. The fan's radial spokes (tip -> boundary) belong
     // to the fan drawing (fig. 13d), not the spine, so they are NOT included here.
@@ -1212,6 +1252,108 @@ export function minDistToPolygonBoundary(p: Vec2, polygon: Vec2[]): number {
     );
   }
   return minD;
+}
+
+/** One debug frame for paper §5.1 spine elevation (direct boundary spokes or axis propagation). */
+export interface SpineElevationDebugStep {
+  kind: 'direct' | 'propagate';
+  stepIndex: number;
+  spineId: number;
+  /** Boundary vertices directly connected in the wedge mesh (direct steps only). */
+  exteriorIds: number[];
+  /** Distance from spine to each exterior vertex used in the average (direct steps only). */
+  distances: number[];
+  /** Mean of `distances` (direct steps only). */
+  avgDistance: number | null;
+  /** Neighbor spine nodes averaged for junction hubs (propagate steps only). */
+  neighborSpineIds: number[];
+  /** z of each neighbor at propagation time (propagate steps only). */
+  neighborElevations: number[];
+  /** z assigned to `spineId` after this step. */
+  elevation: number;
+  /** Vertices after applying this step (cumulative). */
+  verticesAfter: Vec3[];
+}
+
+/**
+ * Build per-vertex spine elevation frames for debug stepping (paper §5.1).
+ * Direct steps: z = SPINE_ELEVATION_FACTOR × average distance to connected boundary verts.
+ * Propagate steps: junction hubs with no boundary spokes inherit the mean z of axis neighbors.
+ */
+export function buildSpineElevationDebugSteps(
+  interiorVerts: Map<number, Map<number, number[]>>,
+  baseVerts: Vec3[],
+  axisSegments: [number, number][],
+  boundaryVertexCount: number
+): SpineElevationDebugStep[] {
+  const verts = baseVerts.map((v) => vec3(v.x, v.y, v.z));
+  const steps: SpineElevationDebugStep[] = [];
+  let stepIndex = 0;
+
+  const spineIds = [...interiorVerts.keys()].sort((a, b) => a - b);
+  for (const spineId of spineIds) {
+    const neighbors = interiorVerts.get(spineId);
+    if (!neighbors) continue;
+    const exteriorIds = [...neighbors.keys()].sort((a, b) => a - b);
+    if (exteriorIds.length === 0) continue;
+
+    const distances = exteriorIds.map((eid) => dist3(verts[eid], verts[spineId]));
+    const avgDistance = distances.reduce((s, d) => s + d, 0) / distances.length;
+    const elevation = ELEVATION_FACTOR * avgDistance;
+    verts[spineId].z = elevation;
+
+    steps.push({
+      kind: 'direct',
+      stepIndex: stepIndex++,
+      spineId,
+      exteriorIds,
+      distances,
+      avgDistance,
+      neighborSpineIds: [],
+      neighborElevations: [],
+      elevation,
+      verticesAfter: verts.map((v) => vec3(v.x, v.y, v.z)),
+    });
+  }
+
+  if (axisSegments.length === 0) return steps;
+
+  const adj = new Map<number, number[]>();
+  for (const [a, b] of axisSegments) {
+    (adj.get(a) ?? adj.set(a, []).get(a)!).push(b);
+    (adj.get(b) ?? adj.set(b, []).get(b)!).push(a);
+  }
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [id, neighbors] of adj) {
+      if (id < boundaryVertexCount || verts[id].z > 1e-6) continue;
+      const lifted = neighbors.filter((n) => verts[n].z > 1e-6);
+      if (lifted.length === 0) continue;
+
+      const neighborElevations = lifted.map((n) => verts[n].z);
+      const elevation =
+        neighborElevations.reduce((s, z) => s + z, 0) / neighborElevations.length;
+      verts[id].z = elevation;
+
+      steps.push({
+        kind: 'propagate',
+        stepIndex: stepIndex++,
+        spineId: id,
+        exteriorIds: [],
+        distances: [],
+        avgDistance: null,
+        neighborSpineIds: lifted,
+        neighborElevations,
+        elevation,
+        verticesAfter: verts.map((v) => vec3(v.x, v.y, v.z)),
+      });
+      changed = true;
+    }
+  }
+
+  return steps;
 }
 
 /**

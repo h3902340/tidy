@@ -6,10 +6,12 @@ import { buildTeddyPipelineFromStroke } from './teddy';
 import {
   FAN_TERMINAL_COLOR,
   type Mesh3D,
+  type SpineElevationDebugStep,
   type TeddyPipelineMeshes,
   type TerminalPruneDebugStep,
   type TriangleType,
 } from './teddy';
+import { SPINE_ELEVATION_FACTOR } from './zeyapInflation';
 import type { Vec2 } from './math';
 
 const sceneEl = document.querySelector<HTMLElement>('#scene-view')!;
@@ -25,6 +27,7 @@ const btnTriangle = document.querySelector<HTMLButtonElement>('#btn-triangle')!;
 const btnStar = document.querySelector<HTMLButtonElement>('#btn-star')!;
 const btnNext = document.querySelector<HTMLButtonElement>('#btn-next-step')!;
 const btnSkipPrune = document.querySelector<HTMLButtonElement>('#btn-skip-prune')!;
+const btnSkipElevation = document.querySelector<HTMLButtonElement>('#btn-skip-elevation')!;
 const displayModeEl = document.querySelector<HTMLSelectElement>('#display-mode')!;
 const sketchModeEl = document.querySelector<HTMLInputElement>('#sketch-mode')!;
 const paintPaletteEl = document.querySelector<HTMLDivElement>('#paint-palette')!;
@@ -49,6 +52,7 @@ type InflationStep =
   | 'prune'
   | 'fan'
   | 'spine'
+  | 'elevation'
   | 'elevated'
   | 'done';
 
@@ -65,6 +69,7 @@ let polygonReady = false;
 let inflationStep: InflationStep = 'idle';
 let pipelineMeshes: TeddyPipelineMeshes | null = null;
 let pruneStepIndex = 0;
+let elevationStepIndex = 0;
 
 const INFLATED_COLOR = 0xffffff;
 
@@ -360,6 +365,7 @@ function updateDebugActions(): void {
   if (!isDebugMode()) {
     btnNext.hidden = true;
     btnSkipPrune.hidden = true;
+    btnSkipElevation.hidden = true;
     btnDiscardCut.disabled = true;
     return;
   }
@@ -372,6 +378,11 @@ function updateDebugActions(): void {
       inflationStep === 'classified' || inflationStep === 'prune';
     btnSkipPrune.hidden = !canSkipPrune;
     btnSkipPrune.disabled = !canSkipPrune;
+    const canSkipElevation =
+      (inflationStep === 'spine' || inflationStep === 'elevation') &&
+      (pipelineMeshes?.spineElevationSteps.length ?? 0) > 0;
+    btnSkipElevation.hidden = !canSkipElevation;
+    btnSkipElevation.disabled = !canSkipElevation;
     if (inflationStep === 'classified') {
       const hasPrune =
         (pipelineMeshes?.terminalPruneSteps.length ?? 0) > 0;
@@ -385,13 +396,21 @@ function updateDebugActions(): void {
         pruneStepIndex + 1 >= steps.length
           ? 'Next: all fan triangles'
           : pruneStepButtonLabel(nextStep);
+    } else if (inflationStep === 'elevation' && pipelineMeshes) {
+      const steps = pipelineMeshes.spineElevationSteps;
+      const next = steps[elevationStepIndex + 1];
+      btnNext.textContent =
+        elevationStepIndex + 1 >= steps.length
+          ? 'Next: all elevated'
+          : elevationStepButtonLabel(next);
     } else {
       const labels: Record<InflationStep, string> = {
         idle: 'Next step',
         classified: 'Next: terminal prune',
         prune: 'Next step',
         fan: 'Next: show spine',
-        spine: 'Next: elevate spine',
+        spine: 'Next: spine elevation',
+        elevation: 'Next step',
         elevated: 'Next: full inflation',
         done: 'Done',
       };
@@ -404,11 +423,13 @@ function updateDebugActions(): void {
     btnDiscardCut.disabled = true;
     btnNext.hidden = true;
     btnSkipPrune.hidden = true;
+    btnSkipElevation.hidden = true;
     return;
   }
 
   if (isLoopCutActive()) {
     btnSkipPrune.hidden = true;
+    btnSkipElevation.hidden = true;
     const phase = sceneView.getLoopCutPhase();
     btnDiscardCut.disabled = false;
     if (phase === 'projected') {
@@ -426,6 +447,7 @@ function updateDebugActions(): void {
   }
 
   btnSkipPrune.hidden = true;
+  btnSkipElevation.hidden = true;
   const pending = sceneView.hasPendingCut();
   btnDiscardCut.disabled = false;
   if (pending) {
@@ -456,6 +478,7 @@ function resetInflationFlow(): void {
   inflationStep = 'idle';
   pipelineMeshes = null;
   pruneStepIndex = 0;
+  elevationStepIndex = 0;
   polygonReady = false;
   enablePostInflationControls(false);
   editHistory.seedEmpty();
@@ -550,6 +573,7 @@ function showFanStep(): void {
 function showSpineStep(): void {
   if (!pipelineMeshes) return;
   inflationStep = 'spine';
+  elevationStepIndex = 0;
   sceneView.setMesh(pipelineMeshes.fan, {
     color: 0xe8e8e8,
     wireColor: 0x4a4a48,
@@ -565,6 +589,51 @@ function showSpineStep(): void {
     { onSurface: true }
   );
   setStatus('');
+  updateDebugActions();
+}
+
+function elevationStepButtonLabel(step: SpineElevationDebugStep): string {
+  if (step.kind === 'direct') {
+    return `Next: spine v${step.spineId} height`;
+  }
+  return `Next: junction v${step.spineId} (propagate)`;
+}
+
+function elevationStepStatus(step: SpineElevationDebugStep): string {
+  const n = step.stepIndex + 1;
+  if (step.kind === 'direct') {
+    const distList = step.distances.map((d) => d.toFixed(1)).join(', ');
+    const avg = step.avgDistance?.toFixed(1) ?? '0';
+    return `§5.1 step ${n}: spine v${step.spineId} — distances [${distList}], avg=${avg}, z=${SPINE_ELEVATION_FACTOR}×${avg}=${step.elevation.toFixed(1)}`;
+  }
+  const zs = step.neighborElevations.map((z) => z.toFixed(1)).join(', ');
+  return `§5.1 step ${n}: junction v${step.spineId} — avg neighbor z [${zs}] → z=${step.elevation.toFixed(1)}`;
+}
+
+function showElevationStep(index: number): void {
+  if (!pipelineMeshes) return;
+  const steps = pipelineMeshes.spineElevationSteps;
+  if (index >= steps.length) {
+    showElevatedStep();
+    return;
+  }
+
+  inflationStep = 'elevation';
+  elevationStepIndex = index;
+  const step = steps[index];
+
+  sceneView.clearSecondaryMesh();
+  sceneView.setMesh(pipelineMeshes.fan, {
+    color: 0xe8e8e8,
+    wireColor: 0x4a4a48,
+  });
+  sceneView.setSpineElevationDebugOverlay(
+    pipelineMeshes.fan.vertices,
+    pipelineMeshes.spineSegments,
+    step,
+    steps.slice(0, index)
+  );
+  setStatus(elevationStepStatus(step));
   updateDebugActions();
 }
 
@@ -647,6 +716,12 @@ btnSkipPrune.addEventListener('click', () => {
   showFanStep();
 });
 
+btnSkipElevation.addEventListener('click', () => {
+  if (!pipelineMeshes || !isDebugMode()) return;
+  if (inflationStep !== 'spine' && inflationStep !== 'elevation') return;
+  showElevatedStep();
+});
+
 btnNext.addEventListener('click', () => {
   if (isDebugMode() && !inflationPipelineActive() && isCutDebugActive()) {
     advanceCutDebugStep();
@@ -668,7 +743,14 @@ btnNext.addEventListener('click', () => {
       showSpineStep();
       break;
     case 'spine':
-      showElevatedStep();
+      if ((pipelineMeshes.spineElevationSteps.length ?? 0) > 0) {
+        showElevationStep(0);
+      } else {
+        showElevatedStep();
+      }
+      break;
+    case 'elevation':
+      showElevationStep(elevationStepIndex + 1);
       break;
     case 'elevated':
       showInflatedStep();

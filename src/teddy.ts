@@ -8,6 +8,7 @@ import type { Mesh3D } from './teddyPipeline';
 
 export type {
   Mesh3D,
+  SpineElevationDebugStep,
   TeddyPipelineMeshes,
   TeddyPipelineResult,
   TerminalPruneDebugStep,

@@ -12,6 +12,7 @@ import {
 } from './meshWinding';
 import {
   applySpineElevation,
+  buildSpineElevationDebugSteps,
   buildTerminalPruneDebugSteps,
   cdtToZeyapTriangles,
   drawBackface,
@@ -22,10 +23,11 @@ import {
   wedgesToElevatedFanFaces,
   wedgesToFanFaces,
   wedgesToFanFacesFiltered,
+  type SpineElevationDebugStep,
   type TerminalPruneDebugStep,
 } from './zeyapInflation';
 
-export type { TerminalPruneDebugStep } from './zeyapInflation';
+export type { SpineElevationDebugStep, TerminalPruneDebugStep } from './zeyapInflation';
 
 export type TriangleType = 'T' | 'S' | 'J';
 
@@ -49,6 +51,8 @@ export interface TeddyPipelineMeshes {
   fan: Mesh3D;
   /** Paper (e): branched chordal-axis overlay (same vertices as fan). */
   spineSegments: [number, number][];
+  /** Paper §5.1: per-spine-vertex elevation frames for debug stepping. */
+  spineElevationSteps: SpineElevationDebugStep[];
   /** Fan vertices with spine elevation applied — spine nodes lifted to their height (z > 0). */
   elevatedSpineVertices: Vec3[];
   /** Elevated fans, mirrored back; no quarter-ovals or rim. */
@@ -177,6 +181,13 @@ export function buildTeddyPipeline(ring: Vec2[]): {
   const terminalFans: Mesh3D = { vertices: pruneVerts, faces: terminalFanFaces };
   const fan: Mesh3D = { vertices: pruneVerts, faces: fanFaces };
 
+  const spineElevationSteps = buildSpineElevationDebugSteps(
+    interiorVerts,
+    pruneVerts,
+    axisSegments,
+    polygon.length
+  );
+
   // Spine lifted into the air: same node indices as spineSegments, but z = elevation.
   const elevatedSpineVertices = pruneVerts.map((v) => vec3(v.x, v.y, v.z));
   applySpineElevation(interiorVerts, elevatedSpineVertices);
@@ -203,6 +214,7 @@ export function buildTeddyPipeline(ring: Vec2[]): {
       terminalPruneSteps,
       fan,
       spineSegments: axisSegments,
+      spineElevationSteps,
       elevatedSpineVertices,
       elevated,
       inflated,
