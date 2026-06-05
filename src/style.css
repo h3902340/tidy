@@ -320,11 +320,21 @@ body {
 }
 
 .paint-palette {
+  position: absolute;
+  top: 0.75rem;
+  left: 0.75rem;
+  z-index: 20;
   display: flex;
-  align-items: center;
-  gap: 0.3rem;
-  padding: 0.15rem 0 0;
-  flex-wrap: wrap;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.45rem;
+  padding: 0.55rem 0.65rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(250, 249, 247, 0.94);
+  box-shadow: 0 2px 10px rgba(42, 40, 38, 0.12);
+  pointer-events: auto;
+  max-width: calc(100% - 1.5rem);
 }
 
 .paint-palette[hidden] {
@@ -332,9 +342,18 @@ body {
 }
 
 .paint-palette-label {
-  font-size: 0.78rem;
-  color: var(--text-muted);
-  margin-right: 0.15rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-subtle);
+}
+
+.paint-palette-swatches {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem;
 }
 
 .paint-palette .swatch {
@@ -365,9 +384,9 @@ body {
   display: flex;
   align-items: center;
   gap: 0.35rem;
-  margin-left: 0.5rem;
   font-size: 0.78rem;
   color: var(--text-muted);
+  width: 100%;
 }
 
 .paint-brush input[type='range'] {

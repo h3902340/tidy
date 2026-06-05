@@ -36,6 +36,7 @@ const paintBrushValueEl = document.querySelector<HTMLSpanElement>('#paint-brush-
 const btnDiscardCut = document.querySelector<HTMLButtonElement>('#btn-discard-cut')!;
 const btnUndo = document.querySelector<HTMLButtonElement>('#btn-undo')!;
 const btnRedo = document.querySelector<HTMLButtonElement>('#btn-redo')!;
+const btnTopView = document.querySelector<HTMLButtonElement>('#btn-top-view')!;
 const btnConfirmExtrude =
   document.querySelector<HTMLButtonElement>('#btn-confirm-extrude')!;
 const toolTabEls = Array.from(
@@ -223,7 +224,34 @@ function updateHistoryButtons(): void {
   btnRedo.disabled = !editHistory.canRedo();
 }
 
-function finalizeAfterHistoryRestore(): void {
+function restoreEmptyCanvas(): void {
+  inflationStep = 'idle';
+  pipelineMeshes = null;
+  polygonReady = false;
+  btnNext.disabled = true;
+  btnNext.textContent = 'Next step';
+  setStepLabel('idle');
+  enablePostInflationControls(false);
+  clearStagedCut();
+  sceneView.clear();
+  sketchModeEl.checked = false;
+  sceneView.setSketchMode(false);
+  paintPaletteEl.hidden = true;
+  syncToolTabs('silhouette');
+  setStatus('');
+  updateExtrudeConfirmButton();
+  updateCutActionButtons();
+  updateNavHelp();
+  updateHint();
+}
+
+function finalizeAfterHistoryRestore(snapshot: EditSnapshot): void {
+  if (!snapshot.mesh) {
+    restoreEmptyCanvas();
+    updateHistoryButtons();
+    return;
+  }
+
   polygonReady = true;
   inflationStep = 'done';
   pipelineMeshes = null;
@@ -251,9 +279,11 @@ function performUndo(): void {
   const snapshot = editHistory.undo();
   if (!snapshot) return;
   restoringHistory = true;
-  sceneView.applyEditSnapshot(snapshot.mesh, snapshot.paint);
+  if (snapshot.mesh) {
+    sceneView.applyEditSnapshot(snapshot.mesh, snapshot.paint);
+  }
   restoringHistory = false;
-  finalizeAfterHistoryRestore();
+  finalizeAfterHistoryRestore(snapshot);
 }
 
 function performRedo(): void {
@@ -261,9 +291,11 @@ function performRedo(): void {
   const snapshot = editHistory.redo();
   if (!snapshot) return;
   restoringHistory = true;
-  sceneView.applyEditSnapshot(snapshot.mesh, snapshot.paint);
+  if (snapshot.mesh) {
+    sceneView.applyEditSnapshot(snapshot.mesh, snapshot.paint);
+  }
   restoringHistory = false;
-  finalizeAfterHistoryRestore();
+  finalizeAfterHistoryRestore(snapshot);
 }
 
 function applyPaintColor(hex: string): void {
@@ -322,7 +354,7 @@ function updateHint(): void {
 
   const mode = sceneView.getInteractionMode();
   if (mode === 'paint') {
-    hintEl.textContent = 'Paint on the surface — pick a color and brush size above';
+    hintEl.textContent = 'Paint on the surface — pick a color and brush size (top left)';
     return;
   }
   if (mode === 'cut') {
@@ -353,6 +385,7 @@ function enablePostInflationControls(enabled: boolean): void {
   sketchModeEl.disabled = !enabled;
   btnUndo.disabled = !enabled || !editHistory.canUndo();
   btnRedo.disabled = !enabled || !editHistory.canRedo();
+  btnTopView.disabled = !enabled;
   if (!enabled) {
     updateExtrudeConfirmButton();
     updateCutActionButtons();
@@ -450,7 +483,7 @@ function resetInflationFlow(): void {
   btnNext.textContent = 'Next step';
   setStepLabel('idle');
   enablePostInflationControls(false);
-  editHistory.clear();
+  editHistory.seedEmpty();
   updateHistoryButtons();
 }
 
@@ -903,6 +936,10 @@ btnRedo.addEventListener('click', () => {
   performRedo();
 });
 
+btnTopView.addEventListener('click', () => {
+  sceneView.resetViewTopDown();
+});
+
 window.addEventListener('keydown', (e) => {
   if (!(e.metaKey || e.ctrlKey)) return;
   const target = e.target;
@@ -1010,15 +1047,7 @@ btnStar.addEventListener('click', () => {
 
 btnClear.addEventListener('click', () => {
   resetInflationFlow();
-  clearStagedCut();
-  sceneView.clear();
-  sketchModeEl.checked = false;
-  sceneView.setSketchMode(false);
-  paintPaletteEl.hidden = true;
-  updateExtrudeConfirmButton();
-  syncToolTabs('silhouette');
-  setStatus('');
-  updateHint();
+  restoreEmptyCanvas();
 });
 
 resetInflationFlow();

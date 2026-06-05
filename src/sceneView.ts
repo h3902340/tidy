@@ -1785,6 +1785,14 @@ export class SceneView {
     this.controls.update();
   }
 
+  /** Snap the camera back to the top-down view (same as the initial drawing angle). */
+  resetViewTopDown(): void {
+    this.frameDrawingView();
+    if (this.interactionMode === 'cut') {
+      this.scheduleCutSilhouetteRefreshImmediate();
+    }
+  }
+
   clear(): void {
     this.cancelSilhouetteIdleRefresh();
     this.resetExtrudeState();

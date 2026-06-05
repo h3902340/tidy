@@ -1,7 +1,8 @@
 import type { Mesh3D } from './teddy';
 
 export type EditSnapshot = {
-  mesh: Mesh3D;
+  /** `null` = empty canvas (before any shape was created). */
+  mesh: Mesh3D | null;
   paint?: ImageData;
 };
 
@@ -23,10 +24,16 @@ export class EditHistory {
   push(entry: EditSnapshot): void {
     this.entries = this.entries.slice(0, this.index + 1);
     this.entries.push({
-      mesh: cloneMesh(entry.mesh),
+      mesh: entry.mesh ? cloneMesh(entry.mesh) : null,
       paint: entry.paint ? cloneImageData(entry.paint) : undefined,
     });
     this.index = this.entries.length - 1;
+  }
+
+  /** Baseline before the first inflated shape; undo targets this entry. */
+  seedEmpty(): void {
+    this.clear();
+    this.push({ mesh: null });
   }
 
   canUndo(): boolean {
@@ -53,7 +60,7 @@ export class EditHistory {
     if (this.index < 0) return null;
     const entry = this.entries[this.index];
     return {
-      mesh: cloneMesh(entry.mesh),
+      mesh: entry.mesh ? cloneMesh(entry.mesh) : null,
       paint: entry.paint ? cloneImageData(entry.paint) : undefined,
     };
   }
