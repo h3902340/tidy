@@ -5,9 +5,9 @@ import { validateCutCrossesBoundary, type CutBoundaryHit } from './cutPolygon';
 import { computeScreenSilhouetteFromRender } from './renderSilhouette';
 import {
   validateClosedLoopOnSurface,
-  projectScreenStroke,
   projectScreenStrokeFrontBack,
   projectScreenStrokeToPlane,
+  projectScreenStrokeOntoSurface,
   worldHitToMeshVertex,
 } from './surfaceProjection';
 import {
@@ -18,6 +18,7 @@ import {
 } from './extrude';
 import { CLOSE_TOLERANCE, closeStroke } from './stroke';
 import { createSketchMaterials, PAPER_COLOR, type SketchMaterials } from './sketchShader';
+import { SurfacePainter } from './surfacePaint';
 import type { Vec2, Vec3 } from './math';
 
 export type DisplayMode = 'solid' | 'wireframe' | 'both';
@@ -26,8 +27,7 @@ export type InteractionMode =
   | 'orbit'
   | 'paint'
   | 'cut'
-  | 'extrude'
-  | 'loopcut';
+  | 'extrude';
 
 /** Sub-phases of the two-stroke extrusion gesture (Teddy §4.4 / §5.3). */
 export type ExtrudePhase = 'idle' | 'loop' | 'orient' | 'curve';
@@ -46,7 +46,6 @@ export type ExtrudeMeshHandler = (mesh: Mesh3D) => void;
 export type SurfaceEditStatusHandler = (message: string, type: 'ok' | 'error') => void;
 export type SurfaceEditMeshHandler = (mesh: Mesh3D) => void;
 
-const PAINT_LINE_COLOR = 0xc0392b;
 const CUT_LINE_COLOR = 0xd35400;
 /** Base ring highlight while in extrusion mode (paper turns the surface line red). */
 const EXTRUDE_RING_COLOR = 0xe03030;
@@ -90,17 +89,39 @@ export interface MeshDisplayOptions {
   flatShading?: boolean;
 }
 
-const DEFAULT_MESH_COLOR = 0x6b9bd1;
+const DEFAULT_MESH_COLOR = 0xffffff;
 const DEFAULT_WIRE_COLOR = 0x2d4a63;
 /** Render both sides so occasional inverted inflation triangles stay visible. */
 const MESH_MATERIAL_SIDE = THREE.DoubleSide;
 const SPINE_LINE_COLOR = 0x000000;
-/** World-space radius for spine tube meshes (visible on ~100px-scale shapes). */
-const SPINE_TUBE_RADIUS = 1.1;
+/** World-space radius for spine tube meshes. Thin, so midpoint dots stay legible. */
+const SPINE_TUBE_RADIUS = 0.4;
+/** Colour and radius for the internal-edge midpoint dots drawn on the spine step. */
+const SPINE_DOT_COLOR = 0x000000;
+const SPINE_DOT_RADIUS = 1.0;
 /** Recompute cut silhouette only after the camera has been idle this long (ms). */
 const SILHOUETTE_IDLE_MS = 3000;
 const DEFAULT_CAMERA_POSITION = new THREE.Vector3(0, -180, 220);
 const DEFAULT_ORBIT_TARGET = new THREE.Vector3(0, 0, 0);
+/**
+ * Creation/drawing view: looking straight down the drawing plane's normal (+z), so the outline
+ * stroke is captured perfectly orthogonal to the ground and is not foreshortened by perspective.
+ */
+const DRAW_CAMERA_POSITION = new THREE.Vector3(0, 0, 284);
+
+/** OrbitControls keeps damped rotation/pan deltas; clear them when snapping the camera. */
+function clearOrbitControlsInertia(controls: OrbitControls): void {
+  const c = controls as OrbitControls & {
+    _sphericalDelta: { theta: number; phi: number; radius: number };
+    _panOffset: THREE.Vector3;
+    _scale: number;
+  };
+  c._sphericalDelta.theta = 0;
+  c._sphericalDelta.phi = 0;
+  c._sphericalDelta.radius = 0;
+  c._panOffset.set(0, 0, 0);
+  c._scale = 1;
+}
 
 export class SceneView {
   private container: HTMLElement;
@@ -118,6 +139,8 @@ export class SceneView {
   private cutPreviewGroup: THREE.Group;
   private spineLinesGroup: THREE.Group;
   private spineTubeMaterial: THREE.MeshBasicMaterial | null = null;
+  private spineDotMaterial: THREE.MeshBasicMaterial | null = null;
+  private spineLabelGroup: THREE.Group;
   private overlayCanvas: HTMLCanvasElement;
   private overlayCtx: CanvasRenderingContext2D;
   private painting = false;
@@ -145,17 +168,22 @@ export class SceneView {
   private sketchMode = false;
   private sketchMaterials: SketchMaterials | null = null;
   private outlineMesh: THREE.Mesh | null = null;
+  /** Texture painter for the current main mesh (built for paint-capable, non-preview meshes). */
+  private painter: SurfacePainter | null = null;
+  private paintColor = 0xd1495b;
+  /** Brush thickness as a stroke diameter in screen pixels. */
+  private brushPixels = 16;
   /** The mesh's normal (Phong) material, kept aside while the sketch fill is shown so it can be restored. */
   private suspendedFillMaterial: THREE.Material | null = null;
   private grid: THREE.GridHelper | null = null;
-  private readonly defaultBackground = new THREE.Color(0xf0eeea);
+  private readonly defaultBackground = new THREE.Color(0xcccccc);
 
   constructor(container: HTMLElement) {
     this.container = container;
     container.classList.add('scene-view');
 
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(0xf0eeea);
+    this.scene.background = new THREE.Color(0xcccccc);
     this.surfaceLinesGroup = new THREE.Group();
     this.scene.add(this.surfaceLinesGroup);
     this.cutPreviewGroup = new THREE.Group();
@@ -163,13 +191,18 @@ export class SceneView {
     this.spineLinesGroup = new THREE.Group();
     this.spineLinesGroup.scale.set(1, -1, 1);
     this.scene.add(this.spineLinesGroup);
+    // Height labels are billboard sprites; they must NOT inherit the y-flip (it would mirror text).
+    this.spineLabelGroup = new THREE.Group();
+    this.scene.add(this.spineLabelGroup);
     // Base ring lives in world space so it stays put while the camera orbits around it.
     this.extrudeRingGroup = new THREE.Group();
     this.scene.add(this.extrudeRingGroup);
 
     const aspect = container.clientWidth / Math.max(container.clientHeight, 1);
     this.camera = new THREE.PerspectiveCamera(45, aspect, 0.1, 2000);
-    this.camera.position.copy(DEFAULT_CAMERA_POSITION);
+    // Start in the creation view: top-down, orthogonal to the drawing plane.
+    this.camera.up.set(0, 1, 0);
+    this.camera.position.copy(DRAW_CAMERA_POSITION);
 
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
     this.renderer.setPixelRatio(window.devicePixelRatio);
@@ -198,8 +231,10 @@ export class SceneView {
       }
     });
 
-    const ambient = new THREE.AmbientLight(0xffffff, 0.55);
-    const dir = new THREE.DirectionalLight(0xffffff, 0.85);
+    // Bright, fairly even lighting so a white surface actually reads white (with gentle form
+    // shading) and painted colours stay close to the picked colour.
+    const ambient = new THREE.AmbientLight(0xffffff, 0.85);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.45);
     dir.position.set(120, 200, 180);
     this.scene.add(ambient, dir);
 
@@ -209,7 +244,44 @@ export class SceneView {
     this.scene.add(grid);
     this.grid = grid;
 
+    // Dashed X (red) and Y (green) axes on the drawing plane (z = 0).
+    const axisHalf = 200;
+    const makeDashedAxis = (a: THREE.Vector3, b: THREE.Vector3, color: number) => {
+      const geometry = new THREE.BufferGeometry().setFromPoints([a, b]);
+      const line = new THREE.Line(
+        geometry,
+        new THREE.LineDashedMaterial({
+          color,
+          dashSize: 8,
+          gapSize: 6,
+          transparent: true,
+          opacity: 0.9,
+          depthWrite: false,
+        })
+      );
+      line.computeLineDistances();
+      return line;
+    };
+    const axes = new THREE.Group();
+    axes.position.z = -0.4;
+    axes.add(
+      makeDashedAxis(
+        new THREE.Vector3(-axisHalf, 0, 0),
+        new THREE.Vector3(axisHalf, 0, 0),
+        0xffffff
+      )
+    );
+    axes.add(
+      makeDashedAxis(
+        new THREE.Vector3(0, -axisHalf, 0),
+        new THREE.Vector3(0, axisHalf, 0),
+        0xffffff
+      )
+    );
+    this.scene.add(axes);
+
     this.bindOverlayEvents();
+    this.bindPaintEvents();
     window.addEventListener('resize', () => this.onResize());
     this.resizeOverlay();
     this.animate();
@@ -297,13 +369,12 @@ export class SceneView {
   setInteractionMode(mode: InteractionMode): void {
     this.interactionMode = mode;
     if (mode !== 'extrude') this.resetExtrudeState();
-    if (mode !== 'loopcut') this.resetLoopCutState();
+    if (mode !== 'cut') this.resetLoopCutState();
     const overlayActive =
       mode === 'silhouette' ||
       mode === 'paint' ||
       mode === 'cut' ||
-      mode === 'extrude' ||
-      mode === 'loopcut';
+      mode === 'extrude';
     if (!overlayActive) {
       this.painting = false;
       this.paintStroke = [];
@@ -312,8 +383,12 @@ export class SceneView {
       this.discardPendingCut();
       this.clearOverlay();
     } else if (mode === 'cut') {
+      // Unified cut: a closed loop on the surface does a loop cut; an open stroke crossing the
+      // silhouette does a cut-through. The kind is detected when the stroke finishes.
+      this.painting = false;
       this.paintStroke = [];
       this.discardPendingCut();
+      this.resetLoopCutState();
       this.scheduleCutSilhouetteRefreshImmediate();
     } else if (mode === 'extrude') {
       this.painting = false;
@@ -321,46 +396,51 @@ export class SceneView {
       this.discardPendingCut();
       this.clearOverlay();
       this.startExtrude();
-    } else if (mode === 'loopcut') {
-      this.painting = false;
-      this.paintStroke = [];
-      this.discardPendingCut();
-      this.clearOverlay();
-      this.resetLoopCutState();
-      this.onLoopCutStatus?.(
-        'Loop cut (step 1/3): draw a closed loop on the surface to project it onto the front face.',
-        'ok'
-      );
     }
     this.syncPointerAndOrbitState();
   }
 
   /** Overlay captures strokes; orbit uses the canvas during a cut review or extrusion re-orient. */
   private syncPointerAndOrbitState(): void {
-    const cutReviewing =
-      this.interactionMode === 'cut' && this.pendingCut !== null;
+    const cutMode = this.interactionMode === 'cut';
+    const cutReviewing = cutMode && this.pendingCut !== null;
+    const loopCutReviewing = cutMode && this.loopCutPhase !== 'idle';
+    // Drawing sub-state of cut mode: nothing staged yet, so the overlay captures the stroke.
+    const cutDrawing = cutMode && this.pendingCut === null && this.loopCutPhase === 'idle';
     const extrudeDrawing =
       this.interactionMode === 'extrude' &&
       (this.extrudePhase === 'loop' || this.extrudePhase === 'curve');
     const extrudeOrbit =
       this.interactionMode === 'extrude' && this.extrudePhase === 'orient';
-    const loopCutDrawing =
-      this.interactionMode === 'loopcut' && this.loopCutPhase === 'idle';
-    const loopCutReviewing =
-      this.interactionMode === 'loopcut' && this.loopCutPhase !== 'idle';
+    // Paint mode is excluded: painting happens on the WebGL canvas (left button) while the camera
+    // controls handle the other buttons, so the overlay must stay click-through.
     const overlayActive =
-      this.interactionMode === 'silhouette' ||
-      this.interactionMode === 'paint' ||
-      this.interactionMode === 'cut' ||
-      loopCutDrawing ||
-      extrudeDrawing;
+      this.interactionMode === 'silhouette' || cutDrawing || extrudeDrawing;
 
-    this.overlayCanvas.classList.toggle(
-      'overlay-interactive',
-      overlayActive && !cutReviewing
-    );
+    this.overlayCanvas.classList.toggle('overlay-interactive', overlayActive);
+
+    const paintMode = this.interactionMode === 'paint';
+    this.renderer.domElement.classList.toggle('paint-cursor', paintMode);
+    if (paintMode) {
+      // Left is reserved for painting; orbit/pan move to the right/middle buttons (wheel = zoom).
+      this.controls.mouseButtons = {
+        LEFT: null as unknown as THREE.MOUSE,
+        MIDDLE: THREE.MOUSE.PAN,
+        RIGHT: THREE.MOUSE.ROTATE,
+      };
+    } else {
+      this.controls.mouseButtons = {
+        LEFT: THREE.MOUSE.ROTATE,
+        MIDDLE: THREE.MOUSE.DOLLY,
+        RIGHT: THREE.MOUSE.PAN,
+      };
+    }
     this.controls.enabled =
-      this.interactionMode === 'orbit' || cutReviewing || extrudeOrbit || loopCutReviewing;
+      this.interactionMode === 'orbit' ||
+      paintMode ||
+      cutReviewing ||
+      loopCutReviewing ||
+      extrudeOrbit;
   }
 
   private cancelSilhouetteIdleRefresh(): void {
@@ -494,16 +574,56 @@ export class SceneView {
       } else if (this.interactionMode === 'paint') {
         this.finishPaintStroke();
       } else if (this.interactionMode === 'cut') {
-        this.finishCutStroke();
+        this.finishCutOrLoopStroke();
       } else if (this.interactionMode === 'extrude') {
         this.finishExtrudeStroke();
-      } else if (this.interactionMode === 'loopcut') {
-        this.finishLoopCutStroke();
       }
     };
 
     this.overlayCanvas.addEventListener('pointerup', finish);
     this.overlayCanvas.addEventListener('pointercancel', finish);
+  }
+
+  /**
+   * Paint mode shares the canvas with the camera: the left button paints (handled here on the
+   * WebGL canvas), while the right/middle buttons and wheel drive OrbitControls (rotate/pan/zoom).
+   * The overlay stays non-interactive in paint mode so these events reach the canvas + controls.
+   */
+  private bindPaintEvents(): void {
+    const el = this.renderer.domElement;
+    const getPos = (e: PointerEvent): Vec2 => {
+      const rect = el.getBoundingClientRect();
+      return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    };
+
+    el.addEventListener('pointerdown', (e) => {
+      if (this.interactionMode !== 'paint') return;
+      if (e.button !== 0) return; // left = paint; other buttons orbit/pan via controls
+      if (!this.meshObject || !this.painter) return;
+      // OrbitControls captures the pointer on the canvas, so move events keep flowing to us; we
+      // deliberately don't capture/release here to avoid clashing with the controls.
+      this.painting = true;
+      this.paintStroke = [getPos(e)];
+      this.drawOverlayPreview();
+    });
+
+    el.addEventListener('pointermove', (e) => {
+      if (this.interactionMode !== 'paint' || !this.painting) return;
+      const p = getPos(e);
+      const last = this.paintStroke[this.paintStroke.length - 1];
+      if (Math.hypot(p.x - last.x, p.y - last.y) > 2) {
+        this.paintStroke.push(p);
+        this.drawOverlayPreview();
+      }
+    });
+
+    const finishPaint = () => {
+      if (this.interactionMode !== 'paint' || !this.painting) return;
+      this.painting = false;
+      this.finishPaintStroke();
+    };
+    el.addEventListener('pointerup', finishPaint);
+    el.addEventListener('pointercancel', finishPaint);
   }
 
   private finishSilhouetteStroke(): void {
@@ -522,23 +642,62 @@ export class SceneView {
     this.onSilhouetteComplete?.(closed);
   }
 
+  /** Set the brush colour for surface painting (hex, e.g. 0xd1495b). */
+  setPaintColor(hex: number): void {
+    this.paintColor = hex;
+  }
+
+  /** Set the brush thickness, as a stroke diameter in screen pixels. */
+  setBrushSize(pixels: number): void {
+    this.brushPixels = Math.max(1, pixels);
+  }
+
   private finishPaintStroke(): void {
     this.clearOverlay();
-    if (!this.meshObject || this.paintStroke.length < 2) {
+    if (!this.meshObject || !this.painter || this.paintStroke.length < 2) {
       this.paintStroke = [];
       return;
     }
 
-    const projected = projectScreenStroke(
+    const projected = projectScreenStrokeOntoSurface(
       this.paintStroke,
       this.camera,
       this.meshObject,
       this.renderer.domElement
     );
     this.paintStroke = [];
-    if (projected.length < 2) return;
+    if (projected.length < 1) return;
 
-    this.addSurfaceLine(projected, PAINT_LINE_COLOR);
+    // Convert the screen brush thickness to a world radius *per point* (using that point's depth),
+    // so the painted band keeps a constant on-screen thickness regardless of zoom/perspective and
+    // matches what the user drew. Bake it into the surface texture.
+    const vFov =
+      (this.camera instanceof THREE.PerspectiveCamera ? this.camera.fov : 45) * (Math.PI / 180);
+    const heightPx = Math.max(1, this.renderer.domElement.clientHeight);
+    const k = (2 * Math.tan(vFov / 2)) / heightPx;
+    const radii = projected.map((p) => {
+      const dist = this.camera.position.distanceTo(p);
+      return Math.max(0.5, this.brushPixels * 0.5 * k * dist);
+    });
+    this.painter.paintStroke(projected, radii, this.paintColor);
+  }
+
+  /**
+   * Unified cut: route the finished stroke to a loop cut (closed loop drawn on the surface) or a
+   * cut-through (open stroke crossing the silhouette), based on the stroke's shape.
+   */
+  private finishCutOrLoopStroke(): void {
+    // Only the drawing sub-state should produce a new cut; ignore strokes while one is staged.
+    if (this.pendingCut !== null || this.loopCutPhase !== 'idle') {
+      this.paintStroke = [];
+      this.clearOverlay();
+      return;
+    }
+    if (strokeIsClosedLoop(this.paintStroke)) {
+      this.finishLoopCutStroke();
+    } else {
+      this.finishCutStroke();
+    }
   }
 
   /**
@@ -599,7 +758,7 @@ export class SceneView {
 
   /** Loop cut — stage 2 of 3: reveal the cut by removing the enclosed front surface. */
   applyLoopCut(): void {
-    if (this.interactionMode !== 'loopcut' || this.loopCutPhase !== 'projected') return;
+    if (this.interactionMode !== 'cut' || this.loopCutPhase !== 'projected') return;
     if (!this.loopCutBase || !this.loopCutMeshBeforeCut) return;
 
     const base = this.loopCutBase;
@@ -623,7 +782,7 @@ export class SceneView {
 
   /** Loop cut — stage 3 of 3: fill the opening left by the cut. */
   fillLoopCut(): void {
-    if (this.interactionMode !== 'loopcut' || this.loopCutPhase !== 'cut') return;
+    if (this.interactionMode !== 'cut' || this.loopCutPhase !== 'cut') return;
     if (!this.loopCutBase || !this.loopCutMeshBeforeCut) return;
 
     const filled = fillLoopHole(this.loopCutMeshBeforeCut, this.loopCutBase);
@@ -646,7 +805,7 @@ export class SceneView {
 
   /** Discard an in-progress loop cut and restore the mesh as it was before the cut. */
   cancelLoopCut(): void {
-    if (this.interactionMode !== 'loopcut') return;
+    if (this.interactionMode !== 'cut') return;
     const restore = this.loopCutMeshBeforeCut;
     this.clearExtrudeRing();
     this.resetLoopCutState();
@@ -873,7 +1032,12 @@ export class SceneView {
 
   /** Recompute screen silhouette for cut mode (call after camera / mesh changes). */
   refreshCutSilhouette(): void {
-    if (this.interactionMode !== 'cut' || !this.currentMeshData) {
+    // Only show the silhouette guide while actively drawing a cut stroke (nothing staged yet).
+    const drawing =
+      this.interactionMode === 'cut' &&
+      this.pendingCut === null &&
+      this.loopCutPhase === 'idle';
+    if (!drawing || !this.currentMeshData) {
       this.cutSilhouette = [];
       if (this.interactionMode === 'cut') this.drawCutOverlay();
       return;
@@ -1020,7 +1184,8 @@ export class SceneView {
     this.overlayCtx.lineCap = 'round';
     this.overlayCtx.lineJoin = 'round';
     this.overlayCtx.strokeStyle = this.overlayStrokeStyle();
-    this.overlayCtx.lineWidth = 2.5;
+    // In paint mode preview the actual brush thickness so the on-screen stroke matches the paint.
+    this.overlayCtx.lineWidth = this.interactionMode === 'paint' ? this.brushPixels : 2.5;
     this.overlayCtx.beginPath();
     this.overlayCtx.moveTo(this.paintStroke[0].x, this.paintStroke[0].y);
     for (let i = 1; i < this.paintStroke.length; i++) {
@@ -1031,11 +1196,16 @@ export class SceneView {
 
   private overlayStrokeStyle(): string {
     if (this.interactionMode === 'silhouette') return 'rgba(45, 90, 142, 0.75)';
-    if (this.interactionMode === 'loopcut') return 'rgba(26, 188, 156, 0.85)';
     if (this.interactionMode === 'extrude') {
       return this.extrudePhase === 'curve'
         ? EXTRUDE_CURVE_PREVIEW
         : EXTRUDE_LOOP_PREVIEW;
+    }
+    if (this.interactionMode === 'paint') {
+      const r = (this.paintColor >> 16) & 255;
+      const g = (this.paintColor >> 8) & 255;
+      const b = this.paintColor & 255;
+      return `rgba(${r}, ${g}, ${b}, 0.65)`;
     }
     return 'rgba(192, 57, 43, 0.55)';
   }
@@ -1109,23 +1279,78 @@ export class SceneView {
     }
     this.spineTubeMaterial?.dispose();
     this.spineTubeMaterial = null;
+    this.spineDotMaterial?.dispose();
+    this.spineDotMaterial = null;
+    while (this.spineLabelGroup.children.length > 0) {
+      const child = this.spineLabelGroup.children[0];
+      this.spineLabelGroup.remove(child);
+      if (child instanceof THREE.Sprite) {
+        child.material.map?.dispose();
+        child.material.dispose();
+      }
+    }
   }
 
-  /** Draw chordal-axis trunk as thick black tubes (step 2). */
+  /** Billboard text sprite (always faces the camera) for spine height labels. */
+  private makeTextSprite(text: string): THREE.Sprite {
+    const pad = 8;
+    const fontPx = 48;
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d')!;
+    ctx.font = `bold ${fontPx}px sans-serif`;
+    const textWidth = ctx.measureText(text).width;
+    canvas.width = Math.ceil(textWidth + pad * 2);
+    canvas.height = fontPx + pad * 2;
+
+    ctx.font = `bold ${fontPx}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.lineWidth = 6;
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+    ctx.strokeText(text, canvas.width / 2, canvas.height / 2);
+    ctx.fillStyle = '#111111';
+    ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.minFilter = THREE.LinearFilter;
+    const material = new THREE.SpriteMaterial({
+      map: texture,
+      depthTest: false,
+      depthWrite: false,
+      transparent: true,
+    });
+    const sprite = new THREE.Sprite(material);
+    const worldHeight = 9;
+    sprite.scale.set((worldHeight * canvas.width) / canvas.height, worldHeight, 1);
+    return sprite;
+  }
+
+  /**
+   * Draw the chordal-axis spine as thin black tubes, with a dot at every spine node (the
+   * midpoints of the remaining internal edges plus junction/fan tips) so the connectivity can be
+   * checked at a glance. Pruned edges absorbed into terminal fans are not spine nodes, so they
+   * are intentionally not dotted.
+   *
+   * When `onSurface` is true, depth testing is enabled so the spine is drawn on the mesh rather
+   * than floating above it — use during creation steps to verify alignment.
+   */
   setSpineOverlay(
     vertices: { x: number; y: number; z: number }[],
-    segments: [number, number][]
+    segments: [number, number][],
+    options: { showHeights?: boolean; onSurface?: boolean } = {}
   ): void {
+    const { showHeights = false, onSurface = false } = options;
     this.clearSpineOverlay();
     const up = new THREE.Vector3(0, 1, 0);
     const dir = new THREE.Vector3();
     this.spineTubeMaterial?.dispose();
     this.spineTubeMaterial = new THREE.MeshBasicMaterial({
       color: SPINE_LINE_COLOR,
-      depthTest: false,
+      depthTest: onSurface,
       depthWrite: false,
     });
     const material = this.spineTubeMaterial;
+    const overlayOrder = onSurface ? 2 : 1000;
 
     for (const [a, b] of segments) {
       const va = vertices[a];
@@ -1152,8 +1377,40 @@ export class SceneView {
       );
       dir.set(dx / len, dy / len, dz / len);
       tube.quaternion.setFromUnitVectors(up, dir);
-      tube.renderOrder = 1000;
+      tube.renderOrder = overlayOrder;
       this.spineLinesGroup.add(tube);
+    }
+
+    const nodeIds = new Set<number>();
+    for (const [a, b] of segments) {
+      nodeIds.add(a);
+      nodeIds.add(b);
+    }
+    if (nodeIds.size > 0) {
+      this.spineDotMaterial?.dispose();
+      this.spineDotMaterial = new THREE.MeshBasicMaterial({
+        color: SPINE_DOT_COLOR,
+        depthTest: onSurface,
+        depthWrite: false,
+      });
+      const dotGeometry = new THREE.SphereGeometry(SPINE_DOT_RADIUS, 10, 8);
+      for (const id of nodeIds) {
+        const v = vertices[id];
+        if (!v) continue;
+        const dot = new THREE.Mesh(dotGeometry.clone(), this.spineDotMaterial);
+        dot.position.set(v.x, v.y, v.z);
+        dot.renderOrder = overlayOrder + 1;
+        this.spineLinesGroup.add(dot);
+
+        if (showHeights) {
+          const label = this.makeTextSprite(v.z.toFixed(1));
+          // The label group is not y-flipped, so mirror the y to match the dot, then float it up.
+          label.position.set(v.x, -v.y + 8, v.z);
+          label.renderOrder = onSurface ? 4 : 1002;
+          this.spineLabelGroup.add(label);
+        }
+      }
+      dotGeometry.dispose();
     }
   }
 
@@ -1279,6 +1536,10 @@ export class SceneView {
       this.suspendedFillMaterial.dispose();
       this.suspendedFillMaterial = null;
     }
+    if (this.painter) {
+      this.painter.dispose(); // also frees the atlas texture
+      this.painter = null;
+    }
     if (this.wireframe) {
       this.scene.remove(this.wireframe);
       this.wireframe.geometry.dispose();
@@ -1295,18 +1556,34 @@ export class SceneView {
     if (this.interactionMode === 'cut') {
       this.scheduleCutSilhouetteRefreshImmediate();
     }
-    const { geometry, useFaceColors } = this.buildMeshGeometry(mesh, options);
 
-    const material = new THREE.MeshPhongMaterial({
-      color: useFaceColors ? 0xffffff : (options.color ?? DEFAULT_MESH_COLOR),
-      vertexColors: useFaceColors,
-      side: MESH_MATERIAL_SIDE,
-      flatShading: useFaceColors || options.flatShading === true,
-      shininess: 30,
-      polygonOffset: true,
-      polygonOffsetFactor: 1,
-      polygonOffsetUnits: 1,
-    });
+    // Solid meshes (no per-face preview colours) become paint-capable: their geometry carries a
+    // per-triangle texture atlas so strokes can be baked onto the surface. Preview meshes that use
+    // flat face colours keep the plain material.
+    let geometry: THREE.BufferGeometry;
+    let material: THREE.Material;
+    const useFaceColors =
+      options.faceColors !== undefined && options.faceColors.length === mesh.faces.length;
+
+    if (useFaceColors) {
+      const built = this.buildMeshGeometry(mesh, options);
+      geometry = built.geometry;
+      material = new THREE.MeshPhongMaterial({
+        color: 0xffffff,
+        vertexColors: true,
+        side: MESH_MATERIAL_SIDE,
+        flatShading: true,
+        shininess: 30,
+        polygonOffset: true,
+        polygonOffsetFactor: 1,
+        polygonOffsetUnits: 1,
+      });
+    } else {
+      const painter = new SurfacePainter(mesh, options.color ?? DEFAULT_MESH_COLOR);
+      this.painter = painter;
+      geometry = painter.geometry;
+      material = painter.material;
+    }
 
     this.meshObject = new THREE.Mesh(geometry, material);
     this.meshObject.scale.set(1, -1, 1);
@@ -1357,8 +1634,17 @@ export class SceneView {
     if (!this.sketchMaterials) {
       this.sketchMaterials = createSketchMaterials();
     }
-    // The sketched object is plain white paper; only the stipple ink conveys shading.
-    (this.sketchMaterials.fill.uniforms.uPaper.value as THREE.Color).setHex(0xffffff);
+    // Plain white paper by default; where the surface is painted, sample that colour so the sketch
+    // shows its greyscale value under the stipple shading.
+    const fillU = this.sketchMaterials.fill.uniforms;
+    (fillU.uPaper.value as THREE.Color).setHex(0xffffff);
+    const surfaceTex = this.painter?.material.map ?? null;
+    if (surfaceTex) {
+      fillU.uColorMap.value = surfaceTex;
+      fillU.uHasColorMap.value = 1;
+    } else {
+      fillU.uHasColorMap.value = 0;
+    }
 
     // Swap in the sketch fill, keeping the Phong material aside so toggling off can restore it.
     if (this.meshObject.material !== this.sketchMaterials.fill) {
@@ -1389,8 +1675,22 @@ export class SceneView {
 
   /** Restore default orbit distance/angle so a previous zoom-in does not block the next object. */
   resetOrbitCamera(): void {
+    this.camera.up.set(0, 1, 0);
     this.camera.position.copy(DEFAULT_CAMERA_POSITION);
     this.controls.target.copy(DEFAULT_ORBIT_TARGET);
+    clearOrbitControlsInertia(this.controls);
+    this.controls.update();
+  }
+
+  /**
+   * Top-down view orthogonal to the drawing plane (z = 0), used while drawing the creation
+   * outline so the stroke is captured without perspective foreshortening.
+   */
+  frameDrawingView(): void {
+    this.camera.up.set(0, 1, 0);
+    this.camera.position.copy(DRAW_CAMERA_POSITION);
+    this.controls.target.copy(DEFAULT_ORBIT_TARGET);
+    clearOrbitControlsInertia(this.controls);
     this.controls.update();
   }
 
@@ -1404,7 +1704,41 @@ export class SceneView {
     this.clearSurfaceLines();
     this.discardPendingCut();
     this.clearOverlay();
-    this.resetOrbitCamera();
+    this.frameDrawingView();
     this.setInteractionMode('silhouette');
   }
+}
+
+/**
+ * Decide whether a screen-space stroke is a closed loop (→ loop cut) rather than an open stroke
+ * (→ cut-through). A loop has its endpoints close together *and* encloses a meaningful area, which
+ * cleanly separates it from a line drawn across the object.
+ */
+function strokeIsClosedLoop(stroke: Vec2[]): boolean {
+  if (stroke.length < 8) return false;
+
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  let area2 = 0;
+  for (let i = 0; i < stroke.length; i++) {
+    const a = stroke[i];
+    const b = stroke[(i + 1) % stroke.length];
+    area2 += a.x * b.y - b.x * a.y;
+    minX = Math.min(minX, a.x);
+    minY = Math.min(minY, a.y);
+    maxX = Math.max(maxX, a.x);
+    maxY = Math.max(maxY, a.y);
+  }
+  const diag = Math.hypot(maxX - minX, maxY - minY);
+  if (diag < 20) return false;
+
+  const first = stroke[0];
+  const last = stroke[stroke.length - 1];
+  const gap = Math.hypot(last.x - first.x, last.y - first.y);
+  const enclosed = Math.abs(area2) / 2;
+
+  // Endpoints near each other, and the enclosed area is a real region (not a thin sliver).
+  return gap <= 0.35 * diag && enclosed >= 0.06 * diag * diag;
 }

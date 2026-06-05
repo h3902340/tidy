@@ -84,6 +84,38 @@ export function projectScreenStrokeFrontBack(
 }
 
 /**
+ * Project a screen stroke onto the nearest (front) surface, returning the raw hit points with no
+ * lift — used for painting, where the brush must sit exactly on the surface. Points that miss the
+ * object are skipped so the rest of the stroke still paints.
+ */
+export function projectScreenStrokeOntoSurface(
+  stroke: Vec2[],
+  camera: THREE.Camera,
+  mesh: THREE.Object3D,
+  domElement: HTMLElement
+): THREE.Vector3[] {
+  if (stroke.length < 2) return [];
+
+  const raycaster = new THREE.Raycaster();
+  const ndc = new THREE.Vector2();
+  const rect = domElement.getBoundingClientRect();
+  const hits: THREE.Vector3[] = [];
+
+  for (const p of densifyStroke(stroke, SEGMENT_SAMPLES)) {
+    ndc.x = (p.x / rect.width) * 2 - 1;
+    ndc.y = -(p.y / rect.height) * 2 + 1;
+    raycaster.setFromCamera(ndc, camera);
+    const intersections = raycaster
+      .intersectObject(mesh, false)
+      .sort((a, b) => a.distance - b.distance);
+    if (intersections.length === 0) continue;
+    hits.push(intersections[0].point.clone());
+  }
+
+  return mergeNearbyHits(hits, 0.3);
+}
+
+/**
  * Project a closed screen-space loop onto the *front* of the object only (nearest hit
  * along each view ray, never the back). Used to define the extrusion base ring
  * (Teddy §5.3). Fails if any part of the loop misses the surface, so the caller can ask

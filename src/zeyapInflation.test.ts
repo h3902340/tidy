@@ -155,6 +155,98 @@ describe('terminal fan pruning', () => {
     void topLeftVid;
   });
 
+  it('open junction triangle: hub-to-mid wedges share edge mids with sleeves', () => {
+    const polygon = normalizePolygon(unitSquare);
+    const { triangles } = constrainedDelaunay(polygon);
+    const jCount = triangles.filter((t) => t.type === 'J').length;
+    expect(jCount).toBeGreaterThan(0);
+
+    const zeyap = cdtToZeyapTriangles(triangles);
+    const verts = polygon.map((p) => vec3(p.x, p.y, 0));
+    const boundaryCount = polygon.length;
+    const { wedges } = pruneToWedges(zeyap, [...verts]);
+
+    const jTri = triangles.find((t) => t.type === 'J')!;
+    const corners = new Set(jTri.indices);
+
+    const spineFreq = new Map<number, number>();
+    for (const w of wedges) {
+      if (w.fromTerminalPrune) continue;
+      for (const v of w.vertIds) {
+        if (v < boundaryCount) continue;
+        spineFreq.set(v, (spineFreq.get(v) ?? 0) + 1);
+      }
+    }
+    let hubIdx = -1;
+    let bestFreq = 0;
+    for (const [v, n] of spineFreq) {
+      if (n > bestFreq) {
+        bestFreq = n;
+        hubIdx = v;
+      }
+    }
+    expect(hubIdx).toBeGreaterThanOrEqual(boundaryCount);
+
+    const hubWedges = wedges.filter(
+      (w) =>
+        !w.fromTerminalPrune &&
+        w.vertIds.includes(hubIdx) &&
+        w.vertIds.filter((v) => v >= boundaryCount).length === 2
+    );
+    // Two wedges per interior edge reached by the junction hub (hub–mid–corner).
+    expect(hubWedges.length).toBeGreaterThanOrEqual(4);
+    expect(hubWedges.length % 2).toBe(0);
+
+    const covered = new Set<number>();
+    for (const fan of hubWedges) {
+      for (const v of fan.vertIds) {
+        if (v < boundaryCount) covered.add(v);
+      }
+    }
+    expect(covered.size).toBeGreaterThanOrEqual(2);
+    void corners;
+  });
+
+  it('wobbly circle: spine axis is one connected component', () => {
+    const pts: { x: number; y: number }[] = [];
+    const n = 120;
+    const r = 100;
+    for (let i = 0; i < n; i++) {
+      const t = (i / n) * Math.PI * 2;
+      const wobble = 1 + 0.08 * Math.sin(t * 5);
+      pts.push({ x: Math.cos(t) * r * wobble, y: Math.sin(t) * r * wobble });
+    }
+    const polygon = normalizePolygon(pts);
+    const { triangles } = constrainedDelaunay(polygon);
+    const zeyap = cdtToZeyapTriangles(triangles);
+    const verts = polygon.map((p) => vec3(p.x, p.y, 0));
+    const { axisSegments } = pruneToWedges(zeyap, [...verts]);
+
+    const adj = new Map<number, number[]>();
+    for (const [a, b] of axisSegments) {
+      (adj.get(a) ?? adj.set(a, []).get(a)!).push(b);
+      (adj.get(b) ?? adj.set(b, []).get(b)!).push(a);
+    }
+    const visited = new Set<number>();
+    let components = 0;
+    for (const start of adj.keys()) {
+      if (visited.has(start)) continue;
+      components++;
+      const q = [start];
+      visited.add(start);
+      while (q.length) {
+        const v = q.pop()!;
+        for (const nb of adj.get(v) ?? []) {
+          if (!visited.has(nb)) {
+            visited.add(nb);
+            q.push(nb);
+          }
+        }
+      }
+    }
+    expect(components).toBe(1);
+  });
+
   it('buildTeddyPipeline resampled square: terminal fans cover all T triangles', () => {
     const result = buildTeddyPipeline(normalizePolygon(unitSquare));
     expect(result.error).toBeNull();

@@ -4,6 +4,7 @@ import { SceneView, type DisplayMode, type InteractionMode } from './sceneView';
 import { buildTeddyPipelineFromStroke } from './teddy';
 import {
   FAN_TERMINAL_COLOR,
+  type Mesh3D,
   type TeddyPipelineMeshes,
   type TriangleType,
 } from './teddy';
@@ -14,14 +15,19 @@ const hintEl = document.querySelector<HTMLElement>('#canvas-hint')!;
 const statusEl = document.querySelector<HTMLElement>('#status')!;
 const stepEl = document.querySelector<HTMLElement>('#inflation-step')!;
 const btnClear = document.querySelector<HTMLButtonElement>('#btn-clear')!;
+const btnCircle = document.querySelector<HTMLButtonElement>('#btn-circle')!;
 const btnSquare = document.querySelector<HTMLButtonElement>('#btn-square')!;
 const btnNext = document.querySelector<HTMLButtonElement>('#btn-next-step')!;
 const displayModeEl = document.querySelector<HTMLSelectElement>('#display-mode')!;
 const paintModeEl = document.querySelector<HTMLInputElement>('#paint-mode')!;
 const cutModeEl = document.querySelector<HTMLInputElement>('#cut-mode')!;
 const extrudeModeEl = document.querySelector<HTMLInputElement>('#extrude-mode')!;
-const loopcutModeEl = document.querySelector<HTMLInputElement>('#loopcut-mode')!;
 const sketchModeEl = document.querySelector<HTMLInputElement>('#sketch-mode')!;
+const paintPaletteEl = document.querySelector<HTMLDivElement>('#paint-palette')!;
+const paintColorEl = document.querySelector<HTMLInputElement>('#paint-color')!;
+const swatchEls = Array.from(paintPaletteEl.querySelectorAll<HTMLButtonElement>('.swatch'));
+const paintBrushEl = document.querySelector<HTMLInputElement>('#paint-brush')!;
+const paintBrushValueEl = document.querySelector<HTMLSpanElement>('#paint-brush-value')!;
 const btnApplyCut = document.querySelector<HTMLButtonElement>('#btn-apply-cut')!;
 const btnFillCut = document.querySelector<HTMLButtonElement>('#btn-fill-cut')!;
 const btnDiscardCut = document.querySelector<HTMLButtonElement>('#btn-discard-cut')!;
@@ -50,8 +56,7 @@ let polygonReady = false;
 let inflationStep: InflationStep = 'idle';
 let pipelineMeshes: TeddyPipelineMeshes | null = null;
 
-const ELEVATED_COLOR = 0x7eb8da;
-const INFLATED_COLOR = 0x6b9bd1;
+const INFLATED_COLOR = 0xffffff;
 const CUT_TRIM_COLOR = 0x8fa8c4;
 
 const sceneView = new SceneView(sceneEl);
@@ -79,9 +84,33 @@ function setInteractionMode(mode: InteractionMode): void {
   paintModeEl.checked = mode === 'paint';
   cutModeEl.checked = mode === 'cut';
   extrudeModeEl.checked = mode === 'extrude';
-  loopcutModeEl.checked = mode === 'loopcut';
+  paintPaletteEl.hidden = mode !== 'paint';
   if (mode !== 'extrude') btnConfirmExtrude.disabled = true;
 }
+
+function applyPaintColor(hex: string): void {
+  sceneView.setPaintColor(parseInt(hex.replace('#', ''), 16));
+  paintColorEl.value = hex;
+  for (const sw of swatchEls) {
+    sw.classList.toggle('is-active', sw.dataset.color?.toLowerCase() === hex.toLowerCase());
+  }
+}
+
+for (const sw of swatchEls) {
+  sw.addEventListener('click', () => {
+    const c = sw.dataset.color;
+    if (c) applyPaintColor(c);
+  });
+}
+paintColorEl.addEventListener('input', () => applyPaintColor(paintColorEl.value));
+applyPaintColor('#d1495b');
+
+function applyBrushSize(px: number): void {
+  sceneView.setBrushSize(px);
+  paintBrushValueEl.textContent = String(px);
+}
+paintBrushEl.addEventListener('input', () => applyBrushSize(Number(paintBrushEl.value)));
+applyBrushSize(Number(paintBrushEl.value));
 
 function classifiedFaceColors(types: TriangleType[]): number[] {
   return types.map((t) => TRIANGLE_TYPE_COLORS[t]);
@@ -100,12 +129,12 @@ function updateHint(): void {
   }
   if (inflationStep === 'spine') {
     hintEl.textContent =
-      'Dark green = terminal fans; black spine branches should stop at fan tips (not pass through)';
+      'Fig. 13f fan mesh — black spine should lie on the surface; green = terminal fans';
     return;
   }
   if (inflationStep === 'elevated') {
     hintEl.textContent =
-      'Spine vertices raised; top + mirrored bottom, no quarter-oval strips yet';
+      'Elevated fan mesh — spine dots sit on raised surface vertices; labels show height (z)';
     return;
   }
   if (!polygonReady) {
@@ -118,17 +147,12 @@ function updateHint(): void {
   }
   if (cutModeEl.checked) {
     hintEl.textContent =
-      'Stroke → review projection → Remove triangles → inspect open cut → Fill hole.';
+      'Cut: open stroke across the object = cut through; closed loop on the surface = loop cut.';
     return;
   }
   if (extrudeModeEl.checked) {
     hintEl.textContent =
       'Closed loop on surface → rotate → Confirm orientation → stroke across the loop.';
-    return;
-  }
-  if (loopcutModeEl.checked) {
-    hintEl.textContent =
-      'Loop cut: draw loop → Remove triangles → inspect hole → Fill hole.';
     return;
   }
   hintEl.textContent = 'Drag to rotate · scroll to zoom · right-drag to pan';
@@ -139,7 +163,6 @@ function enablePostInflationControls(enabled: boolean): void {
   paintModeEl.disabled = !enabled;
   cutModeEl.disabled = !enabled;
   extrudeModeEl.disabled = !enabled;
-  loopcutModeEl.disabled = !enabled;
   sketchModeEl.disabled = !enabled;
   if (!enabled) {
     btnConfirmExtrude.disabled = true;
@@ -147,8 +170,12 @@ function enablePostInflationControls(enabled: boolean): void {
   }
 }
 
+function isLoopCutActive(): boolean {
+  return sceneView.getLoopCutPhase() !== 'idle';
+}
+
 function updateCutActionButtons(): void {
-  if (loopcutModeEl.checked) {
+  if (isLoopCutActive()) {
     // Loop cut reuses the same buttons across its three stages.
     const phase = sceneView.getLoopCutPhase();
     btnApplyCut.disabled = phase !== 'projected';
@@ -224,8 +251,9 @@ function showFanStep(): void {
 function showSpineStep(): void {
   if (!pipelineMeshes) return;
   inflationStep = 'spine';
-  sceneView.setMesh(pipelineMeshes.classified, {
-    faceColors: classifiedFaceColors(pipelineMeshes.classifiedFaceTypes),
+  // Fig. 13f fan mesh — spine vertices share this mesh at z = 0.
+  sceneView.setMesh(pipelineMeshes.fan, {
+    color: 0xe8e8e8,
     wireColor: 0x4a4a48,
   });
   sceneView.setSecondaryMesh(pipelineMeshes.terminalFans, {
@@ -235,12 +263,13 @@ function showSpineStep(): void {
   });
   sceneView.setSpineOverlay(
     pipelineMeshes.fan.vertices,
-    pipelineMeshes.spineSegments
+    pipelineMeshes.spineSegments,
+    { onSurface: true }
   );
   btnNext.textContent = 'Next: elevate spine';
   setStepLabel('spine');
   setStatus(
-    `Step 3 — terminal fans (green) + spine (${pipelineMeshes.spineSegments.length} segments). Each black branch should stop at a fan tip, not cross through it.`,
+    `Step 3 — fig. 13f fan mesh with spine overlaid (${pipelineMeshes.spineSegments.length} segments). Black dots should sit on the surface.`,
     'ok'
   );
   updateHint();
@@ -250,15 +279,24 @@ function showElevatedStep(): void {
   if (!pipelineMeshes) return;
   inflationStep = 'elevated';
   sceneView.clearSecondaryMesh();
-  sceneView.clearSpineOverlay();
-  sceneView.setMesh(pipelineMeshes.elevated, {
-    color: ELEVATED_COLOR,
-    wireColor: 0x3d6b80,
+  // Same fan topology with spine heights applied to spine nodes (paper §5.1).
+  const elevatedFan: Mesh3D = {
+    vertices: pipelineMeshes.elevatedSpineVertices,
+    faces: pipelineMeshes.fan.faces,
+  };
+  sceneView.setMesh(elevatedFan, {
+    color: 0xe8e8e8,
+    wireColor: 0x4a4a48,
   });
+  sceneView.setSpineOverlay(
+    pipelineMeshes.elevatedSpineVertices,
+    pipelineMeshes.spineSegments,
+    { showHeights: true, onSurface: true }
+  );
   btnNext.textContent = 'Next: full inflation';
   setStepLabel('elevated');
   setStatus(
-    `Step 4 — ${pipelineMeshes.elevated.faces.length} triangles (top + bottom). Spine height only — no quarter-oval subdivision.`,
+    `Step 4 — elevated fan mesh (${elevatedFan.faces.length} triangles) with spine on the surface. Height labels show spine z; orbit to inspect fit.`,
     'ok'
   );
   updateHint();
@@ -474,7 +512,7 @@ function applyFillCutHole(): void {
 }
 
 btnApplyCut.addEventListener('click', () => {
-  if (loopcutModeEl.checked) {
+  if (isLoopCutActive()) {
     sceneView.applyLoopCut();
     return;
   }
@@ -482,7 +520,7 @@ btnApplyCut.addEventListener('click', () => {
 });
 
 btnFillCut.addEventListener('click', () => {
-  if (loopcutModeEl.checked) {
+  if (isLoopCutActive()) {
     sceneView.fillLoopCut();
     return;
   }
@@ -490,7 +528,7 @@ btnFillCut.addEventListener('click', () => {
 });
 
 btnDiscardCut.addEventListener('click', () => {
-  if (loopcutModeEl.checked) {
+  if (isLoopCutActive()) {
     sceneView.cancelLoopCut();
     return;
   }
@@ -498,7 +536,7 @@ btnDiscardCut.addEventListener('click', () => {
   sceneView.clearCutProjectionPreview();
   clearStagedCut();
   updateCutActionButtons();
-  setStatus('Cut discarded. Draw a new stroke across the silhouette.');
+  setStatus('Cut discarded. Draw a new stroke.');
 });
 
 displayModeEl.addEventListener('change', () => {
@@ -507,12 +545,7 @@ displayModeEl.addEventListener('change', () => {
 sceneView.setDisplayMode(displayModeEl.value as DisplayMode);
 
 function anyEditModeActive(): boolean {
-  return (
-    paintModeEl.checked ||
-    cutModeEl.checked ||
-    extrudeModeEl.checked ||
-    loopcutModeEl.checked
-  );
+  return paintModeEl.checked || cutModeEl.checked || extrudeModeEl.checked;
 }
 
 paintModeEl.addEventListener('change', () => {
@@ -520,9 +553,8 @@ paintModeEl.addEventListener('change', () => {
   if (paintModeEl.checked) {
     cutModeEl.checked = false;
     extrudeModeEl.checked = false;
-    loopcutModeEl.checked = false;
     setInteractionMode('paint');
-    setStatus('Paint mode: draw on the polygon (red).');
+    setStatus('Paint mode: pick a color, then draw on the surface to bake it in.');
   } else if (!anyEditModeActive()) {
     setInteractionMode('orbit');
     setStatus('Drag to rotate · scroll to zoom · right-drag to pan.');
@@ -535,27 +567,11 @@ cutModeEl.addEventListener('change', () => {
   if (cutModeEl.checked) {
     paintModeEl.checked = false;
     extrudeModeEl.checked = false;
-    loopcutModeEl.checked = false;
     setInteractionMode('cut');
     updateCutActionButtons();
     setStatus(
-      'Cut: stroke → review projection → Remove triangles → Fill hole.',
+      'Cut: draw an open stroke across the object to cut through, or a closed loop on the surface to remove it.',
     );
-  } else if (!anyEditModeActive()) {
-    setInteractionMode('orbit');
-    setStatus('Drag to rotate · scroll to zoom · right-drag to pan.');
-  }
-  updateCutActionButtons();
-  updateHint();
-});
-
-loopcutModeEl.addEventListener('change', () => {
-  if (!polygonReady) return;
-  if (loopcutModeEl.checked) {
-    paintModeEl.checked = false;
-    cutModeEl.checked = false;
-    extrudeModeEl.checked = false;
-    setInteractionMode('loopcut');
   } else if (!anyEditModeActive()) {
     setInteractionMode('orbit');
     setStatus('Drag to rotate · scroll to zoom · right-drag to pan.');
@@ -569,7 +585,6 @@ extrudeModeEl.addEventListener('change', () => {
   if (extrudeModeEl.checked) {
     paintModeEl.checked = false;
     cutModeEl.checked = false;
-    loopcutModeEl.checked = false;
     btnConfirmExtrude.disabled = true;
     setInteractionMode('extrude');
   } else if (!anyEditModeActive()) {
@@ -589,24 +604,39 @@ btnConfirmExtrude.addEventListener('click', () => {
   }
 });
 
-btnSquare.addEventListener('click', () => {
+/** World-space radius for preset shapes on z = 0 (independent of camera projection). */
+const PRESET_RADIUS = 100;
+
+function createPresetStroke(worldRing: Vec2[]): void {
   if (polygonReady || inflationStep !== 'idle') {
     setStatus('Clear first to create a new shape.', 'error');
     return;
   }
-  const rect = sceneEl.getBoundingClientRect();
-  const cx = rect.width / 2;
-  const cy = rect.height / 2;
-  const size = Math.min(rect.width, rect.height) * 0.35;
-  const half = size / 2;
-  const screenSquare = [
-    { x: cx - half, y: cy - half },
-    { x: cx + half, y: cy - half },
-    { x: cx + half, y: cy + half },
-    { x: cx - half, y: cy + half },
-    { x: cx - half, y: cy - half },
-  ];
-  startPipeline(sceneView.projectScreenToMeshPlane(screenSquare));
+  startPipeline(worldRing);
+}
+
+btnCircle.addEventListener('click', () => {
+  const segments = 64;
+  const ring: Vec2[] = [];
+  for (let i = 0; i <= segments; i++) {
+    const t = (i / segments) * Math.PI * 2;
+    ring.push({
+      x: Math.cos(t) * PRESET_RADIUS,
+      y: Math.sin(t) * PRESET_RADIUS,
+    });
+  }
+  createPresetStroke(ring);
+});
+
+btnSquare.addEventListener('click', () => {
+  const r = PRESET_RADIUS;
+  createPresetStroke([
+    { x: -r, y: -r },
+    { x: r, y: -r },
+    { x: r, y: r },
+    { x: -r, y: r },
+    { x: -r, y: -r },
+  ]);
 });
 
 btnClear.addEventListener('click', () => {
@@ -616,9 +646,9 @@ btnClear.addEventListener('click', () => {
   paintModeEl.checked = false;
   cutModeEl.checked = false;
   extrudeModeEl.checked = false;
-  loopcutModeEl.checked = false;
   sketchModeEl.checked = false;
   sceneView.setSketchMode(false);
+  paintPaletteEl.hidden = true;
   btnConfirmExtrude.disabled = true;
   setStatus('Cleared. Draw a new closed loop on the 3D plane.');
   updateHint();

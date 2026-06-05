@@ -421,7 +421,25 @@ function capBoundaryLoop(
     if (k === maxI) break;
   }
 
-  ribbonStitch(arcA, pA, arcB, pB, out);
+  // arcA is the front surface, arcB the back; both run from the same silhouette end (min param)
+  // to the other (max param). Sort each strictly by param so the ribbon pairs front/back vertices
+  // that come from the same point along the cut — even if the rim wiggles or perspective makes the
+  // walk order non-monotonic. This is what keeps the hole fully closed.
+  const a = sortArcByParam(arcA, pA);
+  const b = sortArcByParam(arcB, pB);
+  ribbonStitch(a.arc, a.params, b.arc, b.params, out);
+}
+
+/** Sort a rim arc and its parameters together, ascending by parameter. */
+function sortArcByParam(
+  arc: number[],
+  params: number[]
+): { arc: number[]; params: number[] } {
+  const order = arc.map((_, k) => k).sort((x, y) => params[x] - params[y]);
+  return {
+    arc: order.map((k) => arc[k]),
+    params: order.map((k) => params[k]),
+  };
 }
 
 /** Stitch a triangle strip between two arcs that share endpoints, marching by parameter. */
@@ -452,7 +470,12 @@ function ribbonStitch(
   }
 }
 
-/** Fractional arc-length position (0..1) of the polyline point nearest `p`. */
+/**
+ * Position of the polyline point nearest `p`, as a fraction of the stroke's arc length. The cut is
+ * extended past both drawn ends out to the silhouette, so rim vertices beyond the stroke must be
+ * ordered too: the first and last segments are allowed to extrapolate (param < 0 or > 1) instead of
+ * clamping every overhang vertex onto the same endpoint, which would leave the end caps unstitched.
+ */
 function paramAlongPolyline(p: Vec2, path: Vec2[]): number {
   if (path.length < 2) return 0;
 
@@ -465,6 +488,7 @@ function paramAlongPolyline(p: Vec2, path: Vec2[]): number {
   }
   if (total < 1e-9) return 0;
 
+  const lastSeg = path.length - 2;
   let bestD2 = Infinity;
   let bestParam = 0;
   let run = 0;
@@ -475,7 +499,10 @@ function paramAlongPolyline(p: Vec2, path: Vec2[]): number {
     const aby = b.y - a.y;
     const len2 = abx * abx + aby * aby || 1e-12;
     let t = ((p.x - a.x) * abx + (p.y - a.y) * aby) / len2;
-    t = Math.max(0, Math.min(1, t));
+    // Clamp interior joints, but let the two end segments extrapolate to capture overhang.
+    const tMin = i === 0 ? -Infinity : 0;
+    const tMax = i === lastSeg ? Infinity : 1;
+    t = Math.max(tMin, Math.min(tMax, t));
     const cx = a.x + abx * t;
     const cy = a.y + aby * t;
     const d2 = (p.x - cx) ** 2 + (p.y - cy) ** 2;

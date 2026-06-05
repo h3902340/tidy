@@ -140,6 +140,10 @@ body {
   cursor: crosshair;
 }
 
+.scene-view .webgl-layer.paint-cursor {
+  cursor: crosshair;
+}
+
 .paint-toggle {
   display: flex;
   align-items: center;
@@ -152,6 +156,68 @@ body {
 
 .paint-toggle input {
   cursor: pointer;
+}
+
+.paint-palette {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.4rem 1rem 0;
+  flex-wrap: wrap;
+}
+
+.paint-palette[hidden] {
+  display: none;
+}
+
+.paint-palette-label {
+  font-size: 0.78rem;
+  color: #5c5854;
+  margin-right: 0.15rem;
+}
+
+.paint-palette .swatch {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border-radius: 50%;
+  border: 2px solid #fff;
+  box-shadow: 0 0 0 1px #c9c4ba;
+  cursor: pointer;
+}
+
+.paint-palette .swatch.is-active {
+  box-shadow: 0 0 0 2px #2d4a63;
+}
+
+.paint-palette #paint-color {
+  width: 28px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid #c9c4ba;
+  border-radius: 4px;
+  background: none;
+  cursor: pointer;
+}
+
+.paint-brush {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-left: 0.5rem;
+  font-size: 0.78rem;
+  color: #5c5854;
+}
+
+.paint-brush input[type='range'] {
+  width: 90px;
+  cursor: pointer;
+}
+
+.paint-brush .brush-value {
+  min-width: 2.5ch;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 
 .actions {

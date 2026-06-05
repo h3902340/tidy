@@ -28,15 +28,11 @@
               </select>
               <label class="paint-toggle">
                 <input type="checkbox" id="paint-mode" disabled />
-                Paint on surface
+                Paint
               </label>
               <label class="paint-toggle">
                 <input type="checkbox" id="cut-mode" disabled />
-                Cut mode
-              </label>
-              <label class="paint-toggle">
-                <input type="checkbox" id="loopcut-mode" disabled />
-                Loop cut
+                Cut
               </label>
               <label class="paint-toggle">
                 <input type="checkbox" id="extrude-mode" disabled />
@@ -46,6 +42,24 @@
                 <input type="checkbox" id="sketch-mode" disabled />
                 Sketch
               </label>
+            </div>
+            <div class="paint-palette" id="paint-palette" hidden>
+              <span class="paint-palette-label">Color</span>
+              <button type="button" class="swatch" data-color="#d1495b" style="background:#d1495b" aria-label="Red"></button>
+              <button type="button" class="swatch" data-color="#f4a259" style="background:#f4a259" aria-label="Orange"></button>
+              <button type="button" class="swatch" data-color="#f4d35e" style="background:#f4d35e" aria-label="Yellow"></button>
+              <button type="button" class="swatch" data-color="#3a9d4e" style="background:#3a9d4e" aria-label="Green"></button>
+              <button type="button" class="swatch" data-color="#2a9d8f" style="background:#2a9d8f" aria-label="Teal"></button>
+              <button type="button" class="swatch" data-color="#2274a5" style="background:#2274a5" aria-label="Blue"></button>
+              <button type="button" class="swatch" data-color="#7b4fb5" style="background:#7b4fb5" aria-label="Purple"></button>
+              <button type="button" class="swatch" data-color="#3d3d3d" style="background:#3d3d3d" aria-label="Charcoal"></button>
+              <button type="button" class="swatch" data-color="#ffffff" style="background:#ffffff" aria-label="White"></button>
+              <input type="color" id="paint-color" value="#d1495b" aria-label="Custom paint color" />
+              <span class="paint-brush">
+                <label for="paint-brush">Brush</label>
+                <input type="range" id="paint-brush" min="2" max="60" step="1" value="16" aria-label="Brush thickness" />
+                <span class="brush-value" id="paint-brush-value">16</span>
+              </span>
             </div>
             <span class="inflation-step" id="inflation-step" aria-live="polite"></span>
             <span class="hint" id="canvas-hint">Draw one closed loop on the 3D plane</span>
@@ -63,6 +77,7 @@
             <button id="btn-confirm-extrude" type="button" disabled>
               Confirm orientation
             </button>
+            <button id="btn-circle" type="button" class="secondary">Create circle</button>
             <button id="btn-square" type="button" class="secondary">Create square</button>
             <button id="btn-clear" type="button" class="secondary">Clear</button>
           </div>

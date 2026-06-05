@@ -11,8 +11,10 @@ import {
   teddyInteriorReference,
 } from './meshWinding';
 import {
+  applySpineElevation,
   cdtToZeyapTriangles,
   drawBackface,
+  propagateSpineElevationAlongAxis,
   pruneToWedges,
   pruneTrianglesAndElevateVertices,
   stitchSilhouetteRim,
@@ -41,6 +43,8 @@ export interface TeddyPipelineMeshes {
   fan: Mesh3D;
   /** Paper (e): branched chordal-axis overlay (same vertices as fan). */
   spineSegments: [number, number][];
+  /** Fan vertices with spine elevation applied — spine nodes lifted to their height (z > 0). */
+  elevatedSpineVertices: Vec3[];
   /** Elevated fans, mirrored back; no quarter-ovals or rim. */
   elevated: Mesh3D;
   /** Full inflation: quarter-ovals, rim, winding fixes. */
@@ -93,10 +97,17 @@ function buildElevatedFanSolid(
   polygon: Vec2[],
   wedges: ReturnType<typeof pruneToWedges>['wedges'],
   interiorVerts: ReturnType<typeof pruneToWedges>['interiorVerts'],
+  axisSegments: [number, number][],
   verts: Vec3[]
 ): Mesh3D {
   const elevatedVerts = verts.map((v) => vec3(v.x, v.y, v.z));
-  const topFaces = wedgesToElevatedFanFaces(wedges, interiorVerts, elevatedVerts);
+  const topFaces = wedgesToElevatedFanFaces(
+    wedges,
+    interiorVerts,
+    elevatedVerts,
+    axisSegments,
+    polygon.length
+  );
   enforceWindingTowardView(elevatedVerts, topFaces, vec3(0, 0, 1));
   const { vertices, faces } = drawBackface(topFaces, elevatedVerts);
   enforceSolidMeshWinding(vertices, faces, polygon, elevatedVerts.length);
@@ -157,7 +168,22 @@ export function buildTeddyPipeline(ring: Vec2[]): {
   const terminalFans: Mesh3D = { vertices: pruneVerts, faces: terminalFanFaces };
   const fan: Mesh3D = { vertices: pruneVerts, faces: fanFaces };
 
-  const elevated = buildElevatedFanSolid(polygon, wedges, interiorVerts, pruneVerts);
+  // Spine lifted into the air: same node indices as spineSegments, but z = elevation.
+  const elevatedSpineVertices = pruneVerts.map((v) => vec3(v.x, v.y, v.z));
+  applySpineElevation(interiorVerts, elevatedSpineVertices);
+  propagateSpineElevationAlongAxis(
+    elevatedSpineVertices,
+    axisSegments,
+    polygon.length
+  );
+
+  const elevated = buildElevatedFanSolid(
+    polygon,
+    wedges,
+    interiorVerts,
+    axisSegments,
+    pruneVerts
+  );
   const inflated = buildInflatedMesh(polygon);
 
   return {
@@ -167,6 +193,7 @@ export function buildTeddyPipeline(ring: Vec2[]): {
       terminalFans,
       fan,
       spineSegments: axisSegments,
+      elevatedSpineVertices,
       elevated,
       inflated,
     },

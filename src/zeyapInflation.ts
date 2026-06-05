@@ -114,6 +114,23 @@ function addSpineNeighbor(
   }
 }
 
+/**
+ * After fig. 13f subdivision (wedge mesh between spine and boundary), each spine-to-boundary
+ * spoke is a wedge spineEdge. Elevation uses only these direct connections — not neighbors
+ * accumulated during the growth walk.
+ */
+export function buildElevationNeighborsFromWedges(
+  wedges: PrunedWedge[]
+): Map<number, Map<number, number[]>> {
+  const interiorVerts = new Map<number, Map<number, number[]>>();
+  for (const wedge of wedges) {
+    for (const [spineId, exteriorId] of wedge.spineEdges) {
+      addSpineNeighbor(interiorVerts, spineId, exteriorId);
+    }
+  }
+  return interiorVerts;
+}
+
 /** Corner vertex where the two external edges of a terminal triangle meet. */
 function terminalCornerVertex(tri: ZeyapTriangle): number | null {
   if (tri.externalEdges.length < 2) return null;
@@ -178,6 +195,77 @@ function ensureTerminalFansAtCorners(
   }
 }
 
+/** Bridge disconnected chordal-axis components (common when J hubs were isolated from sleeve walks). */
+function connectAxisComponents(
+  segments: [number, number][],
+  verts: Vec3[],
+  boundaryVertexCount: number
+): void {
+  const adj = new Map<number, number[]>();
+  const segKey = (a: number, b: number) => (a < b ? `${a}_${b}` : `${b}_${a}`);
+  const hasSeg = new Set(segments.map(([a, b]) => segKey(a, b)));
+
+  const link = (a: number, b: number) => {
+    if (!adj.has(a)) adj.set(a, []);
+    if (!adj.has(b)) adj.set(b, []);
+    adj.get(a)!.push(b);
+    adj.get(b)!.push(a);
+  };
+  for (const [a, b] of segments) link(a, b);
+
+  const spineVerts = [...adj.keys()].filter((v) => v >= boundaryVertexCount);
+  if (spineVerts.length < 2) return;
+
+  const componentOf = new Map<number, number>();
+  let compId = 0;
+  for (const start of spineVerts) {
+    if (componentOf.has(start)) continue;
+    const q = [start];
+    componentOf.set(start, compId);
+    while (q.length) {
+      const v = q.pop()!;
+      for (const n of adj.get(v) ?? []) {
+        if (n < boundaryVertexCount || componentOf.has(n)) continue;
+        componentOf.set(n, compId);
+        q.push(n);
+      }
+    }
+    compId++;
+  }
+  if (compId <= 1) return;
+
+  const byComp = new Map<number, number[]>();
+  for (const v of spineVerts) {
+    const c = componentOf.get(v)!;
+    const row = byComp.get(c) ?? [];
+    row.push(v);
+    byComp.set(c, row);
+  }
+
+  const reps = [...byComp.values()];
+  for (let i = 1; i < reps.length; i++) {
+    let bestA = reps[0][0];
+    let bestB = reps[i][0];
+    let bestD = Infinity;
+    for (const a of reps[0]) {
+      for (const b of reps[i]) {
+        const d = dist3(verts[a], verts[b]);
+        if (d < bestD) {
+          bestD = d;
+          bestA = a;
+          bestB = b;
+        }
+      }
+    }
+    const key = segKey(bestA, bestB);
+    if (hasSeg.has(key)) continue;
+    hasSeg.add(key);
+    segments.push([bestA, bestB]);
+    link(bestA, bestB);
+    for (const b of reps[i]) reps[0].push(b);
+  }
+}
+
 /** Connect terminal fan tips that have no chordal-axis edge yet. */
 function linkOrphanFanTipsToAxis(
   segments: [number, number][],
@@ -222,27 +310,6 @@ function linkOrphanFanTipsToAxis(
     adj.get(tip)!.push(best);
     adj.get(best)!.push(tip);
   }
-}
-
-/** Chordal-axis segments plus terminal-fan spokes (tip → boundary) for display. */
-export function collectSpineDisplaySegments(
-  wedges: PrunedWedge[],
-  chordalAxis: [number, number][]
-): [number, number][] {
-  const out: [number, number][] = [...chordalAxis];
-  const seen = new Set(chordalAxis.map(([a, b]) => axisEdgeKey(a, b)));
-
-  for (const wedge of wedges) {
-    if (!wedge.fromTerminalPrune) continue;
-    for (const [a, b] of wedge.spineEdges) {
-      const key = axisEdgeKey(a, b);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push([a, b]);
-    }
-  }
-
-  return out;
 }
 
 /** Port of zeyap pruneTrianglesAndElevateVertices (Fig. 13–15). */
@@ -356,6 +423,14 @@ export function pruneToWedges(
       verts[interiorEdge[0]],
       verts[interiorEdge[1]]
     );
+    // Width of the terminal's own interior edge. A genuine limb stays roughly this wide as the fan
+    // walks down it; a corner of a blocky shape (e.g. a square) widens quickly into the body. We
+    // stop the fan once it widens past this, so each terminal stays LOCAL. Without it the first
+    // terminal processed walks all the way to the central junction and swallows the whole sleeve,
+    // leaving the other corners (or, here, the opposite corner) without their own fan — the steep
+    // cliff. Keeping fans local makes the result order-independent and symmetric.
+    const terminalEdgeLen = dist3(verts[interiorEdge[0]], verts[interiorEdge[1]]);
+    const WIDEN_FACTOR = 1.6;
 
     while (true) {
       triangleDeleted[triangleId] = true;
@@ -393,8 +468,16 @@ export function pruneToWedges(
       const nextId = adj.find((id) => id !== triangleId);
       if (nextId === undefined || triangleDeleted[nextId]) break;
 
+      const nextTri = triangles[nextId];
+      // Stop before stepping into a triangle that widens past the terminal width: keep the fan local.
+      if (nextTri.type !== 'J') {
+        const ni = nextTri.interiorEdges.find(([a, b]) => !(a === inA && b === inB));
+        if (!ni) break;
+        if (dist3(verts[ni[0]], verts[ni[1]]) > terminalEdgeLen * WIDEN_FACTOR) break;
+      }
+
       triangleId = nextId;
-      triangle = triangles[triangleId];
+      triangle = nextTri;
 
       if (triangle.type === 'J') {
         semicircleCenter = triangle.centroid!;
@@ -436,28 +519,56 @@ export function pruneToWedges(
     spineEndpointsTriangleId
   );
 
-  // --- Spine growth through S/J (Fig. 13e–f) ---
+  const pushHubMidWedges = (
+    hubIdx: number,
+    e: [number, number]
+  ) => {
+    const midIdx = getOrCreateInteriorEdgeMid(e[0], e[1]);
+    prunedTriangles.push({
+      vertIds: [hubIdx, midIdx, e[0]],
+      spineEdges: [
+        [hubIdx, e[0]],
+        [midIdx, e[0]],
+      ],
+      fromTerminalPrune: false,
+    });
+    prunedTriangles.push({
+      vertIds: [hubIdx, midIdx, e[1]],
+      spineEdges: [
+        [hubIdx, e[1]],
+        [midIdx, e[1]],
+      ],
+      fromTerminalPrune: false,
+    });
+  };
+
+  // --- Sleeve / terminal / junction (fig. 13f): grow from fan tips through S and J ---
   for (let i = 0; i < spineEndpointsId.length; i++) {
-    const queueTri: number[] = [spineEndpointsTriangleId[i]];
+    const startTriId = spineEndpointsTriangleId[i];
+
+    const queueTri: number[] = [startTriId];
     const queueVert: number[] = [spineEndpointsId[i]];
 
     while (queueTri.length > 0) {
       const triangleId = queueTri.shift()!;
       const startVertId = queueVert.shift()!;
 
-      if (triangleId !== spineEndpointsTriangleId[i] && triangleDeleted[triangleId]) {
+      if (triangleId !== startTriId && triangleDeleted[triangleId]) {
         continue;
       }
 
       const triangle = triangles[triangleId];
-      if (!triangle) continue;
+      if (
+        !triangle ||
+        (triangle.type !== 'S' &&
+          triangle.type !== 'T' &&
+          triangle.type !== 'J')
+      ) {
+        continue;
+      }
 
       triangleDeleted[triangleId] = true;
 
-      const junctionHub =
-        triangle.type === 'J' ? getJunctionHub(triangleId, triangle) : -1;
-      const junctionFanTip =
-        triangle.type === 'J' && spineEndpointsId.includes(junctionHub);
       const sleeveMids =
         triangle.type === 'S'
           ? triangle.interiorEdges.map(([a, b]) =>
@@ -470,17 +581,18 @@ export function pruneToWedges(
         const midIdx = getOrCreateInteriorEdgeMid(e[0], e[1]);
         const shouldAddInboundAxis =
           startVertId !== midIdx &&
-          !junctionFanTip &&
-          triangle.type === 'S' &&
-          !sleeveMids.includes(startVertId) &&
-          !sleeveInboundAxis;
+          (triangle.type === 'T' ||
+            triangle.type === 'J' ||
+            (!sleeveMids.includes(startVertId) && !sleeveInboundAxis));
 
         if (shouldAddInboundAxis) {
           addAxis(startVertId, midIdx);
           if (triangle.type === 'S') sleeveInboundAxis = true;
         }
 
-        if (startVertId !== midIdx) {
+        if (triangle.type === 'J') {
+          pushHubMidWedges(startVertId, e);
+        } else if (startVertId !== midIdx) {
           prunedTriangles.push({
             vertIds: [startVertId, midIdx, e[0]],
             spineEdges: [
@@ -497,12 +609,7 @@ export function pruneToWedges(
             ],
             fromTerminalPrune: false,
           });
-
-          addSpineNeighbor(interiorVerts, startVertId, e[0]);
-          addSpineNeighbor(interiorVerts, startVertId, e[1]);
         }
-        addSpineNeighbor(interiorVerts, midIdx, e[0]);
-        addSpineNeighbor(interiorVerts, midIdx, e[1]);
 
         const ek = interiorEdgeKey(e[0], e[1]);
         const adj = edgeToTriangle.get(ek) ?? [];
@@ -511,25 +618,22 @@ export function pruneToWedges(
         const next = nextId !== undefined ? triangles[nextId] : undefined;
 
         if (
-          next &&
-          (next.type === 'J' || next.type === 'S') &&
+          (next?.type === 'S' || next?.type === 'J') &&
           !triangleDeleted[nextId!]
         ) {
           queueTri.push(nextId!);
-          queueVert.push(midIdx);
-          if (next.type === 'S') {
-            removeInteriorEdge(next.interiorEdges, e[0], e[1]);
-          }
+          queueVert.push(
+            next.type === 'J'
+              ? getJunctionHub(nextId!, next)
+              : midIdx
+          );
+          removeInteriorEdge(next.interiorEdges, e[0], e[1]);
         }
       }
 
-      if (triangle.type === 'J') {
-        connectJunctionAxis(triangleId, triangle);
-      } else if (triangle.type === 'S') {
-        connectSleeveAxisMids(triangle);
-      }
-
       if (triangle.type === 'S') {
+        connectSleeveAxisMids(triangle);
+
         const ext = triangle.externalEdges[0];
         prunedTriangles.push({
           vertIds: [startVertId, ext[0], ext[1]],
@@ -539,10 +643,23 @@ export function pruneToWedges(
           ],
           fromTerminalPrune: false,
         });
-        addSpineNeighbor(interiorVerts, startVertId, ext[0]);
-        addSpineNeighbor(interiorVerts, startVertId, ext[1]);
+      } else if (triangle.type === 'J') {
+        connectJunctionAxis(triangleId, triangle);
       }
     }
+  }
+
+  // Open junctions never reached by a sleeve walk (interior J hubs).
+  for (let i = 0; i < triangles.length; i++) {
+    const triangle = triangles[i];
+    if (triangle.type !== 'J' || triangleDeleted[i]) continue;
+
+    const hubIdx = getJunctionHub(i, triangle);
+    for (const e of triangle.interiorEdges) {
+      pushHubMidWedges(hubIdx, e);
+    }
+    connectJunctionAxis(i, triangle);
+    triangleDeleted[i] = true;
   }
 
   const chordalGraph =
@@ -574,6 +691,8 @@ export function pruneToWedges(
     boundaryVertexCount
   );
 
+  connectAxisComponents(trimmedAtFans, verts, boundaryVertexCount);
+
   // Fig. 13e: branched spine; each branch is a leaf at a terminal-fan tip.
   const branchedSpine = pruneAxisGraphToTrunk(trimmedAtFans, fanTips);
 
@@ -582,8 +701,12 @@ export function pruneToWedges(
 
   return {
     wedges: prunedTriangles,
-    interiorVerts,
-    axisSegments: collectSpineDisplaySegments(prunedTriangles, chordal),
+    // Fig. 13f is complete — elevation neighbors come from the subdivided wedge mesh only.
+    interiorVerts: buildElevationNeighborsFromWedges(prunedTriangles),
+    // Paper fig. 13e: the spine is the chordal tree whose leaves land exactly on
+    // each terminal fan's apex. The fan's radial spokes (tip -> boundary) belong
+    // to the fan drawing (fig. 13d), not the spine, so they are NOT included here.
+    axisSegments: chordal,
   };
 }
 
@@ -790,11 +913,45 @@ export function pruneTrianglesAndElevateVertices(
   if (triangles.length < 2) {
     return triangles.map((tri) => [...tri.vertIds] as [number, number, number]);
   }
-  const { wedges, interiorVerts } = pruneToWedges(triangles, verts);
-  return elevateVertices(wedges, interiorVerts, verts);
+  const boundaryVertexCount = verts.length;
+  const { wedges, interiorVerts, axisSegments } = pruneToWedges(triangles, verts);
+  return elevateVertices(
+    wedges,
+    interiorVerts,
+    verts,
+    axisSegments,
+    boundaryVertexCount
+  );
 }
 
-/** Paper §5.1: set spine vertex heights from average distance to boundary. */
+function pointToSegmentDist(p: Vec2, a: Vec2, b: Vec2): number {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len2 = dx * dx + dy * dy;
+  if (len2 < 1e-12) return Math.hypot(p.x - a.x, p.y - a.y);
+  let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
+}
+
+/** Shortest distance from a point to the polygon silhouette (local shape width). */
+export function minDistToPolygonBoundary(p: Vec2, polygon: Vec2[]): number {
+  const n = polygon.length;
+  if (n < 3) return 0;
+  let minD = Infinity;
+  for (let i = 0; i < n; i++) {
+    minD = Math.min(
+      minD,
+      pointToSegmentDist(p, polygon[i], polygon[(i + 1) % n])
+    );
+  }
+  return minD;
+}
+
+/**
+ * Paper §5.1 (after fig. 13f): elevate spine vertices from the average distance to boundary
+ * vertices directly connected in the subdivided wedge mesh.
+ */
 export function applySpineElevation(
   interiorVerts: Map<number, Map<number, number[]>>,
   verts: Vec3[]
@@ -809,6 +966,38 @@ export function applySpineElevation(
     if (n > 0) {
       verts[spineId].z = ELEVATION_FACTOR * (avg / n);
     }
+  }
+}
+
+/**
+ * Junction hubs on the chordal axis may have no direct boundary spokes in the wedge mesh (only
+ * links to other spine nodes). Propagate elevation from wedge-connected neighbors so axis joints
+ * are not left at z = 0.
+ */
+export function propagateSpineElevationAlongAxis(
+  verts: Vec3[],
+  axisSegments: [number, number][],
+  boundaryVertexCount: number
+): void {
+  if (axisSegments.length === 0) return;
+
+  const adj = new Map<number, number[]>();
+  for (const [a, b] of axisSegments) {
+    (adj.get(a) ?? adj.set(a, []).get(a)!).push(b);
+    (adj.get(b) ?? adj.set(b, []).get(b)!).push(a);
+  }
+
+  for (let pass = 0; pass < adj.size; pass++) {
+    let changed = false;
+    for (const [id, neighbors] of adj) {
+      if (id < boundaryVertexCount || verts[id].z > 1e-6) continue;
+      const lifted = neighbors.filter((n) => verts[n].z > 1e-6);
+      if (lifted.length === 0) continue;
+      verts[id].z =
+        lifted.reduce((sum, n) => sum + verts[n].z, 0) / lifted.length;
+      changed = true;
+    }
+    if (!changed) break;
   }
 }
 
@@ -827,9 +1016,12 @@ export function wedgesToFanFacesFiltered(
 export function wedgesToElevatedFanFaces(
   wedges: PrunedWedge[],
   interiorVerts: Map<number, Map<number, number[]>>,
-  verts: Vec3[]
+  verts: Vec3[],
+  axisSegments: [number, number][],
+  boundaryVertexCount: number
 ): [number, number, number][] {
   applySpineElevation(interiorVerts, verts);
+  propagateSpineElevationAlongAxis(verts, axisSegments, boundaryVertexCount);
   return wedgesToFanFaces(wedges);
 }
 
@@ -875,9 +1067,12 @@ export function collectSpineSegments(
 function elevateVertices(
   wedges: PrunedWedge[],
   interiorVerts: Map<number, Map<number, number[]>>,
-  verts: Vec3[]
+  verts: Vec3[],
+  axisSegments: [number, number][],
+  boundaryVertexCount: number
 ): [number, number, number][] {
   applySpineElevation(interiorVerts, verts);
+  propagateSpineElevationAlongAxis(verts, axisSegments, boundaryVertexCount);
 
   const divTriangles: [number, number, number][] = [];
 
@@ -923,8 +1118,12 @@ function elevateVertices(
     }
 
     for (let j = 0; j < 4; j++) {
-      divTriangles.push([p[0][j], p[1][j], p[1][j + 1]]);
-      divTriangles.push([p[0][j], p[1][j + 1], p[0][j + 1]]);
+      if (p[0][j] !== p[1][j]) {
+        divTriangles.push([p[0][j], p[1][j], p[1][j + 1]]);
+      }
+      if (p[0][j + 1] !== p[1][j + 1]) {
+        divTriangles.push([p[0][j], p[1][j + 1], p[0][j + 1]]);
+      }
     }
   }
 

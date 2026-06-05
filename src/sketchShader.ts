@@ -27,8 +27,10 @@ export interface SketchMaterials {
 
 const fillVertex = /* glsl */ `
   varying vec3 vViewNormal;
+  varying vec2 vUv;
   void main() {
     vViewNormal = normalize(normalMatrix * normal);
+    vUv = uv;
     gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
   }
 `;
@@ -36,14 +38,17 @@ const fillVertex = /* glsl */ `
 const fillFragment = /* glsl */ `
   precision highp float;
 
-  uniform vec3 uPaper;       // fill colour (lit paper)
-  uniform vec3 uInk;         // stipple / shadow ink colour
-  uniform vec3 uLightDir;    // view-space direction toward the light
-  uniform float uAmbient;    // ambient floor [0..1]
-  uniform float uDotScale;   // dot cell size, in CSS pixels
-  uniform float uPixelRatio; // device pixel ratio
+  uniform vec3 uPaper;        // fallback fill colour (lit paper)
+  uniform vec3 uInk;          // stipple / shadow ink colour
+  uniform vec3 uLightDir;     // view-space direction toward the light
+  uniform float uAmbient;     // ambient floor [0..1]
+  uniform float uDotScale;    // dot cell size, in CSS pixels
+  uniform float uPixelRatio;  // device pixel ratio
+  uniform sampler2D uColorMap; // baked surface colour (painted texture)
+  uniform float uHasColorMap;  // 1 when uColorMap is the surface texture
 
   varying vec3 vViewNormal;
+  varying vec2 vUv;
 
   float hash(vec2 p) {
     return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
@@ -80,7 +85,16 @@ const fillFragment = /* glsl */ `
       }
     }
 
-    vec3 col = mix(uPaper, uInk, ink);
+    // Paper tone reflects the greyscale of the surface colour: a white surface stays white paper,
+    // while painted (coloured) areas read as the corresponding grey value under the pencil shading.
+    vec3 paper = uPaper;
+    if (uHasColorMap > 0.5) {
+      vec3 surf = texture2D(uColorMap, vUv).rgb;
+      float lum = dot(surf, vec3(0.299, 0.587, 0.114));
+      paper = vec3(lum);
+    }
+
+    vec3 col = mix(paper, uInk, ink);
     gl_FragColor = vec4(col, 1.0);
   }
 `;
@@ -110,6 +124,10 @@ const INK_COLOR = 0x2b2a26;
 export function createSketchMaterials(fillColor = PAPER_COLOR): SketchMaterials {
   const ink = new THREE.Color(INK_COLOR);
 
+  // 1x1 white texture so the sampler is always bound even before a surface texture is supplied.
+  const whiteTex = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1);
+  whiteTex.needsUpdate = true;
+
   const fill = new THREE.ShaderMaterial({
     uniforms: {
       uPaper: { value: new THREE.Color(fillColor) },
@@ -118,6 +136,8 @@ export function createSketchMaterials(fillColor = PAPER_COLOR): SketchMaterials 
       uAmbient: { value: 0.4 },
       uDotScale: { value: 5.5 },
       uPixelRatio: { value: 1 },
+      uColorMap: { value: whiteTex },
+      uHasColorMap: { value: 0 },
     },
     vertexShader: fillVertex,
     fragmentShader: fillFragment,
