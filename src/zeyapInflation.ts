@@ -660,6 +660,81 @@ export function buildTerminalPruneDebugSteps(
   return steps;
 }
 
+function axisEdgeKey(a: number, b: number): string {
+  return a < b ? `${a}_${b}` : `${b}_${a}`;
+}
+
+function fanTipOnInteriorEdge(
+  tip: number,
+  e0: number,
+  e1: number,
+  verts: Vec3[]
+): boolean {
+  const c = edgeCenter(verts[e0], verts[e1]);
+  const t = verts[tip];
+  return dist3(c, t) < 1e-3;
+}
+
+/**
+ * At a terminal-fan stop triangle, interior-edge midpoints must connect to the fan
+ * tip (fig. 14d–f), not to each other. Sleeve mid-chords on the stop triangle are removed.
+ */
+function repairFanStopAxis(
+  addAxis: (a: number, b: number) => void,
+  removeAxis: (a: number, b: number) => void,
+  triangles: ZeyapTriangle[],
+  postPruneInteriorEdges: [number, number][][],
+  originalInteriorEdges: [number, number][][],
+  spineEndpointsId: number[],
+  spineEndpointsTriangleId: number[],
+  resolveMid: (a: number, b: number) => number,
+  verts: Vec3[]
+): void {
+  const seen = new Set<string>();
+
+  for (let i = 0; i < spineEndpointsId.length; i++) {
+    const tip = spineEndpointsId[i];
+    const triId = spineEndpointsTriangleId[i];
+    const pairKey = `${tip}_${triId}`;
+    if (seen.has(pairKey)) continue;
+    seen.add(pairKey);
+
+    const tri = triangles[triId];
+    if (!tri) continue;
+
+    // Sleeve walks remove invaded interior edges; use post-prune edges at the fan stop.
+    const stopEdges =
+      postPruneInteriorEdges[triId]?.length > 0
+        ? postPruneInteriorEdges[triId]
+        : originalInteriorEdges[triId]?.length > 0
+          ? originalInteriorEdges[triId]
+          : tri.interiorEdges;
+
+    const mids: number[] = [];
+    for (const [a, b] of stopEdges) {
+      mids.push(resolveMid(a, b));
+    }
+
+    if (tri.type === 'J') {
+      for (const mid of mids) addAxis(tip, mid);
+    } else if (tri.type === 'S' || tri.type === 'T') {
+      for (let e = 0; e < stopEdges.length; e++) {
+        const [a, b] = stopEdges[e];
+        if (fanTipOnInteriorEdge(tip, a, b, verts)) continue;
+        addAxis(tip, mids[e]);
+      }
+    } else {
+      continue;
+    }
+
+    for (let j = 0; j < mids.length; j++) {
+      for (let k = j + 1; k < mids.length; k++) {
+        removeAxis(mids[j], mids[k]);
+      }
+    }
+  }
+}
+
 /** Port of zeyap pruneTrianglesAndElevateVertices (Fig. 13–15). */
 export function pruneToWedges(
   triangles: ZeyapTriangle[],
@@ -695,11 +770,17 @@ export function pruneToWedges(
   const addAxis = (a: number, b: number) => {
     if (a === b) return;
     if (a < boundaryVertexCount || b < boundaryVertexCount) return;
-    const key = a < b ? `${a}_${b}` : `${b}_${a}`;
-    if (axisSegments.some(([u, v]) => (u < v ? `${u}_${v}` : `${v}_${u}`) === key)) {
+    const key = axisEdgeKey(a, b);
+    if (axisSegments.some(([u, v]) => axisEdgeKey(u, v) === key)) {
       return;
     }
     axisSegments.push([a, b]);
+  };
+
+  const removeAxis = (a: number, b: number) => {
+    const key = axisEdgeKey(a, b);
+    const idx = axisSegments.findIndex(([u, v]) => axisEdgeKey(u, v) === key);
+    if (idx >= 0) axisSegments.splice(idx, 1);
   };
 
   const interiorEdgeMid = new Map<string, number>();
@@ -729,7 +810,23 @@ export function pruneToWedges(
 
   const junctionHubByTri = new Map<number, number>();
 
-  const getJunctionHub = (triangleId: number, triangle: ZeyapTriangle): number => {
+  const getJunctionHub = (
+    triangleId: number,
+    triangle: ZeyapTriangle,
+    preferredTip?: number
+  ): number => {
+    if (preferredTip !== undefined) {
+      for (let i = 0; i < spineEndpointsTriangleId.length; i++) {
+        if (
+          spineEndpointsTriangleId[i] === triangleId &&
+          spineEndpointsId[i] === preferredTip
+        ) {
+          junctionHubByTri.set(triangleId, preferredTip);
+          return preferredTip;
+        }
+      }
+    }
+
     const cached = junctionHubByTri.get(triangleId);
     if (cached !== undefined) return cached;
 
@@ -753,8 +850,12 @@ export function pruneToWedges(
    * - Open J: center to every interior-edge midpoint.
    * - Fan at center (fig. 14e–f): fan tip to midpoints of remaining (non-invaded) interior edges only.
    */
-  const connectJunctionAxis = (triangleId: number, triangle: ZeyapTriangle) => {
-    const hubIdx = getJunctionHub(triangleId, triangle);
+  const connectJunctionAxis = (
+    triangleId: number,
+    triangle: ZeyapTriangle,
+    preferredTip?: number
+  ) => {
+    const hubIdx = getJunctionHub(triangleId, triangle, preferredTip);
 
     for (const [a, b] of triangle.interiorEdges) {
       const midIdx = getOrCreateInteriorEdgeMid(a, b);
@@ -947,13 +1048,26 @@ export function pruneToWedges(
         }
       }
 
-      if (triangle.type === 'S') {
+      const isFanStopTriangle = spineEndpointsTriangleId.includes(triangleId);
+      if (triangle.type === 'S' && !isFanStopTriangle) {
         connectSleeveAxisMids(triangle);
       } else if (triangle.type === 'J') {
-        connectJunctionAxis(triangleId, triangle);
+        connectJunctionAxis(triangleId, triangle, startVertId);
       }
     }
   }
+
+  repairFanStopAxis(
+    addAxis,
+    removeAxis,
+    triangles,
+    postPruneInteriorEdges,
+    originalInteriorEdges,
+    spineEndpointsId,
+    spineEndpointsTriangleId,
+    getOrCreateInteriorEdgeMid,
+    verts
+  );
 
   // Open junctions never reached by a sleeve walk (interior J hubs).
   for (let i = 0; i < triangles.length; i++) {
@@ -1014,10 +1128,6 @@ export function pruneToWedges(
     // to the fan drawing (fig. 13d), not the spine, so they are NOT included here.
     axisSegments: chordal,
   };
-}
-
-function axisEdgeKey(a: number, b: number): string {
-  return a < b ? `${a}_${b}` : `${b}_${a}`;
 }
 
 function minDistToBoundary(

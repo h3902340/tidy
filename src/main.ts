@@ -586,7 +586,7 @@ function showSpineStep(): void {
   sceneView.setSpineOverlay(
     pipelineMeshes.fan.vertices,
     pipelineMeshes.spineSegments,
-    { onSurface: true }
+    { showVertexIds: true, onSurface: true }
   );
   setStatus('');
   updateDebugActions();
@@ -652,7 +652,7 @@ function showElevatedStep(): void {
   sceneView.setSpineOverlay(
     pipelineMeshes.elevatedSpineVertices,
     pipelineMeshes.spineSegments,
-    { showHeights: true, onSurface: true }
+    { showHeights: true, showVertexIds: true, onSurface: true }
   );
   setStatus('');
   updateDebugActions();

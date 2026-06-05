@@ -300,6 +300,28 @@ describe('terminal fan pruning', () => {
     }
   });
 
+  it('circle: junction fan tip connects to interior edge mids, not mid-to-mid chord', () => {
+    const segments = 64;
+    const r = 100;
+    const ring: { x: number; y: number }[] = [];
+    for (let i = 0; i <= segments; i++) {
+      const t = (i / segments) * Math.PI * 2;
+      ring.push({ x: Math.cos(t) * r, y: Math.sin(t) * r });
+    }
+    const polygon = normalizePolygon(ring);
+    const { meshes } = buildTeddyPipeline(polygon);
+    expect(meshes).not.toBeNull();
+
+    const segs = meshes!.spineSegments;
+    const has = (a: number, b: number) =>
+      segs.some(([u, v]) => (u === a && v === b) || (u === b && v === a));
+
+    // v80 = fan tip at J triangle centroid; v156/v157 = interior-edge mids.
+    expect(has(80, 156)).toBe(true);
+    expect(has(80, 157)).toBe(true);
+    expect(has(157, 156)).toBe(false);
+  });
+
   it('buildTeddyPipeline spine elevation steps only use chordal-axis nodes', () => {
     const result = buildTeddyPipeline(normalizePolygon(unitSquare));
     expect(result.meshes).not.toBeNull();

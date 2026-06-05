@@ -107,6 +107,8 @@ const SPINE_TUBE_RADIUS = 0.4;
 /** Colour and radius for the internal-edge midpoint dots drawn on the spine step. */
 const SPINE_DOT_COLOR = 0x000000;
 const SPINE_DOT_RADIUS = 1.0;
+/** Above secondary mesh overlay (10) and its wireframe (11). */
+const SPINE_LABEL_RENDER_ORDER = 12;
 /** Spine elevation debug (paper §5.1). */
 const ELEVATION_LINE_COLOR = 0xe85d04;
 const ELEVATION_LINE_RADIUS = 0.35;
@@ -1742,9 +1744,13 @@ export class SceneView {
   setSpineOverlay(
     vertices: { x: number; y: number; z: number }[],
     segments: [number, number][],
-    options: { showHeights?: boolean; onSurface?: boolean } = {}
+    options: {
+      showHeights?: boolean;
+      showVertexIds?: boolean;
+      onSurface?: boolean;
+    } = {}
   ): void {
-    const { showHeights = false, onSurface = false } = options;
+    const { showHeights = false, showVertexIds = false, onSurface = false } = options;
     this.clearSpineOverlay();
     const up = new THREE.Vector3(0, 1, 0);
     const dir = new THREE.Vector3();
@@ -1807,11 +1813,14 @@ export class SceneView {
         dot.renderOrder = overlayOrder + 1;
         this.spineLinesGroup.add(dot);
 
-        if (showHeights) {
-          const label = this.makeTextSprite(v.z.toFixed(1));
+        if (showHeights || showVertexIds) {
+          const parts: string[] = [];
+          if (showVertexIds) parts.push(`v${id}`);
+          if (showHeights) parts.push(`z=${v.z.toFixed(1)}`);
+          const label = this.makeTextSprite(parts.join(' '), showVertexIds ? 7 : 9);
           // The label group is not y-flipped, so mirror the y to match the dot, then float it up.
-          label.position.set(v.x, -v.y + 8, v.z);
-          label.renderOrder = onSurface ? 4 : 1002;
+          label.position.set(v.x, -v.y + 8, v.z + 4);
+          label.renderOrder = onSurface ? SPINE_LABEL_RENDER_ORDER : 1002;
           this.spineLabelGroup.add(label);
         }
       }
