@@ -30,9 +30,11 @@ import {
 import { CLOSE_TOLERANCE, closeStroke } from './stroke';
 import { createDoubleSidedPhongMaterial } from './doubleSidedPhong';
 import {
+  createColoredSketchFillMaterial,
   createSketchMaterials,
   LIGHT_VIEW_DIR,
   PAPER_COLOR,
+  updateSketchFillPixelRatio,
   type SketchMaterials,
 } from './sketchShader';
 import {
@@ -239,6 +241,8 @@ export class SceneView {
   private loopCutMeshBeforeCut: Mesh3D | null = null;
   private sketchMode = false;
   private sketchMaterials: SketchMaterials | null = null;
+  /** Per-ribbon sketch fill materials (pixel ratio updated each frame). */
+  private paintedRibbonFillMaterials: THREE.ShaderMaterial[] = [];
   /** Key light — repositioned each frame to stay fixed relative to the camera. */
   private keyLight: THREE.DirectionalLight;
   private readonly keyLightOffset = new THREE.Vector3();
@@ -711,11 +715,11 @@ export class SceneView {
   }
 
   private rebuildPaintedLineMeshes(): void {
+    this.paintedRibbonFillMaterials = [];
     while (this.paintedLinesGroup.children.length > 0) {
-      const child = this.paintedLinesGroup.children[0] as THREE.Mesh;
+      const child = this.paintedLinesGroup.children[0];
       this.paintedLinesGroup.remove(child);
-      child.geometry.dispose();
-      (child.material as THREE.Material).dispose();
+      this.disposePaintedLineNode(child);
     }
 
     const viewport = {
@@ -723,23 +727,63 @@ export class SceneView {
       height: Math.max(1, this.renderer.domElement.clientHeight),
     };
 
+    const useSketch = this.sketchMode;
+    if (useSketch && !this.sketchMaterials) {
+      this.sketchMaterials = createSketchMaterials();
+    }
+
     for (let i = 0; i < this.paintedSurfaceLines.length; i++) {
       const line = this.paintedSurfaceLines[i];
       const geometry = buildPaintRibbonGeometry(line, this.camera, viewport);
       if (!geometry) continue;
-      const material = new THREE.MeshBasicMaterial({
-        color: line.color,
-        side: THREE.DoubleSide,
-        depthTest: true,
-        depthWrite: false,
-        polygonOffset: true,
-        polygonOffsetFactor: -1,
-        polygonOffsetUnits: -1,
-      });
-      const mesh = new THREE.Mesh(geometry, material);
-      mesh.renderOrder = 10 + i;
-      this.paintedLinesGroup.add(mesh);
+
+      const group = new THREE.Group();
+      group.renderOrder = 10 + i;
+
+      if (useSketch && this.sketchMaterials) {
+        const fillMat = createColoredSketchFillMaterial(
+          this.sketchMaterials.fill,
+          line.color
+        );
+        this.paintedRibbonFillMaterials.push(fillMat);
+        updateSketchFillPixelRatio(fillMat, this.renderer);
+
+        const fill = new THREE.Mesh(geometry, fillMat);
+        group.add(fill);
+
+        const outline = new THREE.Mesh(geometry, this.sketchMaterials.outline);
+        outline.renderOrder = -0.5;
+        group.add(outline);
+      } else {
+        const material = new THREE.MeshBasicMaterial({
+          color: line.color,
+          side: THREE.DoubleSide,
+          depthTest: true,
+          depthWrite: false,
+          polygonOffset: true,
+          polygonOffsetFactor: -1,
+          polygonOffsetUnits: -1,
+        });
+        group.add(new THREE.Mesh(geometry, material));
+      }
+
+      this.paintedLinesGroup.add(group);
     }
+  }
+
+  private disposePaintedLineNode(node: THREE.Object3D): void {
+    node.traverse((obj) => {
+      if (!(obj instanceof THREE.Mesh)) return;
+      obj.geometry.dispose();
+      const mat = obj.material;
+      if (Array.isArray(mat)) {
+        for (const m of mat) {
+          if (m !== this.sketchMaterials?.outline) m.dispose();
+        }
+      } else if (mat !== this.sketchMaterials?.outline) {
+        mat.dispose();
+      }
+    });
   }
 
   private bindOverlayEvents(): void {
@@ -1631,6 +1675,9 @@ export class SceneView {
       this.updateCameraRelativeLighting();
       if (this.sketchMode && this.sketchMaterials) {
         this.sketchMaterials.update(this.camera, this.renderer);
+        for (const mat of this.paintedRibbonFillMaterials) {
+          updateSketchFillPixelRatio(mat, this.renderer);
+        }
       }
       this.renderer.render(this.scene, this.camera);
       if (this.interactionMode === 'cut' && this.currentMeshData) {
@@ -2582,6 +2629,7 @@ export class SceneView {
     if (this.grid) this.grid.visible = !enabled;
     this.refreshSketchAppearance();
     this.applyDisplayMode();
+    this.rebuildPaintedLineMeshes();
   }
 
   /** Apply or remove the sketch material/outline on the current mesh to match `sketchMode`. */

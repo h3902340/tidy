@@ -14,6 +14,8 @@ Thesis-style technical report (~10 pages) for the **Tidy** web application.
 report/
   main.tex              ← set as main document
   references.bib
+  figures/
+    tidy-overview.png   ← introduction screenshot
   sections/
     abstract.tex
     introduction.tex
