@@ -369,18 +369,26 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-.debug-panel {
+.canvas-overlay-footer {
   position: absolute;
   left: 0.75rem;
   right: 0.75rem;
   bottom: 0.75rem;
   z-index: 20;
   display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.5rem;
+  pointer-events: none;
+}
+
+.debug-panel {
+  display: flex;
   flex-wrap: wrap;
   align-items: flex-end;
   gap: 0.75rem;
   padding: 0;
-  pointer-events: none;
+  width: 100%;
 }
 
 .debug-panel button {
@@ -447,11 +455,7 @@ button.secondary:disabled:hover {
 }
 
 .status {
-  position: absolute;
-  left: 0.75rem;
-  bottom: 0.75rem;
-  z-index: 30;
-  max-width: min(28rem, calc(100% - 1.5rem));
+  max-width: min(28rem, 100%);
   margin: 0;
   padding: 0.4rem 0.55rem;
   font-size: 0.82rem;
