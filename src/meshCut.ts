@@ -1,8 +1,8 @@
 import * as THREE from 'three';
 import type { Mesh3D } from './teddyPipeline';
 import type { Vec2, Vec3 } from './math';
-import { cross2, lerp3 } from './math';
-import type { CutBoundaryHit } from './cutPolygon';
+import { cross2, dist, lerp3 } from './math';
+import { extractCutPath, type CutBoundaryHit } from './cutPolygon';
 import {
   meshVertexToScreen,
   meshVertexToWorld,
@@ -36,7 +36,7 @@ export function computeTeddyCut(
   screenStroke: Vec2[],
   camera: THREE.Camera,
   domElement: HTMLElement,
-  _validated: {
+  validated: {
     silhouette: Vec2[];
     hits: [CutBoundaryHit, CutBoundaryHit];
   },
@@ -80,8 +80,12 @@ export function computeTeddyCut(
     return { error: 'Could not project cut onto the object surface (front and back).' };
   }
 
-  const split = splitMeshAlongScreenStroke(mesh, camera, rect, screenStroke, worldRoot);
-  const keptFaces = keepFacesOnLargerVertexSide(split.leftFaces, split.rightFaces);
+  const cutPath = buildCutPathFromHits(screenStroke, validated.hits);
+  const split = splitMeshAlongScreenStroke(mesh, camera, rect, cutPath, worldRoot);
+  const keptFaces = [
+    ...split.unaffectedFaces,
+    ...keepFacesOnLargerVertexSide(split.leftFaces, split.rightFaces),
+  ];
 
   if (keptFaces.length === 0) {
     return { error: 'Cut removed the entire object — try a smaller cut.' };
@@ -98,7 +102,7 @@ export function computeTeddyCut(
     split.cutSegments,
     camera,
     rect,
-    screenStroke,
+    cutPath,
     worldRoot
   );
   const capFaces = buildCapFromProjectedSection(
@@ -106,7 +110,7 @@ export function computeTeddyCut(
     holeLoop,
     camera,
     rect,
-    screenStroke,
+    cutPath,
     worldRoot
   );
   const capped: Mesh3D = {
@@ -130,27 +134,26 @@ type SplitResult = {
   vertices: Vec3[];
   leftFaces: Triangle[];
   rightFaces: Triangle[];
+  /** Triangles outside the stroke corridor — always kept. */
+  unaffectedFaces: Triangle[];
   /** Edges (pairs of crossing-vertex ids) lying exactly on the cut, forming the hole rim. */
   cutSegments: [number, number][];
 };
 
 /**
- * Phase 1: slice every triangle that the screen-space cut *stroke* passes through, so the
- * boundary follows the drawn stroke exactly instead of a straight chord or original triangle
- * edges. Triangles are partitioned into the two sides of the stroke polyline; crossed
- * triangles are split into sub-triangles at the precise crossing points.
+ * Phase 1: slice triangles inside the stroke corridor (between silhouette crossings). Geometry
+ * far from the drawn stroke is left untouched so a partial cut does not partition the whole
+ * canvas. Crossed triangles are split into sub-triangles at the precise crossing points.
  */
 function splitMeshAlongScreenStroke(
   mesh: Mesh3D,
   camera: THREE.Camera,
   rect: { width: number; height: number },
-  screenStroke: Vec2[],
+  cutPath: Vec2[],
   worldRoot?: THREE.Object3D
 ): SplitResult {
   const vertices = mesh.vertices.slice();
-  // Extend the stroke past both ends so triangles near the silhouette still flip sign.
-  const cutPath = extendPolyline(screenStroke, 1e5);
-  const signedDist = (s: Vec2): number => signedDistanceToPolyline(s, cutPath);
+  const signedDist = (s: Vec2): number => nearestPointOnPolyline(s, cutPath).signedDistance;
 
   const screenCache = new Map<number, Vec2 | null>();
   const sideOf = (id: number): number => {
@@ -159,6 +162,7 @@ function splitMeshAlongScreenStroke(
     }
     const s = screenCache.get(id) ?? null;
     if (!s) return 0;
+    if (!isInfluencedByCut(s, cutPath)) return 0;
     const d = signedDist(s);
     if (d > 1e-6) return 1;
     if (d < -1e-6) return -1;
@@ -203,9 +207,20 @@ function splitMeshAlongScreenStroke(
 
   const leftFaces: Triangle[] = [];
   const rightFaces: Triangle[] = [];
+  const unaffectedFaces: Triangle[] = [];
   const cutSegments: [number, number][] = [];
 
   for (const tri of mesh.faces) {
+    const vertexInfluenced = tri.map((id) => {
+      const s = screenCache.get(id) ?? meshVertexToScreen(vertices[id], camera, rect, worldRoot);
+      if (!screenCache.has(id)) screenCache.set(id, s);
+      return s ? isInfluencedByCut(s, cutPath) : false;
+    });
+    if (!vertexInfluenced.some(Boolean)) {
+      unaffectedFaces.push(tri);
+      continue;
+    }
+
     const signs: number[] = [sideOf(tri[0]), sideOf(tri[1]), sideOf(tri[2])];
     // Snap on-line vertices onto a neighbor's side to avoid degenerate zero-area slivers.
     for (let i = 0; i < 3; i++) {
@@ -251,54 +266,69 @@ function splitMeshAlongScreenStroke(
     }
   }
 
-  return { vertices, leftFaces, rightFaces, cutSegments };
+  return { vertices, leftFaces, rightFaces, unaffectedFaces, cutSegments };
 }
 
-function fanTriangulate(poly: number[], out: Triangle[]): void {
-  for (let i = 1; i < poly.length - 1; i++) {
-    out.push([poly[0], poly[i], poly[i + 1]]);
+/** Stroke segment between the two validated silhouette crossings. */
+function buildCutPathFromHits(
+  stroke: Vec2[],
+  hits: [CutBoundaryHit, CutBoundaryHit]
+): Vec2[] {
+  const path = extractCutPath(stroke, hits[0].cutParam, hits[1].cutParam);
+  if (path.length >= 2) return path;
+  return dedupePolyline(stroke);
+}
+
+function dedupePolyline(path: Vec2[]): Vec2[] {
+  const out: Vec2[] = [];
+  for (const p of path) {
+    if (out.length === 0 || dist(out[out.length - 1], p) > 1e-6) {
+      out.push(p);
+    }
   }
+  return out.length >= 2 ? out : path;
 }
 
-/** Extend a polyline outward at both ends along its end tangents by `amount` pixels. */
-function extendPolyline(path: Vec2[], amount: number): Vec2[] {
-  const pts = path.filter(
-    (p, i) => i === 0 || Math.hypot(p.x - path[i - 1].x, p.y - path[i - 1].y) > 1e-6
-  );
-  if (pts.length < 2) return pts.length === 1 ? [pts[0], pts[0]] : pts;
-
-  const head = pts[0];
-  const headDir = pts[1];
-  const tail = pts[pts.length - 1];
-  const tailDir = pts[pts.length - 2];
-
-  const extend = (from: Vec2, toward: Vec2): Vec2 => {
-    const dx = from.x - toward.x;
-    const dy = from.y - toward.y;
-    const len = Math.hypot(dx, dy) || 1;
-    return { x: from.x + (dx / len) * amount, y: from.y + (dy / len) * amount };
-  };
-
-  return [extend(head, headDir), ...pts, extend(tail, tailDir)];
+function polylineLength(path: Vec2[]): number {
+  let total = 0;
+  for (let i = 0; i < path.length - 1; i++) {
+    total += dist(path[i], path[i + 1]);
+  }
+  return total;
 }
 
-/**
- * Signed distance from a screen point to a polyline. Magnitude is distance to the nearest
- * segment; sign tells which side of that segment the point lies on (zero set = the polyline).
- */
-function signedDistanceToPolyline(p: Vec2, path: Vec2[]): number {
+type NearestOnPolyline = {
+  distance: number;
+  /** Arc-length fraction along the polyline in [0, 1] at the closest point (endpoints clamped). */
+  param: number;
+  signedDistance: number;
+};
+
+function nearestPointOnPolyline(p: Vec2, path: Vec2[]): NearestOnPolyline {
+  if (path.length < 2) {
+    return { distance: Infinity, param: 0, signedDistance: 0 };
+  }
+
+  const segLen: number[] = [];
+  let total = 0;
+  for (let i = 0; i < path.length - 1; i++) {
+    const len = dist(path[i], path[i + 1]);
+    segLen.push(len);
+    total += len;
+  }
+  if (total < 1e-9) return { distance: 0, param: 0, signedDistance: 0 };
+
   let bestDist2 = Infinity;
+  let bestParam = 0;
   let bestSign = 1;
-
+  let run = 0;
   for (let i = 0; i < path.length - 1; i++) {
     const a = path[i];
     const b = path[i + 1];
     const abx = b.x - a.x;
     const aby = b.y - a.y;
-    const apx = p.x - a.x;
-    const apy = p.y - a.y;
     const len2 = abx * abx + aby * aby || 1e-12;
-    let t = (apx * abx + apy * aby) / len2;
+    let t = ((p.x - a.x) * abx + (p.y - a.y) * aby) / len2;
     t = Math.max(0, Math.min(1, t));
     const cx = a.x + abx * t;
     const cy = a.y + aby * t;
@@ -308,10 +338,34 @@ function signedDistanceToPolyline(p: Vec2, path: Vec2[]): number {
     if (d2 < bestDist2) {
       bestDist2 = d2;
       bestSign = cross2(a, b, p) >= 0 ? 1 : -1;
+      bestParam = (run + t * segLen[i]) / total;
     }
+    run += segLen[i];
   }
 
-  return bestSign * Math.sqrt(bestDist2);
+  const distance = Math.sqrt(bestDist2);
+  return { distance, param: bestParam, signedDistance: bestSign * distance };
+}
+
+/** True when a screen point lies in the corridor where the cut should partition mesh. */
+export function isInfluencedByCut(p: Vec2, cutPath: Vec2[]): boolean {
+  const { distance, param } = nearestPointOnPolyline(p, cutPath);
+  const pathLen = polylineLength(cutPath);
+  const endMargin = Math.max(24, pathLen * 0.2);
+  const interiorPerp = Math.max(48, pathLen * 0.75);
+
+  if (param >= 0 && param <= 1) {
+    return distance <= interiorPerp;
+  }
+
+  const beyond = param < 0 ? -param * pathLen : (param - 1) * pathLen;
+  return beyond <= endMargin && distance <= endMargin;
+}
+
+function fanTriangulate(poly: number[], out: Triangle[]): void {
+  for (let i = 1; i < poly.length - 1; i++) {
+    out.push([poly[0], poly[i], poly[i + 1]]);
+  }
 }
 
 /**
@@ -325,14 +379,12 @@ function buildCapFromProjectedSection(
   holeLoop: number[] | null,
   camera: THREE.Camera,
   rect: { width: number; height: number },
-  screenStroke: Vec2[],
+  cutPath: Vec2[],
   worldRoot?: THREE.Object3D
 ): Triangle[] {
   if (!holeLoop) return [];
 
-  const stroke = screenStroke.filter(
-    (p, i) => i === 0 || Math.hypot(p.x - screenStroke[i - 1].x, p.y - screenStroke[i - 1].y) > 1e-6
-  );
+  const stroke = dedupePolyline(cutPath);
   const out: Triangle[] = [];
   capBoundaryLoop(holeLoop, vertices, camera, rect, stroke, worldRoot, out);
   const ref = meshCentroid(vertices);
@@ -369,13 +421,11 @@ function findCutHoleLoop(
   cutSegments: [number, number][],
   camera: THREE.Camera,
   rect: { width: number; height: number },
-  screenStroke: Vec2[],
+  cutPath: Vec2[],
   worldRoot?: THREE.Object3D
 ): number[] | null {
   const loops = extractBoundaryLoops(keptFaces);
-  const stroke = screenStroke.filter(
-    (p, i) => i === 0 || Math.hypot(p.x - screenStroke[i - 1].x, p.y - screenStroke[i - 1].y) > 1e-6
-  );
+  const stroke = dedupePolyline(cutPath);
   return pickCutHoleLoop(loops, cutSegments, vertices, camera, rect, stroke, worldRoot);
 }
 
