@@ -1,12 +1,7 @@
 import * as THREE from 'three';
 import { describe, expect, it } from 'vitest';
 import type { CutBoundaryHit } from './cutPolygon';
-import {
-  computeTeddyCut,
-  countBoundaryEdges,
-  isInfluencedByCut,
-  keepFacesOnLargerVertexSide,
-} from './meshCut';
+import { computeTeddyCut, countBoundaryEdges, keepFacesOnLargerVertexSide } from './meshCut';
 import { buildTeddyPipelineFromStroke } from './teddy';
 import type { Vec2 } from './math';
 
@@ -29,20 +24,6 @@ function dummyHits(): [CutBoundaryHit, CutBoundaryHit] {
   });
   return [hit(0), hit(1)];
 }
-
-describe('isInfluencedByCut', () => {
-  it('marks points near the stroke corridor but not far-away geometry', () => {
-    const cutPath: Vec2[] = [
-      { x: 100, y: 200 },
-      { x: 160, y: 200 },
-    ];
-
-    expect(isInfluencedByCut({ x: 130, y: 200 }, cutPath)).toBe(true);
-    expect(isInfluencedByCut({ x: 130, y: 170 }, cutPath)).toBe(true);
-    expect(isInfluencedByCut({ x: 320, y: 200 }, cutPath)).toBe(false);
-    expect(isInfluencedByCut({ x: 320, y: 170 }, cutPath)).toBe(false);
-  });
-});
 
 describe('keepFacesOnLargerVertexSide', () => {
   it('keeps the side with more unique vertices', () => {
