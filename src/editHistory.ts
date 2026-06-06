@@ -1,9 +1,13 @@
 import type { Mesh3D } from './teddy';
+import {
+  clonePaintedSurfaceLines,
+  type PaintedSurfaceLine,
+} from './surfaceLines';
 
 export type EditSnapshot = {
   /** `null` = empty canvas (before any shape was created). */
   mesh: Mesh3D | null;
-  paint?: ImageData;
+  surfaceLines?: PaintedSurfaceLine[];
 };
 
 export function cloneMesh(mesh: Mesh3D): Mesh3D {
@@ -11,10 +15,6 @@ export function cloneMesh(mesh: Mesh3D): Mesh3D {
     vertices: mesh.vertices.map((v) => ({ x: v.x, y: v.y, z: v.z })),
     faces: mesh.faces.map((f) => [f[0], f[1], f[2]] as [number, number, number]),
   };
-}
-
-export function cloneImageData(data: ImageData): ImageData {
-  return new ImageData(new Uint8ClampedArray(data.data), data.width, data.height);
 }
 
 export class EditHistory {
@@ -25,7 +25,9 @@ export class EditHistory {
     this.entries = this.entries.slice(0, this.index + 1);
     this.entries.push({
       mesh: entry.mesh ? cloneMesh(entry.mesh) : null,
-      paint: entry.paint ? cloneImageData(entry.paint) : undefined,
+      surfaceLines: entry.surfaceLines
+        ? clonePaintedSurfaceLines(entry.surfaceLines)
+        : undefined,
     });
     this.index = this.entries.length - 1;
   }
@@ -61,7 +63,9 @@ export class EditHistory {
     const entry = this.entries[this.index];
     return {
       mesh: entry.mesh ? cloneMesh(entry.mesh) : null,
-      paint: entry.paint ? cloneImageData(entry.paint) : undefined,
+      surfaceLines: entry.surfaceLines
+        ? clonePaintedSurfaceLines(entry.surfaceLines)
+        : undefined,
     };
   }
 

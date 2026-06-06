@@ -2,18 +2,14 @@ import { describe, expect, it } from 'vitest';
 import { constrainedDelaunay } from './cdt';
 import {
   applySpineElevation,
-  buildFanElevationDebugSteps,
-  buildInternalFlatElevationDebugSteps,
-  buildInternalQuarterOvalDebugSteps,
-  buildQuarterOvalDebugSteps,
   buildSpineElevationDebugSteps,
   buildTerminalPruneDebugSteps,
-  cdtToZeyapTriangles,
+  cdtToInflationTriangles,
   drawBackface,
   propagateSpineElevationAlongAxis,
   pruneToWedges,
   wedgesToFanFacesFiltered,
-} from './zeyapInflation';
+} from './teddyInflation';
 import { buildTeddyPipeline } from './teddyPipeline';
 import { normalizePolygon } from './stroke';
 import { vec3 } from './math';
@@ -55,9 +51,9 @@ describe('terminal fan pruning', () => {
     const tCount = triangles.filter((t) => t.type === 'T').length;
     expect(tCount).toBe(2);
 
-    const zeyap = cdtToZeyapTriangles(triangles);
+    const inflationTris = cdtToInflationTriangles(triangles);
     const verts = unitSquare.map((p) => vec3(p.x, p.y, 0));
-    const { wedges } = pruneToWedges(zeyap, [...verts]);
+    const { wedges } = pruneToWedges(inflationTris, [...verts]);
     const terminalFans = wedgesToFanFacesFiltered(
       wedges,
       (w) => w.fromTerminalPrune
@@ -86,9 +82,9 @@ describe('terminal fan pruning', () => {
     const tCount = triangles.filter((t) => t.type === 'T').length;
     expect(tCount).toBeGreaterThanOrEqual(4);
 
-    const zeyap = cdtToZeyapTriangles(triangles);
+    const inflationTris = cdtToInflationTriangles(triangles);
     const verts = polygon.map((p) => vec3(p.x, p.y, 0));
-    const { wedges, axisSegments } = pruneToWedges(zeyap, [...verts]);
+    const { wedges, axisSegments } = pruneToWedges(inflationTris, [...verts]);
     const terminalFans = wedgesToFanFacesFiltered(
       wedges,
       (w) => w.fromTerminalPrune
@@ -161,9 +157,9 @@ describe('terminal fan pruning', () => {
     const jCount = triangles.filter((t) => t.type === 'J').length;
     expect(jCount).toBeGreaterThan(0);
 
-    const zeyap = cdtToZeyapTriangles(triangles);
+    const inflationTris = cdtToInflationTriangles(triangles);
     const verts = polygon.map((p) => vec3(p.x, p.y, 0));
-    const { wedges } = pruneToWedges(zeyap, [...verts]);
+    const { wedges } = pruneToWedges(inflationTris, [...verts]);
 
     const interiorWedges = wedges.filter((w) => !w.fromTerminalPrune);
     expect(interiorWedges.length).toBeGreaterThanOrEqual(1);
@@ -172,9 +168,9 @@ describe('terminal fan pruning', () => {
   it('terminal prune debug steps include semicircle advance and fan frames', () => {
     const polygon = normalizePolygon(unitSquare);
     const { triangles } = constrainedDelaunay(polygon);
-    const zeyap = cdtToZeyapTriangles(triangles);
+    const inflationTris = cdtToInflationTriangles(triangles);
     const verts = polygon.map((p) => vec3(p.x, p.y, 0));
-    const steps = buildTerminalPruneDebugSteps(zeyap, [...verts]);
+    const steps = buildTerminalPruneDebugSteps(inflationTris, [...verts]);
 
     expect(steps.length).toBeGreaterThan(0);
     expect(steps.some((s) => s.kind === 'start')).toBe(true);
@@ -201,9 +197,9 @@ describe('terminal fan pruning', () => {
     }
     const polygon = normalizePolygon(pts);
     const { triangles } = constrainedDelaunay(polygon);
-    const zeyap = cdtToZeyapTriangles(triangles);
+    const inflationTris = cdtToInflationTriangles(triangles);
     const verts = polygon.map((p) => vec3(p.x, p.y, 0));
-    const { axisSegments } = pruneToWedges(zeyap, [...verts]);
+    const { axisSegments } = pruneToWedges(inflationTris, [...verts]);
 
     const adj = new Map<number, number[]>();
     for (const [a, b] of axisSegments) {
@@ -232,9 +228,9 @@ describe('terminal fan pruning', () => {
 
   it('elevation neighbors only include chordal-axis spine nodes', () => {
     const { triangles } = constrainedDelaunay(unitSquare);
-    const zeyap = cdtToZeyapTriangles(triangles);
+    const inflationTris = cdtToInflationTriangles(triangles);
     const verts = unitSquare.map((p) => vec3(p.x, p.y, 0));
-    const { wedges, interiorVerts, axisSegments } = pruneToWedges(zeyap, verts);
+    const { wedges, interiorVerts, axisSegments } = pruneToWedges(inflationTris, verts);
     const boundaryCount = unitSquare.length;
 
     const spineNodes = new Set<number>();
@@ -266,9 +262,9 @@ describe('terminal fan pruning', () => {
 
   it('buildSpineElevationDebugSteps matches applySpineElevation + propagate', () => {
     const { triangles } = constrainedDelaunay(unitSquare);
-    const zeyap = cdtToZeyapTriangles(triangles);
+    const inflationTris = cdtToInflationTriangles(triangles);
     const verts = unitSquare.map((p) => vec3(p.x, p.y, 0));
-    const { interiorVerts, axisSegments } = pruneToWedges(zeyap, verts);
+    const { interiorVerts, axisSegments } = pruneToWedges(inflationTris, verts);
 
     const steps = buildSpineElevationDebugSteps(
       interiorVerts,
@@ -337,12 +333,12 @@ describe('terminal fan pruning', () => {
     }
     const polygon = normalizePolygon(ring);
     const { triangles } = constrainedDelaunay(polygon);
-    const zeyap = cdtToZeyapTriangles(triangles);
+    const inflationTris = cdtToInflationTriangles(triangles);
     const verts = polygon.map((p) => vec3(p.x, p.y, 0));
-    const { wedges } = pruneToWedges(zeyap, verts);
+    const { wedges } = pruneToWedges(inflationTris, verts);
 
-    for (let ti = 0; ti < zeyap.length; ti++) {
-      const tri = zeyap[ti];
+    for (let ti = 0; ti < inflationTris.length; ti++) {
+      const tri = inflationTris[ti];
       if (tri.type !== 'S' && tri.type !== 'J') continue;
       const tv = new Set(tri.vertIds);
       const hit = wedges.some(
@@ -362,9 +358,9 @@ describe('terminal fan pruning', () => {
     }
     const polygon = normalizePolygon(ring);
     const { triangles } = constrainedDelaunay(polygon);
-    const zeyap = cdtToZeyapTriangles(triangles);
+    const inflationTris = cdtToInflationTriangles(triangles);
     const verts = polygon.map((p) => vec3(p.x, p.y, 0));
-    const { wedges, axisSegments } = pruneToWedges(zeyap, verts);
+    const { wedges, axisSegments } = pruneToWedges(inflationTris, verts);
     const bc = polygon.length;
 
     const meshEdge = (a: number, b: number) =>
@@ -550,9 +546,9 @@ describe('terminal fan pruning', () => {
     }
     const polygon = normalizePolygon(ring);
     const { triangles } = constrainedDelaunay(polygon);
-    const zeyap = cdtToZeyapTriangles(triangles);
+    const inflationTris = cdtToInflationTriangles(triangles);
     const verts = polygon.map((p) => vec3(p.x, p.y, 0));
-    const { wedges, axisSegments } = pruneToWedges(zeyap, verts);
+    const { wedges, axisSegments } = pruneToWedges(inflationTris, verts);
     const bc = polygon.length;
 
     const hasChord = (a: number, b: number, corner: number) =>

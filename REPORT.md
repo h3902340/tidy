@@ -4,7 +4,7 @@
 
 ---
 
-**Project:** Tidy — Teddy Sketch to 3D
+**Project:** Tidy — Based on Teddy System by Takeo Igarashi (1999)
 **Domain:** Interactive computer graphics / geometric modeling
 **Primary reference:** Igarashi, Matsuoka & Tanaka, *Teddy: A Sketching Interface for 3D Freeform Design*, SIGGRAPH 1999
 **Implementation:** TypeScript + Three.js, single-page web application
@@ -38,16 +38,17 @@ landmark *Teddy* system, which pioneered the idea of "inflating" a hand-drawn 2D
 a plausible rounded 3D model. A user draws a single closed stroke; the system triangulates that
 outline, computes its medial (chordal) axis, lifts the interior into a smooth dome, mirrors it to
 form a closed watertight solid, and presents it in an interactive 3D viewport. From there the user
-can refine the model through four gesture-based editing operations — **paint**, **cut**,
-**loop cut**, and **extrude** — each projected from screen space onto the 3D surface, and can
-toggle a stylized "pencil sketch" rendering mode that imitates the look of the original Teddy demo.
+can refine the model through gesture-based editing — **surface paint** (draw and erase),
+**cut** (through-cut or loop cut, chosen automatically from the stroke shape), and
+**extrude** — each projected from screen space onto the 3D surface. **Undo and redo** restore
+both mesh geometry and painted surface lines. A stylized "pencil sketch" rendering mode imitates
+the look of the original Teddy demo.
 
 The system is written entirely in TypeScript and runs client-side with no server component. It
 uses Three.js for rendering and interaction, the `cdt2d` library for constrained Delaunay
-triangulation, and a custom geometry layer (roughly 7,400 lines of source across 23 modules) that
-implements the inflation algorithm, the screen-to-surface projection machinery, and the four
-editing operations. A small Vitest suite guards the most failure-prone invariant of the system:
-consistent, outward-facing mesh winding.
+triangulation, and a custom geometry layer (roughly 14,000 lines of source across 26 modules) that
+implements the inflation algorithm, screen-to-surface projection, surface-line painting, and the
+editing operations. A Vitest suite (28 tests across three files) guards mesh winding and cut logic.
 
 This report documents the architecture, the algorithms behind each feature, the coordinate-system
 conventions that tie the 2D drawing surface to the 3D world, the engineering challenges that arose
@@ -71,8 +72,8 @@ a balloon or a stuffed toy (hence "Teddy").
 
 Beyond creation, Teddy defined a family of gesture-based editing operations — extrusion, cutting,
 smoothing, and bending — all driven by simple strokes rather than menus or numeric entry. Tidy
-implements the creation pipeline and three of these editing gestures (cut, loop cut, extrude), plus
-a freehand surface-painting tool.
+implements the creation pipeline and Teddy's stroke-driven editing gestures — through-cut, loop cut,
+extrude, and surface painting.
 
 ### 2.2 Goals of the Tidy project
 
@@ -81,13 +82,14 @@ a freehand surface-painting tool.
   appears where they drew, then can be orbited, zoomed, and panned.
 - Support **stroke-driven editing** that operates on the actual surface mesh (not a separate
   overlay), keeping the mesh watertight after each operation.
+- Provide **undo/redo** over mesh edits and surface paint so users can experiment safely.
 - Offer an optional **stylized rendering** mode that evokes the hand-drawn aesthetic of the
   original paper's figures and demo video.
 - Run **entirely client-side** so it can be deployed as a static site (GitHub Pages).
 
 ### 2.3 Relationship to prior implementations
 
-The inflation core is a careful TypeScript port of the open-source `zeyap/teddy` implementation,
+The inflation core is a careful TypeScript implementation of the SIGGRAPH 1999 Teddy algorithm,
 adapted to Tidy's data structures and extended with additional winding-correction passes. The
 editing operations (loop cut, extrusion, and the cut tool) and the entire interaction/rendering
 layer are original to this project, as is the non-photorealistic shader.
@@ -122,7 +124,7 @@ The `src/` directory contains the following modules, grouped here by responsibil
 - `stroke.ts` — stroke closing (auto-snap tolerance), uniform resampling, self-intersection test.
 
 **Inflation pipeline**
-- `zeyapInflation.ts` (≈ 995 lines) — the heart of the creation algorithm: pruning, chordal-axis
+- `teddyInflation.ts` (≈ 2,770 lines) — the heart of the creation algorithm: pruning, chordal-axis
   spine growth, quarter-oval elevation, back-face mirroring, and rim stitching.
 - `teddyPipeline.ts` — orchestrates the inflation stages and exposes intermediate meshes for the
   step-by-step UI.
@@ -131,22 +133,27 @@ The `src/` directory contains the following modules, grouped here by responsibil
   consistently outward.
 
 **Interaction and rendering**
-- `sceneView.ts` (≈ 1,410 lines) — the central controller: Three.js scene, camera, orbit controls,
-  pointer handling, all interaction modes, and the overlay drawing.
-- `main.ts` (≈ 631 lines) — DOM wiring, mode toggles, button handlers, status messaging.
-- `appCanvas.ts` — the 2D silhouette canvas used for the very first stroke.
+- `sceneView.ts` (≈ 2,700 lines) — the central controller: Three.js scene, camera, orbit controls,
+  pointer handling, all interaction modes, overlay drawing, and painted-line meshes.
+- `main.ts` (≈ 1,500 lines) — DOM wiring, tool tabs, preset shapes, edit history, debug stepping,
+  status messaging.
 - `screenSilhouette.ts`, `renderSilhouette.ts` — projecting mesh vertices to screen and computing
   view-dependent silhouettes.
-- `surfaceProjection.ts` — raycasting screen strokes onto the 3D surface (front/back hits).
+- `surfaceProjection.ts` — raycasting screen strokes onto the 3D surface (paired front/back hits,
+  face normals, surface-aligned lift for paint).
+- `surfaceLines.ts` — Teddy-style surface paint: ribbon geometry, carve/erase clipping, silhouette
+  validation.
+- `editHistory.ts` — undo/redo snapshots (`Mesh3D` + optional painted surface lines).
 - `sketchShader.ts` — the non-photorealistic stipple + outline materials.
 
 **Editing operations**
-- `cutPolygon.ts`, `meshCut.ts` — the Teddy §5.4 cut (remove a side, cap the hole).
-- `loopImprint.ts` — imprint a closed screen loop onto the mesh and remove the enclosed surface.
+- `cutPolygon.ts`, `meshCut.ts` — the Teddy §5.4 through-cut (remove a side, cap the hole).
+- `loopImprint.ts` — imprint a closed screen loop onto the mesh and remove the enclosed surface
+  (loop cut and extrusion base).
 - `extrude.ts` (≈ 583 lines) — the §5.3 extrusion sweep built on top of loop imprinting.
 
 **Tests**
-- `meshWinding.test.ts`, `meshCut.test.ts`, `zeyapInflation.test.ts`.
+- `meshWinding.test.ts`, `meshCut.test.ts`, `teddyInflation.test.ts`.
 
 ---
 
@@ -162,16 +169,16 @@ The `src/` directory contains the following modules, grouped here by responsibil
       │  constrained Delaunay (cdt.ts → cdt2d)
       ▼
  triangulated outline + T/S/J classification
-      │  prune to wedges, grow chordal axis (zeyapInflation.ts)
+      │  prune to wedges, grow chordal axis (teddyInflation.ts)
       ▼
  elevated top fan (quarter-oval heights)
       │  mirror back face + stitch silhouette rim
       ▼
  watertight inflated Mesh3D  ───────────────►  SceneView (Three.js)
       ▲                                              │
-      │   edited Mesh3D                              │ pointer strokes
-      └───────────── editing ops ◄───────────────────┘
-            (cut / loop cut / extrude / paint)
+      │   edited Mesh3D + surface lines              │ pointer strokes
+      └──── editHistory (undo/redo) ◄────────────────┘
+            cut / loop cut / extrude / paint
 ```
 
 The fundamental data structure passed between every stage is the deliberately minimal `Mesh3D`:
@@ -224,13 +231,14 @@ as possible.
 ## 5. The Inflation Pipeline (Creating a Shape)
 
 This is the algorithmic centerpiece — the transformation from a flat outline to a rounded solid. It
-is implemented across `stroke.ts`, `cdt.ts`, `zeyapInflation.ts`, and `teddyPipeline.ts`, and it
+is implemented across `stroke.ts`, `cdt.ts`, `teddyInflation.ts`, and `teddyPipeline.ts`, and it
 proceeds in the following stages.
 
 ### 5.1 Stroke acquisition and normalization
 
-The first stroke is captured on a dedicated 2D canvas (`appCanvas.ts`) as a list of pointer
-positions, sampled whenever the pointer moves more than 2 px. On release, the stroke is
+The first stroke is captured on a transparent 2D overlay atop the WebGL canvas as a list of pointer
+positions, sampled whenever the pointer moves more than 2 px. Shape presets (circle, oval,
+triangle, square, star) can skip freehand drawing. On release, the stroke is
 **auto-closed**: if the start and end points are within a 40 px tolerance the loop is snapped shut,
 otherwise a closing segment is appended.
 
@@ -284,7 +292,7 @@ merges the surviving sleeve/junction triangles into a branched spine. The result
 **wedges** (boundary-to-spine fan triangles) and a set of **axis segments** (the pruned skeleton),
 both exposed for visualization.
 
-`zeyapInflation.ts` contains a substantial amount of careful bookkeeping here — ensuring that every
+`teddyInflation.ts` contains a substantial amount of careful bookkeeping here — ensuring that every
 terminal corner actually receives fan triangles, that orphaned fan tips get linked back to the axis,
 and that doubly-defined edges are removed — because these edge cases are exactly where holes and
 non-manifold geometry would otherwise creep in.
@@ -347,14 +355,35 @@ educational feature and an invaluable debugging aid.
 ### 6.1 The unified 3D canvas
 
 Rather than splitting drawing and viewing into separate panes, Tidy uses a single 3D viewport for
-everything. The initial silhouette is drawn on a transparent 2D overlay that sits on top of the
-WebGL canvas; the stroke is then projected onto the camera's view plane so the inflated model
-appears *where the user drew it*. After creation, the same overlay captures editing strokes, while
-Three.js `OrbitControls` provide rotate (drag), zoom (scroll), and pan (right-drag).
+everything. The initial silhouette is drawn on a transparent 2D overlay; the stroke is projected
+onto the camera's view plane so the inflated model appears *where the user drew it*. After
+creation, paint, cut, and extrude strokes are captured on the **WebGL canvas** so the right mouse
+button can reach `OrbitControls` while the left button draws. Only the silhouette phase uses the
+interactive overlay.
 
-`SceneView` maintains an `interactionMode` state machine — `silhouette`, `orbit`, `paint`, `cut`,
-`loopcut`, `extrude` — and routes pointer events accordingly. Editing modes capture strokes on the
-overlay; orbit mode hands events to the camera controls.
+`SceneView` maintains an `interactionMode` state machine — `silhouette`, `orbit` (View),
+`paint`, `cut`, `extrude` — and routes pointer events accordingly. **Cut** is unified: a closed
+stroke triggers a loop cut; an open stroke crossing the silhouette triggers a through-cut (§7.2,
+§8). The active tool **persists** after paint, cut, extrude, undo, and redo (the UI does not
+force a return to View).
+
+### 6.1.1 Camera controls
+
+**Right mouse always rotates** in every mode. Other bindings depend on context:
+
+| Context | Rotate | Pan | Zoom |
+|---------|--------|-----|------|
+| View, cut review, extrude orient | Right-drag | Left-drag | Scroll |
+| Paint / cut / extrude (drawing) | Right-drag | Middle-drag | Scroll |
+
+Orbit damping is disabled so the camera stops immediately when the user releases the mouse.
+
+### 6.1.2 Status feedback
+
+Validation errors (stroke outside silhouette, failed cut, etc.) appear in a **bottom-left overlay**
+on the canvas and **auto-dismiss after five seconds**. In production mode the dashed silhouette
+guide is hidden; it is shown only when **Debug mode** is enabled, though paint/cut validation still
+uses the computed outline.
 
 ### 6.2 Rendering setup
 
@@ -371,10 +400,8 @@ done by **raycasting**: for each densified stroke sample, a ray is built from th
 sample's normalized device coordinates and intersected with a raycast proxy of the mesh.
 `surfaceProjection.ts` provides the variants used throughout:
 
-- `projectClosedLoopToFrontSurface` — nearest hit only (front surface), used for the extrusion base
-  ring; fails if any sample misses the object.
-- `projectScreenStrokeFrontBack` — both nearest and farthest hits, used by the cut tool to build a
-  front path and a back path.
+- `projectScreenStrokeFrontBackPaired` — aligned front/back hits for cut-through quads.
+- `projectScreenStrokeWithNormals` — front-surface hits with face normals for surface paint.
 - `validateClosedLoopOnSurface` — a lenient on-surface check that tolerates a loop bulging slightly
   past the silhouette (needed for loops drawn around corners).
 
@@ -385,12 +412,32 @@ displayed mesh exactly, including the y-flip scale.
 
 ## 7. Surface Editing I — Painting and Cutting
 
-### 7.1 Painting
+### 7.1 Surface painting (Teddy surface lines)
 
-Paint mode is the simplest editing gesture: the user's stroke is projected onto the front surface
-and drawn as a colored polyline lifted slightly off the surface (so it does not z-fight with the
-mesh). It demonstrates the projection machinery without modifying topology and serves as a
-lightweight annotation tool.
+Paint mode projects 2D strokes onto the mesh front surface and renders them as **ribbon meshes**
+lying in each sample's tangent plane — a thin layer of paint, not a volumetric tube and not a
+per-triangle texture atlas (a texture-atlas approach was prototyped and abandoned because
+resampling after topology edits was too slow).
+
+**Projection (`surfaceProjection.ts`).** Each densified screen sample is raycast against the mesh.
+The hit point is offset ~1 px along the **face normal** (toward the camera) for z-fighting relief,
+not along the view ray, so ribbons stay flush on curved surfaces. Face normals are stored per
+vertex for ribbon framing.
+
+**Ribbon build (`surfaceLines.ts`).** At each sample, stroke tangent is projected onto the tangent
+plane; lateral width follows `normal × tangent`, with brush diameter measured in screen pixels.
+`MeshBasicMaterial` ribbons use `depthWrite: false` and stacked `renderOrder` so newer strokes
+paint over older ones.
+
+**Crossing strokes.** Before a new stroke is committed, existing strokes are **carved** under the
+new brush corridor: each ribbon cross-section is clipped in screen space so cut edges follow the
+crossing angle (a clean "X" rather than a rectangular notch). **Erase** reuses the same lateral
+clip against a scribble path, trimming ribbons rather than deleting whole strokes.
+
+**Persistence.** Painted lines live in `PaintedSurfaceLine` records (points, normals, color,
+linewidth, optional per-vertex clip scales). They survive `setMesh` after cut and extrude and are
+included in **undo/redo** snapshots (`editHistory.ts`). Paint must stay inside the view silhouette
+(Teddy §5 validation via winding number).
 
 ### 7.2 Cutting (Teddy §5.4)
 
@@ -408,6 +455,10 @@ The cut is validated before execution: the stroke must genuinely cross the rende
 boundary twice (`validateCutCrossesBoundary`), otherwise it is rejected. A view-dependent silhouette
 is computed from the current camera (`renderSilhouette.ts` / `screenSilhouette.ts`) and refreshed as
 the camera orbits, so the crossing test reflects exactly what the user sees.
+
+In **production mode**, through-cuts apply immediately after the stroke; loop cuts run automatically
+through imprint → remove → fill. In **debug mode**, both cut types can be stepped and discarded via
+overlay controls.
 
 ---
 
@@ -605,10 +656,10 @@ The automated tests focus on this invariant and on the cut logic:
 
 - `meshWinding.test.ts` — verifies that interior faces point outward from the solid and that
   silhouette-adjacent faces on the top cap point upward (historically the most common hole source).
-- `zeyapInflation.test.ts` — exercises the inflation stages.
+- `teddyInflation.test.ts` — exercises the inflation stages.
 - `meshCut.test.ts` — checks cut behavior.
 
-All ten tests across three files pass (`npm test`). The suite is intentionally narrow but targets the
+All 28 tests across three files pass (`npm test`). The suite is intentionally narrow but targets the
 highest-risk area; the step-by-step pipeline visualization serves as the primary "test" for the more
 visual aspects of inflation.
 
@@ -651,6 +702,17 @@ along the curve. "Smooth the symptom" can be worse than understanding the cause.
 because the original material had been disposed when entering sketch mode. Treating UI toggles as
 reversible state — keeping what you will need to restore — avoided a class of "stuck mode" bugs.
 
+**Surface paint is a 2D carving problem on 3D ribbons.** Crossing strokes required clipping each
+ribbon cross-section in screen space (not just deleting centerline samples), and keeping fully
+clipped vertices so the mesh tapers through intersections. Lifting samples along the view ray rather
+than the face normal made ribbons appear tilted off the surface; tangent-plane framing and
+normal-aligned offset fixed that.
+
+**Consistent camera controls reduce mode friction.** Extrude initially blocked rotation because
+drawing used a pointer-blocking overlay and orbit controls were disabled during loop/curve phases.
+Moving extrude strokes to the WebGL canvas and standardizing on right-drag rotate (left pan in View)
+aligned behavior across tools.
+
 ---
 
 ## 13. Limitations and Future Work
@@ -660,8 +722,8 @@ reversible state — keeping what you will need to restore — avoided a class o
   loop straddles the silhouette) would unify the two regimes and is the highest-value next step.
 - **Self-intersecting strokes.** Both creation and editing assume simple polygons; figure-eight and
   other self-crossing inputs are rejected rather than handled.
-- **No undo/redo history.** Editing operations are destructive; only a full "Clear" resets the
-  session. A mesh-state stack would make experimentation safer.
+- **Undo depth.** Undo/redo covers mesh geometry and surface paint after inflation, but not
+  pre-inflation debug stepping; **Clear** still resets the entire session.
 - **Smoothing and bending gestures.** The paper defines additional editing operations (smoothing a
   region, bending along a stroke) that are not yet implemented.
 - **Performance on large meshes.** Several operations are O(n) per stroke sample with per-face
@@ -678,8 +740,9 @@ reversible state — keeping what you will need to restore — avoided a class o
 Tidy demonstrates that the expressive, low-friction modeling paradigm introduced by Teddy in 1999
 maps naturally onto today's web platform. With nothing more than a browser, a user can sketch a
 closed outline and immediately obtain a rounded, watertight 3D solid, then refine it through
-intuitive stroke gestures — cutting it, punching holes, and extruding new limbs — and finally view
-it in a stylized hand-drawn aesthetic that pays homage to the original system.
+intuitive stroke gestures — painting it, cutting it, punching holes, and extruding new limbs —
+with undo/redo for safe iteration, and finally view it in a stylized hand-drawn aesthetic that pays
+homage to the original system.
 
 The project's value lies as much in its engineering discipline as in its features: a minimal mesh
 interchange type, a clean split between pure geometry and rendering, a centralized coordinate
@@ -698,33 +761,33 @@ documented trade-offs that remain open, form a solid foundation for the future w
 1. T. Igarashi, S. Matsuoka, H. Tanaka. *Teddy: A Sketching Interface for 3D Freeform Design.*
    SIGGRAPH 1999. https://www-ui.is.s.u-tokyo.ac.jp/~takeo/papers/siggraph99.pdf
 2. Original Teddy project page. http://www-ui.is.s.u-tokyo.ac.jp/~takeo/teddy/teddy.htm
-3. `zeyap/teddy` — reference inflation implementation. https://github.com/zeyap/teddy
-4. Three.js. https://threejs.org
-5. `cdt2d` — constrained Delaunay triangulation. https://www.npmjs.com/package/cdt2d
+3. Three.js. https://threejs.org
+4. `cdt2d` — constrained Delaunay triangulation. https://www.npmjs.com/package/cdt2d
 
 ### Appendix A — Module reference
 
 | Module | Lines | Responsibility |
 |--------|------:|----------------|
-| `sceneView.ts` | 1,410 | Three.js scene, interaction modes, overlay, orchestration |
-| `zeyapInflation.ts` | 995 | Inflation: pruning, spine, elevation, back face, rim |
-| `main.ts` | 631 | DOM wiring, mode toggles, status |
-| `meshCut.ts` | 652 | Teddy §5.4 cut (remove side, cap hole) |
+| `teddyInflation.ts` | 2,767 | Inflation: pruning, spine, elevation, back face, rim |
+| `sceneView.ts` | 2,717 | Three.js scene, interaction modes, paint ribbons, orchestration |
+| `main.ts` | 1,524 | DOM wiring, presets, edit history, debug stepping, status |
+| `meshCut.ts` | 888 | Teddy §5.4 through-cut (remove side, cap hole) |
 | `extrude.ts` | 583 | §5.3 extrusion sweep + hole fill |
-| `meshWinding.ts` | 559 | Outward-winding enforcement utilities |
+| `meshWinding.ts` | 572 | Outward-winding enforcement utilities |
+| `loopImprint.ts` | 637 | Imprint closed loop, remove enclosed surface |
+| `surfaceProjection.ts` | 465 | Raycast strokes, normals, surface-aligned paint lift |
+| `surfaceLines.ts` | 430 | Surface paint ribbons, carve, erase, validation |
 | `screenSilhouette.ts` | 362 | Mesh-vertex-to-screen projection, silhouette |
-| `loopImprint.ts` | 311 | Imprint closed loop, remove enclosed surface |
+| `teddyPipeline.ts` | 356 | Stage orchestration, intermediate meshes |
 | `renderSilhouette.ts` | 272 | View-dependent silhouette from render |
 | `cutPolygon.ts` | 267 | Cut-stroke / silhouette crossing validation |
-| `surfaceProjection.ts` | 229 | Raycast screen strokes to surface (front/back) |
-| `teddyPipeline.ts` | 206 | Stage orchestration, intermediate meshes |
 | `sketchShader.ts` | 144 | Stipple fill + inverted-hull outline materials |
-| `appCanvas.ts` | 120 | 2D silhouette capture canvas |
+| `editHistory.ts` | 77 | Undo/redo snapshots (mesh + surface lines) |
 | `stroke.ts` | 109 | Close, resample, self-intersection |
 | `math.ts` | 80 | Vector math, winding-number test |
 | `cdt.ts` | 73 | CDT wrapper + T/S/J classification |
 | `teddy.ts` | 58 | Public facade |
-| *(tests)* | 334 | `meshWinding`, `meshCut`, `zeyapInflation` |
+| *(tests)* | ≈1,200 | `meshWinding`, `meshCut`, `teddyInflation` (28 tests) |
 
 ### Appendix B — Build and run
 
@@ -733,16 +796,18 @@ npm install     # install dependencies
 npm run dev     # start the Vite dev server (http://localhost:5173)
 npm run build   # type-check and produce a static build in dist/
 npm run preview # serve the production build locally
-npm test        # run the Vitest suite (10 tests)
+npm test        # run the Vitest suite (28 tests)
 ```
 
 ### Appendix C — User workflow at a glance
 
-1. Draw a simple closed shape on the canvas; release to inflate it into a 3D solid.
-2. Orbit (drag), zoom (scroll), and pan (right-drag) to inspect.
-3. Toggle **Paint**, **Cut**, **Loop cut**, or **Extrude** to edit the surface with strokes.
-4. Toggle **Sketch** to view the model in the stippled, hand-drawn style.
-5. **Clear** to start a new shape.
+1. Draw a closed shape (freehand or preset); release to inflate it into a 3D solid.
+2. **View** — right-drag rotate, left-drag pan, scroll zoom; **Top view** resets the camera.
+3. **Paint** — draw/erase surface strokes; **Cut** — open stroke (through-cut) or closed loop
+   (loop cut); **Extrude** — base loop, orient, then sweeping stroke.
+4. **Undo / redo** (toolbar or ⌘Z / ⌘⇧Z) for mesh and paint; tools stay active after each operation.
+5. Toggle **Sketch** for stippled hand-drawn rendering; **Display** for solid/wireframe/both.
+6. **Clear** to start a new shape. Enable **Debug mode** to step through inflation or staged cuts.
 
 ---
 

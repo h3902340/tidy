@@ -4,13 +4,13 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tidy — Sketch to 3D</title>
+    <title>Tidy - Based on Teddy System by Takeo Igarashi (1999)</title>
   </head>
   <body>
     <div id="app">
       <header class="header">
         <div class="header-text">
-          <h1>Tidy</h1>
+          <h1>Tidy - Based on Teddy System by Takeo Igarashi (1999)</h1>
         </div>
         <label class="debug-toggle">
           <input type="checkbox" id="debug-mode" />
@@ -77,6 +77,10 @@
 
           <div class="canvas-wrap">
             <div class="paint-palette" id="paint-palette" hidden>
+              <div class="paint-tools" role="group" aria-label="Paint tool">
+                <button type="button" class="paint-tool is-active" data-paint-tool="draw">Draw</button>
+                <button type="button" class="paint-tool" data-paint-tool="erase">Erase</button>
+              </div>
               <span class="paint-palette-label">Color</span>
               <div class="paint-palette-swatches">
                 <button type="button" class="swatch" data-color="#d1495b" style="background:#d1495b" aria-label="Red"></button>
@@ -100,6 +104,7 @@
               Confirm orientation
             </button>
             <div id="scene-view" class="scene-view"></div>
+            <p id="status" class="status" role="status" hidden></p>
             <div class="debug-panel" id="debug-panel" hidden>
               <button id="btn-next-step" type="button" disabled hidden>Next step</button>
               <button id="btn-skip-prune" type="button" class="secondary" disabled hidden>Skip to fan triangles</button>
@@ -108,10 +113,6 @@
               <button id="btn-skip-result" type="button" class="secondary" disabled hidden>Skip to result</button>
               <button id="btn-discard-cut" type="button" class="secondary" disabled hidden>Discard cut</button>
             </div>
-          </div>
-
-          <div class="canvas-footer">
-            <p id="status" class="status" role="status" hidden></p>
           </div>
         </section>
       </main>

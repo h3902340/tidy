@@ -177,7 +177,7 @@ export function assertAllNormalsOutward(
 }
 
 /**
- * Port of zeyap createNormalsAndEnforceCCW: flip triangles whose normal
+ * Teddy createNormalsAndEnforceCCW: flip triangles whose normal
  * points away from viewDir (camera look direction in mesh space).
  */
 export function enforceWindingTowardView(

@@ -125,37 +125,6 @@ export function computeTeddyCut(
   };
 }
 
-/** @deprecated Use computeTeddyCut */
-export function applyTeddyCut(
-  mesh: Mesh3D,
-  screenStroke: Vec2[],
-  camera: THREE.Camera,
-  domElement: HTMLElement,
-  validated: {
-    silhouette: Vec2[];
-    hits: [CutBoundaryHit, CutBoundaryHit];
-  },
-  worldRoot?: THREE.Object3D,
-  projectedPaths?: { frontPath: Vec3[]; backPath: Vec3[] }
-): { mesh: Mesh3D; polygon: Vec2[]; frontPath: Vec3[]; backPath: Vec3[] } | { error: string } {
-  const result = computeTeddyCut(
-    mesh,
-    screenStroke,
-    camera,
-    domElement,
-    validated,
-    worldRoot,
-    projectedPaths
-  );
-  if ('error' in result) return result;
-  return {
-    mesh: result.capped,
-    polygon: result.polygon,
-    frontPath: result.frontPath,
-    backPath: result.backPath,
-  };
-}
-
 type SplitResult = {
   /** Original vertices plus new vertices created where edges cross the cut. */
   vertices: Vec3[];

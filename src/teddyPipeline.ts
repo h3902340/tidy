@@ -18,7 +18,7 @@ import {
   buildQuarterOvalDebugSteps,
   buildSpineElevationDebugSteps,
   buildTerminalPruneDebugSteps,
-  cdtToZeyapTriangles,
+  cdtToInflationTriangles,
   drawBackface,
   elevateSubdivisionHubHeights,
   propagateSpineElevationAlongAxis,
@@ -31,15 +31,15 @@ import {
   type QuarterOvalDebugStep,
   type SpineElevationDebugStep,
   type TerminalPruneDebugStep,
-  type ZeyapTriangle,
-} from './zeyapInflation';
+  type InflationTriangle,
+} from './teddyInflation';
 
 export type {
   FanElevationDebugStep,
   QuarterOvalDebugStep,
   SpineElevationDebugStep,
   TerminalPruneDebugStep,
-} from './zeyapInflation';
+} from './teddyInflation';
 
 export type TriangleType = 'T' | 'S' | 'J';
 
@@ -131,7 +131,7 @@ function buildElevatedFanSolid(
   interiorVerts: ReturnType<typeof pruneToWedges>['interiorVerts'],
   axisSegments: [number, number][],
   verts: Vec3[],
-  zeyapTris: ZeyapTriangle[],
+  inflationTris: InflationTriangle[],
   hubMeta: Pick<
     ReturnType<typeof pruneToWedges>,
     'subdivisionHubByTri' | 'junctionHubByTri' | 'interiorEdgeMid'
@@ -144,7 +144,7 @@ function buildElevatedFanSolid(
     elevatedVerts,
     axisSegments,
     polygon.length,
-    { ...hubMeta, triangles: zeyapTris, axisSegments }
+    { ...hubMeta, triangles: inflationTris, axisSegments }
   );
   enforceWindingTowardView(elevatedVerts, topFaces, vec3(0, 0, 1));
   const { vertices, faces } = drawBackface(topFaces, elevatedVerts, polygon.length);
@@ -211,8 +211,8 @@ export function buildTeddyPipeline(ring: Vec2[]): {
     buildClassifiedFromTriangles(polygon, triangles);
 
   const pruneVerts = polygon.map((p) => vec3(p.x, p.y, 0));
-  const zeyapTris = cdtToZeyapTriangles(triangles);
-  const terminalPruneSteps = buildTerminalPruneDebugSteps(zeyapTris, [
+  const inflationTris = cdtToInflationTriangles(triangles);
+  const terminalPruneSteps = buildTerminalPruneDebugSteps(inflationTris, [
     ...pruneVerts,
   ]);
   const {
@@ -222,7 +222,7 @@ export function buildTeddyPipeline(ring: Vec2[]): {
     subdivisionHubByTri,
     junctionHubByTri,
     interiorEdgeMid,
-  } = pruneToWedges(zeyapTris, pruneVerts);
+  } = pruneToWedges(inflationTris, pruneVerts);
 
   const fanFaces = wedgesToFanFaces(wedges);
   enforceWindingTowardView(pruneVerts, fanFaces, vec3(0, 0, 1));
@@ -252,7 +252,7 @@ export function buildTeddyPipeline(ring: Vec2[]): {
     subdivisionHubByTri,
     junctionHubByTri,
     interiorEdgeMid,
-    zeyapTris,
+    inflationTris,
     polygon.length,
     axisSegments
   );
@@ -290,7 +290,7 @@ export function buildTeddyPipeline(ring: Vec2[]): {
     interiorVerts,
     axisSegments,
     pruneVerts,
-    zeyapTris,
+    inflationTris,
     { subdivisionHubByTri, junctionHubByTri, interiorEdgeMid }
   );
   const inflatedTop = buildInflatedTopMesh(
@@ -337,20 +337,3 @@ export function buildTeddyPipelineFromStroke(rawStroke: Vec2[]): {
   return buildTeddyPipeline(polygon);
 }
 
-/** @deprecated Use buildTeddyPipeline meshes.classified */
-export function buildFlatCdtMesh(polygon: Vec2[]): Mesh3D {
-  const { triangles } = constrainedDelaunay(polygon);
-  return buildClassifiedFromTriangles(polygon, triangles).mesh;
-}
-
-/** @deprecated Use buildTeddyPipeline meshes.fan */
-export function buildSpineMesh(polygon: Vec2[]): {
-  mesh: Mesh3D;
-  spineSegments: [number, number][];
-} {
-  const { meshes } = buildTeddyPipeline(polygon);
-  if (!meshes) {
-    return { mesh: { vertices: [], faces: [] }, spineSegments: [] };
-  }
-  return { mesh: meshes.fan, spineSegments: meshes.spineSegments };
-}

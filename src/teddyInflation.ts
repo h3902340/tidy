@@ -1,6 +1,5 @@
 /**
- * Teddy inflation pipeline ported from zeyap/teddy (SIGGRAPH 1999 implementation).
- * @see https://github.com/zeyap/teddy
+ * Teddy inflation pipeline (SIGGRAPH 1999, Igarashi et al.).
  * @see https://www-ui.is.s.u-tokyo.ac.jp/~takeo/papers/siggraph99.pdf
  */
 
@@ -41,7 +40,7 @@ export interface TerminalPruneDebugStep {
   fanMesh: { vertices: Vec3[]; faces: [number, number, number][] };
 }
 
-export interface ZeyapTriangle {
+export interface InflationTriangle {
   vertIds: [number, number, number];
   type: 'T' | 'S' | 'J';
   interiorEdges: [number, number][];
@@ -98,7 +97,7 @@ function removeDoublyDefinedEdges(edgeBuffer: [number, number][]): [number, numb
   return out;
 }
 
-function buildEdgeToTriangleMap(triangles: ZeyapTriangle[]): Map<string, number[]> {
+function buildEdgeToTriangleMap(triangles: InflationTriangle[]): Map<string, number[]> {
   const map = new Map<string, number[]>();
   const key = (a: number, b: number) => (a < b ? `${a}_${b}` : `${b}_${a}`);
 
@@ -194,7 +193,7 @@ function addInteriorEdgeWedges(
 
 /** J triangle: mid-to-mid chords along the spine perimeter become wedge edges. */
 function addJunctionMidChordWedges(
-  triangle: ZeyapTriangle,
+  triangle: InflationTriangle,
   resolveMid: (a: number, b: number) => number,
   prunedTriangles: PrunedWedge[],
   interiorVerts: Map<number, Map<number, number[]>>,
@@ -553,7 +552,7 @@ export function buildElevationNeighborsFromWedges(
 }
 
 /** Corner vertex where the two external edges of a terminal triangle meet. */
-function terminalCornerVertex(tri: ZeyapTriangle): number | null {
+function terminalCornerVertex(tri: InflationTriangle): number | null {
   if (tri.externalEdges.length < 2) return null;
   const [e0, e1] = tri.externalEdges;
   for (const v of e0) {
@@ -589,14 +588,14 @@ function edgeInList(
  * mesh between the chordal axis and the boundary (paper fig. 13f).
  */
 function subdivideInteriorTrianglesAtCenters(
-  triangles: ZeyapTriangle[],
+  triangles: InflationTriangle[],
   verts: Vec3[],
   originalInteriorEdges: [number, number][][],
   prunedTriangles: PrunedWedge[],
   hubByTri: Map<number, number>,
   activeInteriorEdges: [number, number][][]
 ): void {
-  const getHub = (triId: number, tri: ZeyapTriangle): number => {
+  const getHub = (triId: number, tri: InflationTriangle): number => {
     const cached = hubByTri.get(triId);
     if (cached !== undefined) return cached;
     const c = tri.centroid!;
@@ -641,7 +640,7 @@ function subdivideInteriorTrianglesAtCenters(
  * fan wedges. Ensure each T corner has fig. 14d fans and a spine tip.
  */
 function ensureTerminalFansAtCorners(
-  triangles: ZeyapTriangle[],
+  triangles: InflationTriangle[],
   verts: Vec3[],
   prunedTriangles: PrunedWedge[],
   interiorVerts: Map<number, Map<number, number[]>>,
@@ -660,8 +659,7 @@ function ensureTerminalFansAtCorners(
     const interiorEdge = tri.interiorEdges[0];
     const tipPos = edgeCenter(verts[interiorEdge[0]], verts[interiorEdge[1]]);
     let spineIdx = findCoincidentSpineVertex(verts, tipPos, spineVertexIds);
-    const isNewTip = spineIdx === null;
-    if (isNewTip) {
+    if (spineIdx === null) {
       spineIdx = verts.length;
       verts.push(tipPos);
       spineEndpointsId.push(spineIdx);
@@ -823,7 +821,7 @@ function semicirclePoseFromEdge(
 }
 
 /** Third vertex of triangle — same side of the interior edge as triangle X (fig. 14). */
-function oppositeVertexId(tri: ZeyapTriangle, inA: number, inB: number): number {
+function oppositeVertexId(tri: InflationTriangle, inA: number, inB: number): number {
   return tri.vertIds[0] ^ tri.vertIds[1] ^ tri.vertIds[2] ^ inA ^ inB;
 }
 
@@ -832,7 +830,7 @@ function oppositeVertexId(tri: ZeyapTriangle, inA: number, inB: number): number 
  * Does not mutate the input mesh — used for debug stepping only.
  */
 export function buildTerminalPruneDebugSteps(
-  triangles: ZeyapTriangle[],
+  triangles: InflationTriangle[],
   verts: Vec3[]
 ): TerminalPruneDebugStep[] {
   if (triangles.length < 2) return [];
@@ -1121,7 +1119,7 @@ function deduplicateCoincidentSpineVertices(
     wedge.vertIds = wedge.vertIds.map(resolve) as [number, number, number];
     wedge.spineEdges = wedge.spineEdges.map(
       ([a, b]) => [resolve(a), resolve(b)] as [number, number]
-    );
+    ) as [[number, number], [number, number]];
   }
 
   const segSeen = new Set<string>();
@@ -1170,7 +1168,7 @@ function fanTipOnInteriorEdge(
 function repairFanStopAxis(
   addAxis: (a: number, b: number) => void,
   removeAxis: (a: number, b: number) => void,
-  triangles: ZeyapTriangle[],
+  triangles: InflationTriangle[],
   postPruneInteriorEdges: [number, number][][],
   originalInteriorEdges: [number, number][][],
   spineEndpointsId: number[],
@@ -1252,9 +1250,9 @@ function repairFanStopAxis(
   }
 }
 
-/** Port of zeyap pruneTrianglesAndElevateVertices (Fig. 13–15). */
+/** Teddy pruneTrianglesAndElevateVertices (Fig. 13–15). */
 export function pruneToWedges(
-  triangles: ZeyapTriangle[],
+  triangles: InflationTriangle[],
   verts: Vec3[]
 ): {
   wedges: PrunedWedge[];
@@ -1335,7 +1333,7 @@ export function pruneToWedges(
   };
 
   /** Sleeve (S): link interior-edge midpoints on the axis and in the wedge mesh. */
-  const connectSleeveAxisMids = (triangle: ZeyapTriangle) => {
+  const connectSleeveAxisMids = (triangle: InflationTriangle) => {
     const edges = triangle.interiorEdges;
     const mids = edges.map(([a, b]) => getOrCreateInteriorEdgeMid(a, b));
     for (let j = 0; j < mids.length; j++) {
@@ -1373,7 +1371,7 @@ export function pruneToWedges(
 
   const getJunctionHub = (
     triangleId: number,
-    triangle: ZeyapTriangle,
+    triangle: InflationTriangle,
     preferredTip?: number
   ): number => {
     if (preferredTip !== undefined) {
@@ -1413,7 +1411,7 @@ export function pruneToWedges(
    */
   const connectJunctionAxis = (
     triangleId: number,
-    triangle: ZeyapTriangle,
+    triangle: InflationTriangle,
     preferredTip?: number
   ) => {
     const hubIdx = getJunctionHub(triangleId, triangle, preferredTip);
@@ -1777,11 +1775,11 @@ export function elevateSubdivisionHubHeights(
   subdivisionHubByTri: Map<number, number>,
   junctionHubByTri: Map<number, number>,
   interiorEdgeMid: Map<string, number>,
-  triangles: ZeyapTriangle[],
+  triangles: InflationTriangle[],
   boundaryVertexCount: number,
   axisSegments: [number, number][]
 ): void {
-  const triVerts = (tri: ZeyapTriangle) => new Set(tri.vertIds);
+  const triVerts = (tri: InflationTriangle) => new Set(tri.vertIds);
 
   for (let triId = 0; triId < triangles.length; triId++) {
     const tri = triangles[triId];
@@ -2024,7 +2022,7 @@ export function extractAxisTrunkPath(
 }
 
 export function pruneTrianglesAndElevateVertices(
-  triangles: ZeyapTriangle[],
+  triangles: InflationTriangle[],
   verts: Vec3[]
 ): [number, number, number][] {
   if (triangles.length < 2) {
@@ -2242,7 +2240,7 @@ export function wedgesToElevatedFanFaces(
     subdivisionHubByTri: Map<number, number>;
     junctionHubByTri: Map<number, number>;
     interiorEdgeMid: Map<string, number>;
-    triangles: ZeyapTriangle[];
+    triangles: InflationTriangle[];
     axisSegments: [number, number][];
   }
 ): [number, number, number][] {
@@ -2291,14 +2289,6 @@ export function collectChordalAxisSegments(
   }
 
   return segments;
-}
-
-/** @deprecated Use collectChordalAxisSegments — spineEdges are boundary spokes. */
-export function collectSpineSegments(
-  wedges: PrunedWedge[],
-  boundaryVertexCount: number
-): [number, number][] {
-  return collectChordalAxisSegments(wedges, boundaryVertexCount);
 }
 
 /** Five vertex indices along one spine–boundary spoke (paper quarter oval). */
@@ -2690,7 +2680,7 @@ export function buildInflatedTopFaces(
 }
 
 /**
- * Closed solid via mirrored back face (zeyap drawBackface).
+ * Closed solid via mirrored back face (drawBackface).
  * Silhouette ring vertices (0 .. boundaryVertexCount-1) are shared by top and bottom caps;
  * only interior vertices are duplicated and mirrored across z = 0.
  */
@@ -2758,7 +2748,7 @@ export function stitchSilhouetteRim(
   }
 }
 
-export function cdtToZeyapTriangles(triangles: Triangle2D[]): ZeyapTriangle[] {
+export function cdtToInflationTriangles(triangles: Triangle2D[]): InflationTriangle[] {
   return triangles.map((t) => ({
     vertIds: [...t.indices],
     type: t.type,

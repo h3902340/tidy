@@ -1,17 +1,16 @@
-# Tidy — Teddy Sketch to 3D
+# Tidy - Based on Teddy System by Takeo Igarashi (1999)
 
 Web app that turns a hand-drawn 2D silhouette into an inflated 3D polygonal mesh using the **Teddy** algorithm from *Teddy: A Sketching Interface for 3D Freeform Design* (Igarashi, Matsuoka, Tanaka, SIGGRAPH 1999).
 
 ## Features
 
-- **2D sketch canvas** — draw a freeform closed loop with pen or mouse
-- **Auto-close tolerance** — if start and end are within 40px, the stroke snaps closed; otherwise a closing segment is added
-- **Uniform resampling** — stroke is resampled to even edge length before meshing
-- **Constrained Delaunay triangulation (CDT)** — `cdt2d` on the polygon boundary
-- **Teddy inflation** — inflation pipeline ported from [zeyap/teddy](https://github.com/zeyap/teddy): terminal pruning, spine growth, quarter-oval elevation (SIGGRAPH ’99 §5.1), mirrored back face, and rim stitching
-- **Single 3D panel** — draw the silhouette on the view plane; mesh appears where you drew
-- **Paint & cut** — projected onto the 3D mesh after the silhouette is locked
-- **Extrude** (SIGGRAPH ’99 §5.3) — two-stroke sweep: a closed loop on the front surface, then a second stroke defining the extrusion silhouette. The enclosed surface is removed; the base ring is swept along the projected stroke into triangulated layers.
+- **2D silhouette** — freehand loop or shape presets on the view plane
+- **Teddy inflation** — CDT meshing, terminal pruning, spine growth, quarter-oval elevation, mirrored back face, and rim stitching (SIGGRAPH 1999 algorithm)
+- **Single 3D viewport** — draw, orbit, paint, cut, and extrude in one panel
+- **Surface paint** — Teddy-style strokes projected onto the mesh; erase by scribbling
+- **Cut** — through-cut (open stroke) or loop cut (closed stroke on the surface)
+- **Extrude** (SIGGRAPH ’99 §5.3) — closed base loop + extruding stroke sweep
+- **Undo / redo** — mesh geometry and paint history
 
 ## Live demo (GitHub Pages)
 
@@ -30,7 +29,7 @@ npm run dev
 
 Open the URL shown in the terminal (typically `http://localhost:5173`).
 
-## Build
+## Build & test
 
 ```bash
 npm run build
@@ -38,92 +37,245 @@ npm run preview
 npm test
 ```
 
-`npm test` checks mesh winding: interior faces point outward from the solid, and **silhouette-adjacent** faces point up on the top cap (the usual hole source).
+`npm test` checks mesh winding: interior faces point outward from the solid, and silhouette-adjacent faces point up on the top cap.
 
-## Usage
+---
 
-### Create a shape
+## Mouse & camera controls
 
-1. Draw a closed loop on the canvas, or click a preset (**circle**, **oval**, **triangle**, **square**, **star**).
-2. Release the pointer — the loop auto-closes and inflates into a 3D mesh.
-3. **Clear** resets the session so you can start a new shape.
+**Right mouse always rotates** the camera in every mode. Other bindings depend on whether you are drawing.
 
-Avoid self-intersecting outlines; the algorithm assumes a simple closed polygon.
-
-### View (orbit)
-
-After inflation, **View** is the default tool:
+### View, cut review, extrude orient (not drawing)
 
 | Action | Control |
 |--------|---------|
-| Rotate | Drag |
-| Zoom | Scroll |
-| Pan | Right-drag |
+| Rotate | **Right-drag** |
+| Pan | **Left-drag** |
+| Zoom | **Scroll** (middle mouse dolly) |
 
-**Top view** (toolbar) snaps the camera back to the initial top-down drawing angle.
-
-### Paint
-
-1. Switch to **Paint**.
-2. Pick a color and brush size from the palette (top-left of the canvas).
-3. **Left-drag** on the surface to paint.
-
-Paint mode shares the canvas with the camera:
+### Paint, cut (drawing), extrude loop/curve (drawing)
 
 | Action | Control |
 |--------|---------|
-| Paint | Left-drag |
-| Rotate | Right-drag |
-| Zoom | Scroll |
-| Pan | Middle-drag |
+| Draw stroke | **Left-drag** |
+| Rotate | **Right-drag** |
+| Pan | **Middle-drag** |
+| Zoom | **Scroll** |
 
-### Cut
+After paint, cut, extrude, undo, or redo, the app **stays in the current tool** (it does not switch back to View automatically).
 
-**Through cut** — draw an **open** stroke across the object (it must cross the visible silhouette). The smaller side is removed and the section is capped.
+---
 
-**Loop cut** — draw a **closed** loop on the surface to remove the enclosed patch (small endpoint gaps auto-close).
+## Operations
+
+### 1. Create a shape
+
+**Draw a silhouette**
+
+1. On first load, draw a **closed loop** on the canvas with the left mouse button.
+2. Release — if the start and end are within 40px the stroke snaps closed; otherwise a closing segment is added.
+3. The stroke is resampled and inflated into a 3D mesh.
+
+**Shape presets** (toolbar icons)
+
+Click any preset to skip freehand drawing:
+
+| Button | Shape |
+|--------|--------|
+| Circle | Circle |
+| Oval | Ellipse |
+| Triangle | Equilateral triangle |
+| Square | Axis-aligned square |
+| Star | 5-point star |
+
+Presets only work before a shape exists. If a mesh is already loaded, press **Clear** first.
+
+**Tips**
+
+- Use a **simple closed polygon** — self-intersecting outlines are rejected.
+- The camera starts in a **top-down** view aligned with the drawing plane.
+
+---
+
+### 2. Clear
+
+**Clear** resets the session: mesh, paint, edit history, and tools return to the initial silhouette-drawing state. Use this to start a completely new object.
+
+---
+
+### 3. View
+
+After inflation, **View** is the default editing tool (toolbar tab).
+
+- Orbit with **right-drag**, pan with **left-drag**, zoom with **scroll**.
+- **Top view** (toolbar icon) snaps the camera back to the top-down drawing angle. Useful before a through-cut so the stroke lines up with the visible silhouette.
+
+---
+
+### 4. Display
+
+The **Display** dropdown (toolbar) changes how the mesh is rendered:
+
+| Mode | Description |
+|------|-------------|
+| **Solid** | Filled shaded mesh |
+| **Wireframe** | Triangle edges only |
+| **Both** | Solid fill plus wireframe overlay |
+
+Available before and after inflation.
+
+---
+
+### 5. Sketch rendering
+
+After inflation, enable **Sketch** in the edit toolbar for a pencil-style stipple fill and inked silhouette outline. Toggle off to return to standard Phong shading.
+
+---
+
+### 6. Paint
+
+Switch to the **Paint** tab. A palette appears at the **top-left** of the canvas.
+
+**Draw**
+
+1. Choose **Draw** (default).
+2. Pick a color from the swatches or the custom color picker.
+3. Set **Brush** thickness with the slider (2–60 px).
+4. **Left-drag** on the visible surface to paint.
+
+Strokes are projected onto the mesh along view rays and rendered as surface ribbons. Paint must stay **inside the object outline** (in debug mode the dashed blue silhouette is shown as a guide; in normal use validation still applies from the computed outline).
+
+**Erase**
+
+1. Choose **Erase**.
+2. **Left-drag** over painted areas to remove paint. Only the ribbon under the brush is clipped away — strokes can be split or thinned without deleting whole lines.
+
+**Paint behavior**
+
+- Crossing strokes carve the layer underneath so newer paint sits on top without z-fighting.
+- Paint is stored on the mesh surface and **survives cut and extrude** (it is restored from history on undo/redo).
+- Each successful paint or erase step is recorded for undo.
+
+---
+
+### 7. Cut
+
+Switch to the **Cut** tab. One tool handles both cut types; the app picks the operation from your stroke shape.
+
+#### Through cut (open stroke)
+
+1. Draw an **open** stroke that crosses the object’s **visible silhouette** exactly twice (once on each side).
+2. The mesh is split; the **smaller** piece is removed and the opening is **capped**.
+
+If the stroke does not cross the outline correctly, an error appears at the **bottom-left** of the canvas (auto-hides after 5 seconds). Try **Top view** and redraw.
+
+#### Loop cut (closed stroke)
+
+1. Draw a **closed loop** on the front surface (small gaps at the endpoints auto-close).
+2. The enclosed front patch is removed and the hole is **filled** with new triangles.
+
+**Production mode** (debug off): loop cuts run automatically through imprint → remove → fill.
+
+**Debug mode** (see below): loop cuts step through **Next: Remove triangles** → **Next: Fill hole**, with **Discard cut** to abort.
+
+#### Through cut in debug mode
+
+The front/back projection is shown first. Press **Next: Apply cut** to commit or **Discard cut** to cancel. While reviewing: **right-drag** rotates, **left-drag** pans, **scroll** zooms.
+
+---
+
+### 8. Extrude
+
+Switch to the **Extrude** tab (SIGGRAPH ’99 §5.3 two-stroke sweep).
+
+**Step 1 — Base loop**
+
+- **Left-drag** a **closed loop** on the object’s front surface.
+- The loop is validated and imprinted; a **red ring** marks the base.
+
+**Step 2 — Orient**
+
+- **Right-drag** to rotate the view to the desired extrusion direction.
+- Click **Confirm orientation** (top-right of the canvas).
+
+**Step 3 — Extruding stroke**
+
+- **Left-drag** a second stroke from one side of the red loop to the other.
+- The enclosed surface is swept along the projected stroke into layered triangles.
+
+After a successful extrude, Extrude mode stays active and a **new** extrude gesture begins automatically.
+
+You can **right-drag** to orbit during loop and curve drawing, same as Paint and Cut.
+
+---
+
+### 9. Undo & redo
 
 | Action | Control |
 |--------|---------|
-| Draw cut | Left-drag |
-| Rotate | Right-drag |
-| Zoom | Scroll |
-| Pan | Middle-drag |
+| Undo | Toolbar undo button, or **⌘Z** / **Ctrl+Z** |
+| Redo | Toolbar redo button, or **⌘⇧Z** / **Ctrl+Shift+Z** (or **Ctrl+Y** on Windows) |
 
-Use **Top view** before a through cut if the stroke does not line up with the silhouette.
+Undo/redo restores **mesh geometry** and **surface paint**. The current tool mode is preserved.
 
-With **Debug mode** enabled, a through cut pauses after front/back projection: press **Next: Apply cut** on the canvas overlay to commit, or **Discard cut** to cancel. A loop cut in debug mode steps through imprint → remove triangles → fill hole via **Next**.
+History is seeded when inflation completes; **Clear** resets history.
 
-While reviewing a pending cut in debug mode: **drag** rotates, **scroll** zooms, **right-drag** pans.
+---
 
-### Extrude (two strokes)
+### 10. Status messages
 
-1. Switch to **Extrude** and draw a **closed loop** on the object’s front surface. Small gaps auto-close; if any part misses the surface the loop is rejected — redraw it.
-2. The loop locks as a red ring. **Rotate** the view to the desired orientation, then click **Confirm orientation** (top-right of the canvas).
-3. Draw the **second stroke** across the red loop. The enclosed surface is swept outward along that stroke.
+Validation errors (paint outside outline, failed cut, short stroke, etc.) appear in a **bottom-left** overlay on the canvas. Error messages **disappear automatically after 5 seconds**.
 
-During orientation: **drag** rotates, **scroll** zooms, **right-drag** pans.
+---
 
-### Edit tools
+### 11. Debug mode
 
-- **Undo / Redo** — toolbar buttons, or ⌘Z / ⌘⇧Z (Ctrl+Z / Ctrl+Shift+Z on Windows)
-- **Display** — solid, wireframe, or both
-- **Sketch** — pencil-style stipple rendering with silhouette outline
+Enable **Debug mode** in the header.
 
-### Debug mode
+**Silhouette guide** — dashed blue outline while drawing paint or cut strokes (hidden in normal use).
 
-Enable **Debug mode** in the header to step through the inflation pipeline with **Next step**:
+**Inflation pipeline** — after creating a shape, use **Next step** on the canvas overlay to walk through the full pipeline instead of jumping straight to the result:
 
-1. **Classified** — CDT mesh with T (terminal), S (side), J (join) triangle colors
-2. **Fan** — terminal fan triangles (green overlay)
-3. **Spine** — chordal-axis spine on the fan mesh
-4. **Elevated** — spine raised with height labels (no quarter-ovals yet)
-5. **Inflated** — full Teddy inflation
+1. **Classified** — CDT mesh with T (terminal), S (side), J (join) triangle colors  
+2. **Terminal prune** — fig. 14 pruning steps (per-terminal fan wedges)  
+3. **Fan triangles** — terminal fan overlay (green)  
+4. **Spine** — chordal-axis spine on the fan mesh  
+5. **Spine elevation** — incremental spine height steps  
+6. **Elevated spine** — full elevated axis  
+7. **Fan elevation** — wedge-by-wedge fan elevation  
+8. **Quarter ovals** — outer fan quarter-oval patches  
+9. **Internal triangles / quarter ovals** — interior wedge handling (when present)  
+10. **Complete top surface** — finished top cap  
+11. **Mirrored solid** — top + bottom shell  
+12. **Done** — final inflated mesh  
 
-In **Cut** mode with debug on, cut operations use the overlay controls (**Next**, **Discard cut**) instead of applying immediately.
+Skip shortcuts: **Skip to fan triangles**, **Skip to elevated spine**, **Skip fan construction**, **Skip to result**.
+
+**Cut / loop cut in debug** — stepped apply with **Next** and **Discard cut** (see Cut section).
+
+---
+
+## Toolbar reference
+
+| Control | When available | Action |
+|---------|----------------|--------|
+| Circle / Oval / Triangle / Square / Star | Before first shape | Insert preset silhouette |
+| Clear | Always | Reset session |
+| Top view | Always | Snap to top-down camera |
+| Display | Always | Solid / wireframe / both |
+| View / Paint / Cut / Extrude | After inflation | Switch editing tool |
+| Undo / Redo | After inflation | History |
+| Sketch | After inflation | Pencil rendering toggle |
+| Debug mode | Always | Pipeline + cut stepping + silhouette guide |
+| Draw / Erase | Paint mode | Paint tool |
+| Color swatches + picker | Paint mode | Stroke color |
+| Brush slider | Paint mode | Stroke width |
+| Confirm orientation | Extrude orient phase | Lock extrusion direction |
+| Next step / Skip / Discard cut | Debug mode | Pipeline and cut controls |
+
+---
 
 ## Reference
 
 - Paper: [siggraph99.pdf](https://www-ui.is.s.u-tokyo.ac.jp/~takeo/papers/siggraph99.pdf)
 - Original Teddy: http://www-ui.is.s.u-tokyo.ac.jp/~takeo/teddy/teddy.htm
-- Inflation port reference: [zeyap/teddy](https://github.com/zeyap/teddy)

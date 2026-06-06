@@ -7,7 +7,9 @@ import {
 import type { Mesh3D } from './teddyPipeline';
 
 export type {
+  FanElevationDebugStep,
   Mesh3D,
+  QuarterOvalDebugStep,
   SpineElevationDebugStep,
   TeddyPipelineMeshes,
   TeddyPipelineResult,
@@ -16,9 +18,7 @@ export type {
 } from './teddyPipeline';
 export { FAN_TERMINAL_COLOR } from './teddyPipeline';
 export {
-  buildFlatCdtMesh,
   buildInflatedMesh,
-  buildSpineMesh,
   buildTeddyPipeline,
   buildTeddyPipelineFromStroke,
 } from './teddyPipeline';

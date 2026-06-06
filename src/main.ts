@@ -1,5 +1,6 @@
 import './style.css';
-import { EditHistory, cloneImageData, cloneMesh, type EditSnapshot } from './editHistory';
+import { EditHistory, cloneMesh, type EditSnapshot } from './editHistory';
+import type { PaintTool } from './surfaceLines';
 import { computeTeddyCut, countBoundaryEdges } from './meshCut';
 import { SceneView, type DisplayMode, type InteractionMode } from './sceneView';
 import { buildTeddyPipelineFromStroke } from './teddy';
@@ -13,7 +14,7 @@ import {
   type TerminalPruneDebugStep,
   type TriangleType,
 } from './teddy';
-import { SPINE_ELEVATION_FACTOR } from './zeyapInflation';
+import { SPINE_ELEVATION_FACTOR } from './teddyInflation';
 import type { Vec2 } from './math';
 
 const sceneEl = document.querySelector<HTMLElement>('#scene-view')!;
@@ -39,6 +40,9 @@ const paintColorEl = document.querySelector<HTMLInputElement>('#paint-color')!;
 const swatchEls = Array.from(paintPaletteEl.querySelectorAll<HTMLButtonElement>('.swatch'));
 const paintBrushEl = document.querySelector<HTMLInputElement>('#paint-brush')!;
 const paintBrushValueEl = document.querySelector<HTMLSpanElement>('#paint-brush-value')!;
+const paintToolEls = Array.from(
+  document.querySelectorAll<HTMLButtonElement>('.paint-tool[data-paint-tool]')
+);
 const btnDiscardCut = document.querySelector<HTMLButtonElement>('#btn-discard-cut')!;
 const btnUndo = document.querySelector<HTMLButtonElement>('#btn-undo')!;
 const btnRedo = document.querySelector<HTMLButtonElement>('#btn-redo')!;
@@ -100,10 +104,31 @@ function isDebugMode(): boolean {
   return debugModeEl.checked;
 }
 
+function syncSilhouetteGuide(): void {
+  sceneView.setShowSilhouetteGuide(isDebugMode());
+}
+
+syncSilhouetteGuide();
+
+const STATUS_AUTO_DISMISS_MS = 5000;
+let statusDismissTimer: ReturnType<typeof setTimeout> | null = null;
+
 function setStatus(message: string, type: 'error' | '' = ''): void {
+  if (statusDismissTimer !== null) {
+    clearTimeout(statusDismissTimer);
+    statusDismissTimer = null;
+  }
+
   statusEl.textContent = message;
   statusEl.className = `status ${type}`;
   statusEl.hidden = message === '';
+
+  if (message !== '' && type === 'error') {
+    statusDismissTimer = setTimeout(() => {
+      statusDismissTimer = null;
+      setStatus('');
+    }, STATUS_AUTO_DISMISS_MS);
+  }
 }
 
 function syncToolTabs(mode: InteractionMode): void {
@@ -143,10 +168,10 @@ function updateDebugPanelVisibility(): void {
 function captureEditSnapshot(): EditSnapshot | null {
   const mesh = sceneView.getCurrentMesh();
   if (!mesh) return null;
-  const paint = sceneView.capturePaintTexture();
+  const surfaceLines = sceneView.capturePaintedSurfaceLines();
   return {
     mesh: cloneMesh(mesh),
-    paint: paint ? cloneImageData(paint) : undefined,
+    surfaceLines: surfaceLines.length > 0 ? surfaceLines : undefined,
   };
 }
 
@@ -181,8 +206,9 @@ function finalizeAfterHistoryRestore(snapshot: EditSnapshot): void {
   inflationStep = 'done';
   pipelineMeshes = null;
   enablePostInflationControls(true);
-  setInteractionMode('orbit');
+  sceneView.rearmExtrudeIfActive();
   updateExtrudeConfirmButton();
+  updateDebugActions();
   updateHistoryButtons();
 }
 
@@ -200,7 +226,7 @@ function performUndo(): void {
   if (!snapshot) return;
   restoringHistory = true;
   if (snapshot.mesh) {
-    sceneView.applyEditSnapshot(snapshot.mesh, snapshot.paint);
+    sceneView.applyEditSnapshot(snapshot.mesh, snapshot.surfaceLines);
   }
   restoringHistory = false;
   finalizeAfterHistoryRestore(snapshot);
@@ -212,7 +238,7 @@ function performRedo(): void {
   if (!snapshot) return;
   restoringHistory = true;
   if (snapshot.mesh) {
-    sceneView.applyEditSnapshot(snapshot.mesh, snapshot.paint);
+    sceneView.applyEditSnapshot(snapshot.mesh, snapshot.surfaceLines);
   }
   restoringHistory = false;
   finalizeAfterHistoryRestore(snapshot);
@@ -241,6 +267,26 @@ function applyBrushSize(px: number): void {
 }
 paintBrushEl.addEventListener('input', () => applyBrushSize(Number(paintBrushEl.value)));
 applyBrushSize(Number(paintBrushEl.value));
+
+function syncPaintToolTabs(tool: PaintTool): void {
+  for (const btn of paintToolEls) {
+    btn.classList.toggle('is-active', btn.dataset.paintTool === tool);
+  }
+  paintPaletteEl.classList.toggle('paint-erase-mode', tool === 'erase');
+}
+
+function setPaintTool(tool: PaintTool): void {
+  sceneView.setPaintTool(tool);
+  syncPaintToolTabs(tool);
+}
+
+for (const btn of paintToolEls) {
+  btn.addEventListener('click', () => {
+    const tool = btn.dataset.paintTool as PaintTool | undefined;
+    if (tool) setPaintTool(tool);
+  });
+}
+setPaintTool('draw');
 
 function classifiedFaceColors(types: TriangleType[]): number[] {
   return types.map((t) => TRIANGLE_TYPE_COLORS[t]);
@@ -1195,6 +1241,10 @@ sceneView.setOnPaintComplete(() => {
   commitEditHistory();
 });
 
+sceneView.setOnPaintStatus((message, type) => {
+  if (type === 'error') setStatus(message, 'error');
+});
+
 sceneView.setOnExtrudeStatus((message, type) => {
   if (type === 'error') setStatus(message, 'error');
   else setStatus('');
@@ -1211,7 +1261,6 @@ sceneView.setOnExtrudeComplete((mesh) => {
   pipelineMeshes = null;
   updateExtrudeConfirmButton();
   enablePostInflationControls(true);
-  setInteractionMode('orbit');
   setStatus('');
   commitEditHistory();
 });
@@ -1235,7 +1284,6 @@ sceneView.setOnLoopCutComplete((mesh) => {
   inflationStep = 'done';
   pipelineMeshes = null;
   enablePostInflationControls(true);
-  setInteractionMode('orbit');
   setStatus('');
   commitEditHistory();
 });
@@ -1308,7 +1356,6 @@ function applyThroughCut(): void {
   inflationStep = 'done';
   pipelineMeshes = null;
   enablePostInflationControls(true);
-  setInteractionMode('orbit');
   setStatus('');
   commitEditHistory();
 }
@@ -1383,6 +1430,7 @@ window.addEventListener('keydown', (e) => {
 debugModeEl.addEventListener('change', () => {
   updateDebugPanelVisibility();
   updateDebugActions();
+  syncSilhouetteGuide();
 });
 
 /** World-space radius for preset shapes on z = 0 (independent of camera projection). */
